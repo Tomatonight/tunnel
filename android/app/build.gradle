@@ -1,0 +1,30 @@
+plugins { id 'com.android.application' }
+def depsRoot = providers.gradleProperty('tunnelDeps').orNull
+if (depsRoot == null) throw new GradleException('Set -PtunnelDeps=/absolute/path/to/android-deps (see android/README.txt)')
+android {
+    namespace 'org.example.tunnel'
+    compileSdk 36
+    ndkVersion '27.2.12479018'
+    defaultConfig {
+        applicationId 'org.example.tunnel'
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName '1.0'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DBUILD_TESTING=OFF', "-DTUNNEL_ANDROID_DEPS_ROOT=${file(depsRoot).absolutePath}", '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+                targets 'tunnel_android'
+            }
+        }
+    }
+    externalNativeBuild { cmake { path file('../../CMakeLists.txt'); version '3.22.1' } }
+    // The exact same HTML/CSS/JS bundle is used by the desktop GUI host.
+    sourceSets { main { assets.srcDirs = ['../../gui/assets'] } }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes { release { minifyEnabled false } }
+}

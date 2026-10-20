@@ -1,0 +1,2 @@
+pywebview==6.1
+-r ../remote_desktop/requirements.txt

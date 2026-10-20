@@ -1,0 +1,14 @@
+{
+  "address": "192.0.2.1:65535",
+  "networks": ["10.1.0.1/24"],
+  "peers": [
+    {"address": "192.0.2.2:65535", "shared_key": "replace-with-the-same-random-peer-secret"}
+  ],
+  "remote_desktop": {
+    "enabled": true,
+    "networks": ["10.1.0.0/24"],
+    "access": "authorized_devices",
+    "unattended": true,
+    "device_name": "My desktop"
+  }
+}

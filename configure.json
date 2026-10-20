@@ -1,0 +1,10 @@
+{
+  "address": "100.0.0.1:65535",
+  "networks": ["10.1.0.2/24"],
+  "peers": [
+    {
+      "address": "100.0.0.2:65535",
+      "shared_key": "use-a-random-high-entropy-secret"
+    }
+  ]
+}
