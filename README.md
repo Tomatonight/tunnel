@@ -2,6 +2,14 @@
 
 一个跨平台三层加密组网工具，支持多跳转发、UDP/TCP 数据封装、图形界面与命令行管理，并提供 Linux 内核数据后端。
 
+## UI 示例
+
+以下为当前界面使用示例数据渲染的截图，展示连接状态、节点和流量统计。
+
+![Tunnel UI：连接概览](docs/images/ui-overview.png)
+
+查看 [完整 UI 使用示例](docs/ui-example.md)，包含配置、日志截图和两节点操作步骤。可导入 [节点 A](examples/ui-node-a.json) / [节点 B](examples/ui-node-b.json) 配置开始体验。
+
 ## 功能
 
 - **虚拟网络**：IPv4/IPv6、单设备多地址、多个不重叠网段、按 peer 授权。
@@ -144,6 +152,7 @@ Linux GTK/WebKit 后端通常需要系统 `gi` 包和 WebKit 运行库，安装�
 
 | 内容 | 入口 |
 | --- | --- |
+| UI 使用示例 | [界面截图与操作步骤](docs/ui-example.md)、[节点 A](examples/ui-node-a.json)、[节点 B](examples/ui-node-b.json) |
 | 基础配置 | [configure.json](configure.json) |
 | TCP 数据封装 | [节点 A](examples/tcp-node-a.json)、[节点 B](examples/tcp-node-b.json) |
 | 自动地址分配 | [服务端](examples/address-server.json)、[客户端](examples/address-client.json) |

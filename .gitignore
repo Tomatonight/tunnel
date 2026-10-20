@@ -11,6 +11,7 @@ __pycache__/
 *.pyc
 /.venv-gui/
 /.venv/
+node_modules/
 /kernel/*.o
 /kernel/*.ko
 /kernel/*.mod
