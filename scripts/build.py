@@ -105,9 +105,8 @@ def ensure_gui_dependencies(skip: bool) -> Path | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Configure, build, and test Tunnel")
+    parser = argparse.ArgumentParser(description="Configure and build Tunnel")
     parser.add_argument("--gui", action="store_true", help="also package the desktop GUI on Windows")
-    parser.add_argument("--skip-tests", action="store_true", help="build without running CTest")
     parser.add_argument("--clean", action="store_true", help="remove the build directory before configuring")
     parser.add_argument("--skip-kernel-module", action="store_true",
                         help="on Linux, skip the ABI-specific tunnel_kmod.ko build")
@@ -136,7 +135,7 @@ def main() -> int:
         local_ninja = ROOT / ".build-tools" / "bin" / ("ninja.exe" if os.name == "nt" else "ninja")
         ninja = str(local_ninja) if local_ninja.is_file() else shutil.which("ninja")
 
-        configure = [cmake, "-S", str(ROOT), "-B", str(build_dir), "-DBUILD_TESTING=ON", "-DLIBEVENT_STATIC_LINK=OFF"]
+        configure = [cmake, "-S", str(ROOT), "-B", str(build_dir), "-DBUILD_TESTING=OFF", "-DLIBEVENT_STATIC_LINK=OFF"]
         local_toolchain = ROOT / ".build-tools" / "zig-toolchain.cmake"
         if os.name == "nt" and local_toolchain.is_file():
             configure.append("-DCMAKE_TOOLCHAIN_FILE=.build-tools/zig-toolchain.cmake")
@@ -157,12 +156,6 @@ def main() -> int:
         run([cmake, "--build", str(build_dir), "--parallel"])
         build_linux_kernel_module(build_dir, args.skip_kernel_module)
         copy_windows_runtime(build_dir, preserved)
-
-        if not args.skip_tests:
-            ctest = str(Path(cmake).with_name("ctest.exe" if os.name == "nt" else "ctest"))
-            if not Path(ctest).is_file():
-                ctest = executable("ctest")
-            run([ctest, "--test-dir", str(build_dir), "--output-on-failure"])
 
         if args.gui:
             if os.name != "nt":

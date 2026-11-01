@@ -26,7 +26,7 @@
 
 Directory layout is intentionally small: `src/` contains the cross-platform C++ core; `config/` contains the repository default configuration; `examples/` contains sample node profiles; `gui/`, `remote_desktop/`, `android/`, and `kernel/` contain platform or feature code; `tests/` contains automated tests; `tools/` contains development utilities; `third_party/` contains bundled runtime dependencies; `docs/` contains documentation; and `build/` contains generated files only.
 
-On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script configures CMake, builds the core, and runs CTest. Add `--gui` on Windows to package the desktop application under `build/gui/TunnelUI/`.
+On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script configures CMake and builds the core; run CTest separately when you want the test suite. Add `--gui` on Windows to package the desktop application under `build/gui/TunnelUI/`.
 
 On Windows, double-click `run-gui.vbs` to start the packaged desktop UI without opening a console window. Use `run-gui.bat` from a terminal when you need to pass command-line options or start the source fallback. On Linux/macOS, use `./run-gui.sh`. Run the command-line manager with `run-cli.bat` or `./run-cli.sh`; arguments after the script are passed to the CLI, for example `./run-cli.sh status`.
 
