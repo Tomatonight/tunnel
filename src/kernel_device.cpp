@@ -6,12 +6,172 @@
 #if defined(__linux__) && !defined(__ANDROID__)
 #include "kernel/tunnel_uapi.h"
 #include <cerrno>
+#include <cstdlib>
 #include <fcntl.h>
+#include <limits.h>
+#include <iostream>
+#include <sstream>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
+struct CommandResult {
+    int status = -1;
+    std::string output;
+    CommandResult() = default;
+    CommandResult(int code, const std::string& text) : status(code), output(text) {}
+};
+
+std::string executable_path(const char* name) {
+    const char* path = std::getenv("PATH");
+    const std::string search = path ? path : "";
+    std::size_t start = 0;
+    while (start <= search.size()) {
+        const auto end = search.find(':', start);
+        const auto directory = search.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        const auto candidate = (directory.empty() ? std::string(".") : directory) + "/" + name;
+        if (::access(candidate.c_str(), X_OK) == 0) return candidate;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    for (const auto& directory : {std::string("/sbin"), std::string("/usr/sbin"), std::string("/bin"), std::string("/usr/bin")}) {
+        const auto candidate = directory + "/" + name;
+        if (::access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+    return {};
+}
+
+CommandResult run_command(const std::vector<std::string>& arguments) {
+    if (arguments.empty()) return {-1, "empty command"};
+    int pipe_fds[2];
+    if (::pipe(pipe_fds) < 0) return {-1, std::strerror(errno)};
+    std::vector<char*> argv;
+    for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
+    argv.push_back(nullptr);
+    const auto pid = ::fork();
+    if (pid < 0) {
+        const auto error = std::string(std::strerror(errno));
+        ::close(pipe_fds[0]); ::close(pipe_fds[1]);
+        return {-1, error};
+    }
+    if (!pid) {
+        ::close(pipe_fds[0]);
+        ::dup2(pipe_fds[1], STDOUT_FILENO);
+        ::dup2(pipe_fds[1], STDERR_FILENO);
+        ::close(pipe_fds[1]);
+        ::execv(arguments[0].c_str(), argv.data());
+        _exit(127);
+    }
+    ::close(pipe_fds[1]);
+    std::string output;
+    char buffer[512];
+    for (;;) {
+        const auto count = ::read(pipe_fds[0], buffer, sizeof(buffer));
+        if (count > 0) {
+            if (output.size() < 4096) output.append(buffer, static_cast<std::size_t>(std::min<ssize_t>(count, 4096 - output.size())));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+    }
+    ::close(pipe_fds[0]);
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) if (errno != EINTR) return {-1, output + ": waitpid failed"};
+    return {status, output};
+}
+
+bool command_succeeded(const CommandResult& result) {
+    return result.status >= 0 && WIFEXITED(result.status) && WEXITSTATUS(result.status) == 0;
+}
+
+bool module_loaded() { return ::access("/sys/module/tunnel_kmod", F_OK) == 0; }
+
+std::string module_file() {
+    if (const auto* configured = std::getenv("TUNNEL_KERNEL_MODULE"))
+        if (*configured && ::access(configured, R_OK) == 0) return configured;
+    char executable[PATH_MAX + 1];
+    const auto length = ::readlink("/proc/self/exe", executable, PATH_MAX);
+    std::vector<std::string> candidates;
+    if (length > 0) {
+        executable[length] = '\0';
+        std::string path(executable, static_cast<std::size_t>(length));
+        const auto slash = path.find_last_of('/');
+        if (slash != std::string::npos) {
+            const auto directory = path.substr(0, slash);
+            candidates.push_back(directory + "/kernel/tunnel_kmod.ko");
+            candidates.push_back(directory + "/tunnel_kmod.ko");
+        }
+    }
+    candidates.push_back("build/kernel/tunnel_kmod.ko");
+    candidates.push_back("kernel/tunnel_kmod.ko");
+    for (const auto& candidate : candidates) if (::access(candidate.c_str(), R_OK) == 0) return candidate;
+    return {};
+}
+
+std::string command_error(const std::vector<std::string>& command, const CommandResult& result) {
+    std::ostringstream text;
+    text << command.front();
+    if (!result.output.empty()) {
+        text << ": ";
+        auto output = result.output;
+        while (!output.empty() && (output.back() == '\n' || output.back() == '\r' || output.back() == ' ' || output.back() == '\t')) output.pop_back();
+        text << output;
+    } else if (result.status >= 0 && WIFEXITED(result.status)) {
+        text << " exited with status " << WEXITSTATUS(result.status);
+    }
+    return text.str();
+}
+
+void install_kernel_module(bool& loaded_by_process) {
+    if (module_loaded()) return;
+    const auto module = module_file();
+    std::vector<std::string> command;
+    if (!module.empty()) {
+        // A module produced by the local build is loaded by pathname, so
+        // modprobe cannot infer its udp_tunnel dependencies.  Best-effort
+        // loading keeps built-in implementations and kernels without IPv6
+        // support working while making the common distro case automatic.
+        const auto modprobe = executable_path("modprobe");
+        if (!modprobe.empty()) {
+            for (const auto& dependency : {std::string("udp_tunnel"), std::string("ip6_udp_tunnel")}) {
+                if (access((std::string("/sys/module/") + dependency).c_str(), F_OK) == 0) continue;
+                (void)run_command({modprobe, dependency});
+            }
+        }
+        const auto insmod = executable_path("insmod");
+        if (insmod.empty()) throw std::runtime_error("cannot install tunnel_kmod.ko: insmod was not found; install kmod or load the module manually");
+        command = {insmod, module};
+    } else {
+        const auto modprobe = executable_path("modprobe");
+        if (modprobe.empty()) throw std::runtime_error("cannot install tunnel_kmod.ko: module file was not found and modprobe was not found; build the module or install it first");
+        command = {modprobe, "tunnel_kmod"};
+    }
+    const auto result = run_command(command);
+    if (!command_succeeded(result)) {
+        throw std::runtime_error("cannot install tunnel kernel module (" + command_error(command, result) + "); run as root/CAP_SYS_MODULE or install a matching module");
+    }
+    if (!module_loaded()) {
+        throw std::runtime_error("cannot install tunnel kernel module: loader succeeded but /sys/module/tunnel_kmod is missing");
+    }
+    loaded_by_process = true;
+}
+
+void uninstall_kernel_module(bool& loaded_by_process) {
+    if (!loaded_by_process) return;
+    loaded_by_process = false;
+    const auto rmmod = executable_path("rmmod");
+    if (rmmod.empty()) {
+        std::cerr << "warning: tunnel kernel module was loaded by this process but rmmod was not found; unload tunnel_kmod manually\n";
+        return;
+    }
+    const std::vector<std::string> command{rmmod, "tunnel_kmod"};
+    const auto result = run_command(command);
+    if (!command_succeeded(result))
+        std::cerr << "warning: cannot unload tunnel kernel module (" << command_error(command, result) << ")\n";
+}
+
 void run_ip(const std::vector<std::string>& arguments) {
     std::vector<char*> argv; for (const auto& a : arguments) argv.push_back(const_cast<char*>(a.c_str()));
     argv.push_back(nullptr);
@@ -45,8 +205,13 @@ public:
         if (name.size() >= 16) throw std::invalid_argument("kernel interface name is too long");
         for (char c : name) if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
             throw std::invalid_argument("invalid kernel interface name");
+        install_kernel_module(module_loaded_by_process_);
         fd_ = open("/dev/tunnel_kmod", O_RDWR | O_NONBLOCK | O_CLOEXEC);
-        if (fd_ < 0) throw std::runtime_error("cannot open /dev/tunnel_kmod: load tunnel_kmod.ko and run with CAP_NET_ADMIN (" + std::string(std::strerror(errno)) + ")");
+        if (fd_ < 0) {
+            const auto error = std::string(std::strerror(errno));
+            uninstall_kernel_module(module_loaded_by_process_);
+            throw std::runtime_error("cannot open /dev/tunnel_kmod after installing tunnel kernel module (" + error + "); run with CAP_NET_ADMIN or check the module device permissions");
+        }
         try {
             tnlk_create create{}; create.abi = TNLK_ABI; create.mtu = config.tun_mtu;
             create.transport_mtu = config.transport_mtu; create.lease_ms = 20000;
@@ -209,6 +374,7 @@ private:
         platform_.reset();
         if (!previous_.empty()) OPENSSL_cleanse(previous_.data(), previous_.size());
         previous_.clear();
+        uninstall_kernel_module(module_loaded_by_process_);
     }
     Configure config_;
     int fd_ = -1;
@@ -221,6 +387,7 @@ private:
     std::vector<AdvertisedRoute> exports_;
     std::function<void(KernelEvent)> event_;
     SecretBytes previous_;
+    bool module_loaded_by_process_ = false;
 };
 }
 std::unique_ptr<PacketDevice> open_kernel_device(EventLoop& loop, const Configure& config, const std::string& name) {

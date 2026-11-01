@@ -8,6 +8,12 @@ import os
 from pathlib import Path
 import sys
 
+# Keep direct execution (`python tools/tunnel_cli.py`) equivalent to
+# `python -m tools.tunnel_cli` by adding the repository root to sys.path.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from gui.controller import Controller
 from remote_desktop.security import strict_json
 
@@ -84,7 +90,7 @@ def main(argv=None):
         from remote_desktop.daemon import main as daemon_main
         return daemon_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
-    base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent / 'build'
+    base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else ROOT / 'build'
     parser.add_argument('--binary', type=Path, default=base / ('tunnel.exe' if os.name == 'nt' else 'tunnel'))
     parser.add_argument('--config-dir', type=Path, help='Same private profile directory used by the GUI')
     commands = parser.add_subparsers(dest='command', required=True)

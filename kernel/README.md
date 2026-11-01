@@ -45,7 +45,7 @@ modules_prepare 不足以为启用 MODVERSIONS 的内核提供 Module.symvers。
 匹配模块并完成实际运行测试；没有替换运行内核、重启 WSL 或修改启动配置。
 最终主链路 15/15、ABI 9/9、外层 IPv6/RPF 3/3、子网/NAT 10/10 全部通过，
 真实 BTF 注册为 5868 字节。报告见 build/kernel/tests/wsl-6.18.40.1-final/。
-测试前后宿主网络和原远控进程保持不变；初次 BTF 差异及修复见 测试结果.txt。
+The host network and remote-control process remain unchanged during testing; initial BTF differences and fixes are recorded in [test-results.md](../docs/test-results.md).
 测试清理后已普通 modprobe 加载最终模块留用，/dev/tunnel_kmod 可用；
 产物目录中的 runtime-ready.json 记录模块、BTF 与原远控进程核验结果。
 产物：build/kernel/6.18.40.1-microsoft-standard-WSL2/tunnel_kmod.ko。
@@ -88,7 +88,7 @@ WSL 更新内核后必须重新准备对应开发树并构建，不能复用旧�
 --------
 当前已为 6.18.40.1-microsoft-standard-WSL2 构建并实际运行验证匹配模块；此前版本通过
 6.8.0-147-generic 和 7.0.0-38-generic 开发头文件编译，对应产物按原哈希保留。
-实际加载和功能验证范围见项目根目录的 测试结果.txt。
+The project [test-results.md](../docs/test-results.md) records the actual load and functional validation scope.
 其他版本需在目标系统构建并验证，不声称所有 Linux 版本均可直接使用。
 Makefile 检查目标头文件
 中的 UDP tunnel 函数声明，适配 socket/sock 和发送参数变化，避免仅依赖

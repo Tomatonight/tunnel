@@ -58,7 +58,7 @@ desktop-host.json仅供本机Python宿主发现后台IPC，包含随机认证凭
 后台日志为remote-core.log/desktop-host.log，核心状态为GUI目录下background/status.json。
 GUI保存整份配置后即时应用。Peer差异保留未变化邻接；网络/MTU/监听/地址服务等变更在原进程重建资源并重连，进程身份密钥不变。
 远控策略变更会撤销旧桌面会话；网络重建也可能中断桌面连接。无变化的保存不重建资源。
-命令行配置工具为python -m tunnel_cli，Windows成品为TunnelCtl.exe；与GUI使用同一配置目录即可管理同一个后台，详见../命令行说明.txt。
+Use python -m tools.tunnel_cli for headless configuration. The Windows package includes TunnelCtl.exe; the GUI and CLI share the same profile directory. See the [CLI guide](../docs/cli.md).
 
 验证
 
@@ -70,4 +70,4 @@ Linux隔离真实键鼠（需要Xvfb、libXtst；不会操作当前用户桌面�
     python tests/remote_platform_test.py --xvfb
 真实双节点TUN+TLS+Xvfb（root，需要iproute2、Xvfb、libXtst及Python依赖）：
     sudo python tests/remote_network_integration.py --binary build-wsl/tunnel
-平台与测试结果以 ../测试结果.txt 为准，不将macOS源码检查记为实机通过。
+Use [test-results.md](../docs/test-results.md) for platform validation; macOS source checks are not hardware validation.

@@ -55,7 +55,7 @@ def main():
         host = BackgroundHost(binary, profile)
 
         def cli(*arguments, ok=True, directory=profile):
-            result = subprocess.run([sys.executable, str(ROOT / 'tunnel_cli.py'), '--binary', str(binary),
+            result = subprocess.run([sys.executable, str(ROOT / 'tools' / 'tunnel_cli.py'), '--binary', str(binary),
                 '--config-dir', str(directory), *arguments], capture_output=True, text=True, encoding='utf-8', timeout=180)
             if ok:
                 assert result.returncode == 0, (arguments, result.stderr)

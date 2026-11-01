@@ -224,12 +224,12 @@ wire::Json control_request(Node& node, const std::string& text, const std::strin
 int main(int argc, char** argv) {
     try {
         bool check = false, normalize = false, generate_key = false, path_given = false, stdio_control = false, watch_config = false;
-        std::string path = "configure.json", name, status, export_client, backend_override;
+        std::string path = "config/default.json", name, status, export_client, backend_override;
         int tun_fd = -1; unsigned run_for = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             if (arg == "--help") {
-                std::puts("Usage: tunnel [configure.json] [--check | --normalize-config] [--tun-name NAME]\n"
+                std::puts("Usage: tunnel [config/default.json] [--check | --normalize-config] [--tun-name NAME]\n"
                           "              [--tun-fd FD] [--status-file PATH] [--run-for SECONDS]\n"
                           "              [--stdio-control] [--watch-config] [--device-backend tun|kernel]\n"
                           "              [--export-client NODE_ADDRESS]\n"
@@ -237,7 +237,8 @@ int main(int argc, char** argv) {
                           "Run a single-threaded encrypted IP overlay. --check needs no device privileges.\n"
                           "Linux: CAP_NET_ADMIN/root and iproute2. Windows: administrator and wintun.dll.\n"
                           "--device-backend: kernel (Linux default) or tun (default on other platforms, including Android).\n"
-                          "Overrides JSON for this process, including reloads; kernel requires the matching tunnel_kmod module.\n"
+                          "Overrides JSON for this process, including reloads; kernel tries to load the matching tunnel_kmod module\n"
+                          "from build/kernel/tunnel_kmod.ko (or TUNNEL_KERNEL_MODULE) and unloads modules it loaded on exit.\n"
                           "Inherited TUN fds require backend tun and must already be configured; ownership transfers to the process.\n"
                           "--stdio-control: parent stdin pipe accepts STOP/stop and remote desktop JSON RPC; EOF stops cleanly.\n"
                           "--watch-config: reload changed JSON every second; invalid changes keep the running configuration.\n"

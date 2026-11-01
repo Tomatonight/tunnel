@@ -20,7 +20,7 @@ def main():
     executable = args.executable.resolve(strict=True) if args.executable else None
     if args.binary is not None:
         binary = args.binary.resolve(strict=True)
-        command = ([str(executable)] if executable else [sys.executable, str(ROOT / 'tunnel_cli.py')]) + ['--binary', str(binary)]
+        command = ([str(executable)] if executable else [sys.executable, str(ROOT / 'tools' / 'tunnel_cli.py')]) + ['--binary', str(binary)]
     else:
         # Exercise the packaged CLI's default sibling-core discovery as well.
         (executable.parent / ('tunnel.exe' if sys.platform == 'win32' else 'tunnel')).resolve(strict=True)

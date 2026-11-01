@@ -43,9 +43,18 @@ class CoreBridge:
                     log.write(line)
                     log.flush()
             with self.lock:
+                # Preserve the last core diagnostic for startup failures.  A
+                # module load or device permission error is written to stderr
+                # immediately before exit; surfacing it here keeps the GUI
+                # from reducing the useful message to only "core exited".
+                detail = "Tunnel core exited"
+                for line in reversed(self.logs):
+                    if line.strip():
+                        detail += ": " + line.strip()
+                        break
                 for target in self.pending.values():
                     try:
-                        target.put_nowait({"ok": False, "error": "Tunnel core exited"})
+                        target.put_nowait({"ok": False, "error": detail})
                     except queue.Full:
                         pass
 

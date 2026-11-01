@@ -9,7 +9,7 @@ Linux 也可明确选择 TUN 后端，此时不要求安装额外内核模块；
 
 当前已接通控制握手、路径同步、端到端握手和 TUN 数据转发。
 Linux/WSL 与 Windows 已进行真实设备互通测试；macOS utun 后端、Android VpnService/JNI 工程已编写，
-尚未在对应平台编译和实机验证。构建、运行和测试命令见 开发说明.txt 与 android/README.txt。
+Target-platform builds and hardware validation are tracked in [development.md](development.md) and [Android README](../android/README.md).
 
 ## 配置示例
 
@@ -610,7 +610,7 @@ networks 只能引用本机已有的规范虚拟网段；单网络时可省略�
 长期设备身份和授权库分别保存在desktop-identity.pem、desktop-devices.json；已有文件损坏报错，不覆盖生成。
 同目录仅允许一个后台实例；文件通过临时文件和原子替换保存。桌面IPC与核心RPC均有长度和并发上限。
 直接启动C++ tunnel不启动屏幕组件；使用GUI或python -m remote_desktop.daemon启动完整后台。
-使用方式、系统权限和测试命令见remote_desktop/README.txt。
+使用方式、系统权限和测试命令见remote_desktop/README.md。
 
 ## Peer 状态
 

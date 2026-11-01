@@ -1,9 +1,32 @@
 cmake_minimum_required(VERSION 3.16)
 project(tunnel LANGUAGES CXX)
 
+option(TUNNEL_REQUIRE_GUI_DEPS
+    "Require the desktop GUI Python dependencies during configure" ON)
+
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(TUNNEL_REQUIRE_GUI_DEPS AND UNIX AND NOT ANDROID)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR
+            "Python 3 is required to verify the desktop GUI dependencies. "
+            "Run scripts/build.py or set -DPython3_EXECUTABLE=/path/to/python.")
+    endif()
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import webview"
+        RESULT_VARIABLE TUNNEL_WEBVIEW_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET)
+    if(NOT TUNNEL_WEBVIEW_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "pywebview is missing from ${Python3_EXECUTABLE}. "
+            "Run scripts/build.py to create .venv-gui and install gui/requirements.txt, "
+            "or configure with -DTUNNEL_REQUIRE_GUI_DEPS=OFF for a core-only build.")
+    endif()
+endif()
 
 if(ANDROID AND TUNNEL_ANDROID_DEPS_ROOT)
     list(PREPEND CMAKE_PREFIX_PATH "${TUNNEL_ANDROID_DEPS_ROOT}/${ANDROID_ABI}")
@@ -30,10 +53,13 @@ else()
 endif()
 
 add_library(tunnel_core
-    address.cpp crypto.cpp event.cpp gossip.cpp parse_config.cpp
-    peer.cpp protocol.cpp tunnel.cpp udp_transport.cpp tls.cpp wire.cpp
-    tcp_transport.cpp device.cpp kernel_device.cpp node.cpp address_service.cpp return_flows.cpp subnet_platform.cpp)
-target_include_directories(tunnel_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+    src/address.cpp src/crypto.cpp src/event.cpp src/gossip.cpp src/parse_config.cpp
+    src/peer.cpp src/protocol.cpp src/tunnel.cpp src/udp_transport.cpp src/tls.cpp src/wire.cpp
+    src/tcp_transport.cpp src/device.cpp src/kernel_device.cpp src/node.cpp
+    src/address_service.cpp src/return_flows.cpp src/subnet_platform.cpp)
+target_include_directories(tunnel_core PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(tunnel_core PUBLIC ${TUNNEL_EVENT_TARGET} OpenSSL::SSL OpenSSL::Crypto)
 set_target_properties(tunnel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(WIN32)
@@ -50,16 +76,16 @@ if(ANDROID)
     add_library(tunnel_android SHARED android/jni.cpp)
     target_link_libraries(tunnel_android PRIVATE tunnel_core log)
 else()
-    add_executable(tunnel main.cpp)
+    add_executable(tunnel src/main.cpp)
     target_link_libraries(tunnel PRIVATE tunnel_core)
 endif()
 include(CTest)
 if(BUILD_TESTING AND NOT ANDROID)
     add_executable(tunnel_tests tests/core_tests.cpp)
     target_link_libraries(tunnel_tests PRIVATE tunnel_core)
-    add_test(NAME tunnel_core COMMAND tunnel_tests "${CMAKE_CURRENT_SOURCE_DIR}/configure.json")
+    add_test(NAME tunnel_core COMMAND tunnel_tests "${CMAKE_CURRENT_SOURCE_DIR}/config/default.json")
     set_tests_properties(tunnel_core PROPERTIES TIMEOUT 15)
-    add_test(NAME config_check COMMAND tunnel --check "${CMAKE_CURRENT_SOURCE_DIR}/configure.json")
+    add_test(NAME config_check COMMAND tunnel --check "${CMAKE_CURRENT_SOURCE_DIR}/config/default.json")
     add_executable(runtime_tests tests/runtime_tests.cpp)
     target_link_libraries(runtime_tests PRIVATE tunnel_core)
     add_test(NAME runtime COMMAND runtime_tests)

@@ -17,7 +17,7 @@ TCP 数据与控制消息共用已认证的 TLS 连接；丢包重传可能阻�
 生成密钥使用 OpenSSL 的 32 字节随机数；同一对节点使用相同的生成结果，不能两边各自生成。
 高级设置保留设备后端、入站开关、入站网络限制、绑定地址、MTU 和 JSON 编辑，默认参数不必填写。
 隧道设备可选择“平台默认”“TUN”或“Linux 内核设备”。平台默认在 Linux 使用 kernel，其他平台（含 Android）使用 TUN。
-Linux 默认需要预先编译并加载 tunnel_kmod 模块，命令见开发说明.txt；缺少模块会报错，可明确选择 TUN，不会自动回退。
+On Linux, build and load the tunnel_kmod module first; see [development.md](../docs/development.md). You can explicitly select TUN when the module is unavailable.
 导入未写 device_backend 时表单保持“平台默认”；明确的 tun/kernel 原样保留，保存后核心会写出并显示实际后端，避免跨平台复制时改变选择。
 内核后端的 UDP 数据在内核处理，TCP 沿用用户态 TLS；切换后端会重建设备与连接。
 非 Linux 平台可以查看/编辑该字段，但选择内核后端启动会明确报错，不会自动回退。导入及保存保持原选择。
@@ -33,7 +33,7 @@ TunnelCtl提供独立命令行配置，与界面共用配置目录和后台。�
     TunnelCtl.exe config set /tun_mtu 1300
     TunnelCtl.exe config apply node.json
     TunnelCtl.exe config reload
-运行中编辑会立即应用；查看配置默认隐藏PSK。完整命令见程序包CLI-README.txt或仓库命令行说明.txt。
+See the packaged CLI-README.md or the repository [CLI guide](../docs/cli.md) for complete commands.
 保留整个 TunnelUI 文件夹（包括 _internal、核心程序、DLL 和许可证），不要只复制 EXE。
 窗口请求管理员权限以创建 Wintun。电脑需要 Microsoft Edge WebView2 Runtime。
 首次打开载入仓库示例，必须按实际节点修改地址和 shared_key 后连接。
@@ -110,7 +110,7 @@ examples/subnet-gateway.json 与 subnet-client.json 提供配对示例；先替�
 本版支持已登录桌面的单屏操作。Linux 使用 X11；Wayland 明确不支持。macOS 需首次本机授予屏幕录制和辅助功能权限。
 尚未实现系统开机服务、登录界面、UAC/锁屏安全桌面、音频、剪贴板与文件传输。关闭 GUI 保留后台不等于重启后自动运行。
 授权设备密钥独立于 peer 的 PSK，并持久保存；加入隧道本身不会在名单模式下自动获得桌面权限。
-协议、身份文件、后台命令行和具体平台边界见 ../remote_desktop/README.txt。
+协议、身份文件、后台命令行和具体平台边界见 ../remote_desktop/README.md。
 
 配置存储位置
 Windows: %LOCALAPPDATA%/Tunnel/configure.json
@@ -134,7 +134,7 @@ Windows 重新打包（在 Windows 上执行）
 依赖和许可证需随分发保留；此目录是本地开发产物，尚未代码签名。
 
 Android
-见 ../android/README.txt。Gradle 直接打包共享 assets，宿主通过 JNI 控制同一个协议线程。
+见 ../android/README.md。Gradle 直接打包共享 assets，宿主通过 JNI 控制同一个协议线程。
 退出 Activity 不停止 VPN；使用界面的断开按钮或系统撤销 VPN 授权停止。
 应用私有目录保存配置；导入使用系统文件选择器；VPN 需要系统授权，不要求 root。
 Android 本版没有远程桌面控制端或被控端，页面明确显示不支持并禁用连接与本机服务开关。
@@ -157,6 +157,6 @@ Android 本版没有远程桌面控制端或被控端，页面明确显示不支
     python tests/gui_package_test.py --package build/gui/TunnelUI
 打包后台检查使用隔离的 loopback 地址分配服务，验证冻结程序后台入口、持久身份、重新接回、策略更新与停止，不创建 TUN 或操作屏幕输入。
 --live 和窗口测试会临时创建 198.18.253.0/30 的 TUN；需要权限且该网段不应已被占用。
-前端浏览器回归见 tests/gui_frontend_test.js；精确平台结果见 ../测试结果.txt。
+The browser regression is tests/gui_frontend_test.js; platform results are listed in [test-results.md](../docs/test-results.md).
 macOS 和 Android 当前只有源代码/静态检查，仍需在目标环境构建及验证生命周期。
 Windows WebView2 和 WSLg GTK/WebKit 窗口已通过真实 TUN 启停与状态测试。

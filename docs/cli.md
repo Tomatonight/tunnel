@@ -2,8 +2,8 @@ Tunnel 命令行配置与热加载
 
 Windows程序包：build/gui/TunnelUI/TunnelCtl.exe
 该控制台程序与同目录TunnelUI.exe共用默认配置目录。它不打开GUI，提供配置编辑和后台管理。
-Windows源码入口：python -m tunnel_cli --binary build-reload/tunnel.exe <命令>
-Linux/WSL：build-wsl/gui-venv/bin/python -m tunnel_cli --binary build-wsl-reload/tunnel <命令>
+Windows源码入口：python -m tools.tunnel_cli --binary build-reload/tunnel.exe <命令>
+Linux/WSL：build-wsl/gui-venv/bin/python -m tools.tunnel_cli --binary build-wsl-reload/tunnel <命令>
 需安装gui/requirements.txt所列Python依赖；仅管理隧道无需安装图形桌面。
 以下通用示例以 Windows 源码入口为例，在仓库根目录执行；Linux/WSL 使用上一行的完整入口，并保留其后的子命令。
 2026-10-19 内核设备后端本轮未重新打包 Windows GUI/CLI；现有成品保留 10-16 的 TCP 封装版本，不含新的后端选项。
@@ -12,41 +12,41 @@ Linux/WSL：build-wsl/gui-venv/bin/python -m tunnel_cli --binary build-wsl-reloa
 
 创建和连接
 
-    python -m tunnel_cli --binary build-reload/tunnel.exe init --address 192.0.2.10:65535 --network 10.1.0.1/24
-    python -m tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.20:65535
-    python -m tunnel_cli --binary build-reload/tunnel.exe start
-    python -m tunnel_cli --binary build-reload/tunnel.exe status
-    python -m tunnel_cli --binary build-reload/tunnel.exe stop
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe init --address 192.0.2.10:65535 --network 10.1.0.1/24
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.20:65535
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe start
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe status
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe stop
 
 192.0.2.*为示例，必须替换成实际可达地址。peer add会提示输入PSK；也可用--key-file private-key.txt，从文件读取，避免将密钥写入命令历史。
 多网络时添加peer须重复指定--network 10.1.0.0/24，明确授权范围；对端配置相同peer PSK。
 peer add默认使用UDP数据封装；需要TCP时加--transport tcp，例如：
-    python -m tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.30:65535 --transport tcp
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.30:65535 --transport tcp
 双方均支持TCP且任一端选择tcp时，数据与控制共用已认证的TLS连接；UDP受限时可使用，但丢包重传可能阻塞后续数据。
 选择tcp后对端不支持会报错，不会回退；UDP连接失败也不会自动切换TCP。status的peers[].transport显示实际协商封装。
 从现有完整配置启动：
-    python -m tunnel_cli --binary build-reload/tunnel.exe start --config node.json
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe start --config node.json
 停止控制台命令不会停止后台；使用stop显式停止。关闭GUI仍遵守原有的无人值守后台策略。
 
 运行时编辑
 
-    python -m tunnel_cli --binary build-reload/tunnel.exe config show
-    python -m tunnel_cli --binary build-reload/tunnel.exe config show --running
-    python -m tunnel_cli --binary build-reload/tunnel.exe config check node.json
-    python -m tunnel_cli --binary build-reload/tunnel.exe config apply node.json
-    python -m tunnel_cli --binary build-reload/tunnel.exe config set /tun_mtu 1300
-    python -m tunnel_cli --binary build-reload/tunnel.exe config set /listen/enabled false
-    python -m tunnel_cli --binary build-reload/tunnel.exe config set /address 192.0.2.11:65535 --string
-    python -m tunnel_cli --binary build-reload/tunnel.exe config set /peers/0/transport tcp --string
-    python -m tunnel_cli --binary build-reload/tunnel.exe config unset /tun_mtu
-    python -m tunnel_cli --binary build-reload/tunnel.exe peer remove 192.0.2.20:65535
-    python -m tunnel_cli --binary build-reload/tunnel.exe network add 10.2.0.1/24
-    python -m tunnel_cli --binary build-reload/tunnel.exe config reload
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config show
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config show --running
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config check node.json
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config apply node.json
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /tun_mtu 1300
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /listen/enabled false
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /address 192.0.2.11:65535 --string
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /peers/0/transport tcp --string
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config unset /tun_mtu
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer remove 192.0.2.20:65535
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe network add 10.2.0.1/24
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config reload
 
-Linux/WSL 默认使用内核设备，先按开发说明.txt 编译和加载模块；也可明确切换 TUN 或恢复平台默认：
-    build-wsl/gui-venv/bin/python -m tunnel_cli --binary build-wsl-reload/tunnel config set /device_backend kernel --string
-    build-wsl/gui-venv/bin/python -m tunnel_cli --binary build-wsl-reload/tunnel config set /device_backend tun --string
-    build-wsl/gui-venv/bin/python -m tunnel_cli --binary build-wsl-reload/tunnel config unset /device_backend
+On Linux/WSL the default backend is the kernel device; follow [development.md](development.md) to build and load the module, or explicitly select TUN.
+    build-wsl/gui-venv/bin/python -m tools.tunnel_cli --binary build-wsl-reload/tunnel config set /device_backend kernel --string
+    build-wsl/gui-venv/bin/python -m tools.tunnel_cli --binary build-wsl-reload/tunnel config set /device_backend tun --string
+    build-wsl/gui-venv/bin/python -m tools.tunnel_cli --binary build-wsl-reload/tunnel config unset /device_backend
 省略字段时 Linux 选择 kernel，Windows/macOS/Android 选择 tun；config unset 后核心归一化仍会写出该平台的有效值。
 显式 tun/kernel 在规范化和保存时都会保留；Linux 缺少模块时明确报错，不会自动回退到 TUN。
 
@@ -59,8 +59,8 @@ GUI和命令行同时编辑同一配置时使用文件锁及SHA256版本检查�
 
 指定独立配置目录
 
-    python -m tunnel_cli --binary build-reload/tunnel.exe --config-dir ./my-profile start --config node.json
-    python -m tunnel_cli --binary build-reload/tunnel.exe --config-dir ./my-profile config set /tun_mtu 1300
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe --config-dir ./my-profile start --config node.json
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe --config-dir ./my-profile config set /tun_mtu 1300
     python gui/main.py --binary build-reload/tunnel.exe --config-dir ./my-profile
 
 必须使用相同目录才能管理同一个后台。运行快照位于该目录background/configure.json；请编辑profile根目录configure.json，勿直接修改运行快照。

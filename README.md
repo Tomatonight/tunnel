@@ -22,6 +22,22 @@
 - **Linux 内核后端**：自定义三层 `net_device`，UDP 数据封装、加解密与转发在内核完成；控制面及 TCP/TLS 通道保留用户态。
 
 项目采用 C++11、libevent 和 OpenSSL 3.x。桌面界面使用 Python/pywebview，Android 宿主使用 WebView、VpnService 和 JNI。
+## Layout and build
+
+Directory layout is intentionally small: `src/` contains the cross-platform C++ core; `config/` contains the repository default configuration; `examples/` contains sample node profiles; `gui/`, `remote_desktop/`, `android/`, and `kernel/` contain platform or feature code; `tests/` contains automated tests; `tools/` contains development utilities; `third_party/` contains bundled runtime dependencies; `docs/` contains documentation; and `build/` contains generated files only.
+
+On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script configures CMake, builds the core, and runs CTest. Add `--gui` on Windows to package the desktop application under `build/gui/TunnelUI/`.
+
+On Windows, double-click `run-gui.vbs` to start the packaged desktop UI without opening a console window. Use `run-gui.bat` from a terminal when you need to pass command-line options or start the source fallback. On Linux/macOS, use `./run-gui.sh`. Run the command-line manager with `run-cli.bat` or `./run-cli.sh`; arguments after the script are passed to the CLI, for example `./run-cli.sh status`.
+
+The same entry point is available everywhere:
+
+```bash
+python3 scripts/build.py
+python3 scripts/build.py --clean
+```
+
+Android continues to use Gradle from `android/`; the Linux kernel module continues to use `tools/build_kernel.py`. These platform builds keep their own outputs and do not reuse incompatible CMake caches.
 
 ## 平台与当前边界
 
@@ -50,7 +66,7 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
-Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/libevent，必要时通过 `CMAKE_PREFIX_PATH`、`OPENSSL_ROOT_DIR` 指定依赖。运行时需要管理员权限，并将官方、架构匹配的 `wintun.dll` 放到核心程序旁。具体平台说明见 [开发说明](开发说明.txt)；Android 构建入口见 [Android 文档](android/README.txt)。
+Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/libevent，必要时通过 `CMAKE_PREFIX_PATH`、`OPENSSL_ROOT_DIR` 指定依赖。运行时需要管理员权限，并将官方、架构匹配的 `wintun.dll` 放到核心程序旁。具体平台说明见 [开发说明](docs/development.md)；Android 构建入口见 [Android 文档](android/README.md)。
 
 ## 两节点快速开始
 
@@ -123,7 +139,7 @@ sudo ./build/tunnel node-a.json --device-backend kernel
 
 也可将配置改为 `"device_backend": "kernel"`，或移除该字段以使用 Linux 默认值。模块未安装/加载时会明确报错，不自动退回 TUN。内核更新后需重新构建；模块二进制不能跨内核版本通用。
 
-WSL 也需要与其运行内核匹配的构建树，普通发行版头文件不能直接替代。已在 WSL `6.18.40.1-microsoft-standard-WSL2` 完成实际运行验证，其他版本以对应编译和测试结果为准。构建要求、ABI、WSL 和 BTF 处理见 [内核后端说明](kernel/README.txt)。
+WSL 也需要与其运行内核匹配的构建树，普通发行版头文件不能直接替代。已在 WSL `6.18.40.1-microsoft-standard-WSL2` 完成实际运行验证，其他版本以对应编译和测试结果为准。构建要求、ABI、WSL 和 BTF 处理见 [内核后端说明](kernel/README.md)。
 
 ## 图形界面、命令行与热加载
 
@@ -135,30 +151,30 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/python gui/main.py --binary build/tunnel
 ```
 
-Linux GTK/WebKit 后端通常需要系统 `gi` 包和 WebKit 运行库，安装步骤见 [GUI 文档](gui/README.txt)。启动网络需要相应设备与路由管理权限；Linux/macOS 当前没有独立提权服务。
+Linux GTK/WebKit 后端通常需要系统 `gi` 包和 WebKit 运行库，安装步骤见 [GUI 文档](gui/README.md)。启动网络需要相应设备与路由管理权限；Linux/macOS 当前没有独立提权服务。
 
 也可通过命令行后台管理同一配置：
 
 ```bash
-.venv/bin/python -m tunnel_cli --binary build/tunnel start --config node-a.json
-.venv/bin/python -m tunnel_cli --binary build/tunnel status
-.venv/bin/python -m tunnel_cli --binary build/tunnel config set /tun_mtu 1300
-.venv/bin/python -m tunnel_cli --binary build/tunnel stop
+.venv/bin/python -m tools.tunnel_cli --binary build/tunnel start --config node-a.json
+.venv/bin/python -m tools.tunnel_cli --binary build/tunnel status
+.venv/bin/python -m tools.tunnel_cli --binary build/tunnel config set /tun_mtu 1300
+.venv/bin/python -m tools.tunnel_cli --binary build/tunnel stop
 ```
 
-上述后台管理方式与直接运行核心二选一，避免重复启动同一节点。GUI/CLI 保存会校验并应用运行配置；直接运行核心使用 `--watch-config` 监视文件，Linux/macOS 也支持 `SIGHUP`。peer 变更只重连受影响邻接；地址、设备和网络等变更会重建资源及连接。详见 [命令行说明](命令行说明.txt)。
+上述后台管理方式与直接运行核心二选一，避免重复启动同一节点。GUI/CLI 保存会校验并应用运行配置；直接运行核心使用 `--watch-config` 监视文件，Linux/macOS 也支持 `SIGHUP`。peer 变更只重连受影响邻接；地址、设备和网络等变更会重建资源及连接。详见 [命令行说明](docs/cli.md)。
 
 ## 示例与文档
 
 | 内容 | 入口 |
 | --- | --- |
 | UI 使用示例 | [界面截图与操作步骤](docs/ui-example.md)、[节点 A](examples/ui-node-a.json)、[节点 B](examples/ui-node-b.json) |
-| 基础配置 | [configure.json](configure.json) |
+| 基础配置 | [default.json](config/default.json) |
 | TCP 数据封装 | [节点 A](examples/tcp-node-a.json)、[节点 B](examples/tcp-node-b.json) |
 | 自动地址分配 | [服务端](examples/address-server.json)、[客户端](examples/address-client.json) |
 | 内网路由与 SNAT | [出口节点](examples/subnet-gateway.json)、[访问节点](examples/subnet-client.json) |
-| 远程桌面 | [被控端](examples/desktop-host.json)、[控制端](examples/desktop-client.json)、[使用说明](remote_desktop/README.txt) |
-| 设计与实现 | [设计](设计.txt)、[开发说明](开发说明.txt) |
-| 验证记录 | [测试结果](测试结果.txt)、[测试代码](tests/) |
+| 远程桌面 | [被控端](examples/desktop-host.json)、[控制端](examples/desktop-client.json)、[使用说明](remote_desktop/README.md) |
+| Design and implementation | [Design](docs/design.md), [Development](docs/development.md) |
+| Verification | [Test results](docs/test-results.md), [Tests](tests/) |
 
 示例中的地址和密钥均需替换。普通 CTest 不要求创建真实隧道设备；真实网络、内核模块和 SNAT 集成测试需要 Linux 管理权限，运行方式及已验证范围见开发说明和测试记录。

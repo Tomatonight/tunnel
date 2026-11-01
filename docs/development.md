@@ -23,12 +23,12 @@ Linux 默认选择自定义内核设备；Windows/macOS/Android 默认 TUN。Lin
 Linux/WSL 和 Windows 已完成真实 TUN 互通测试。macOS 后端及 Android 工程尚未在目标平台编译/实机验证。
 不包含 NAT 穿透、默认路由接管、动态 PMTU、隧道分片重组、MSS 改写、TAP 或组播成员订阅。
 内网访问由桌面发布出口，Android 作为访问端；仅允许隧道节点主动访问，内网通过已有连接回包。
-SNAT 可选；关闭时内网仍需正确的回程路径。平台能力边界和访问范围见下文及设计.txt。
+SNAT 可选；关闭时内网仍需正确的回程路径。平台能力边界和访问范围见下文及设计design.md。
 
 远程桌面运行在已登录用户的图形会话；Windows屏幕采集和Linux X11端到端键鼠已有实际验证。
 macOS后端已编写但未实机测试；Wayland、登录/安全桌面及Android远控不在当前支持范围。
 通过GUI或remote_desktop.daemon启动屏幕服务；直接运行C++核心只创建隧道，不创建屏幕组件。
-配对、全员模式、长期身份和后台运行说明见 remote_desktop/README.txt；示例见 examples/desktop-host.json、desktop-client.json。
+配对、全员模式、长期身份和后台运行说明见 remote_desktop/README.md；示例见 examples/desktop-host.json、desktop-client.json。
 
 Linux 可选内核设备
 
@@ -41,8 +41,8 @@ device_backend 省略时，Linux 默认 kernel（需加载模块），其他平�
 Linux 不使用内核模块时必须明确设置 "device_backend": "tun"；缺少模块会报错，不会自动回退。
 核心归一化/保存始终写出有效的 tun/kernel，包括显式 tun，保持配置跨平台复制后的选择。
 或通过原始核心命令行选择（整个进程及后续热加载持续覆盖配置文件的同名字段）：
-    sudo ./build-wsl-reload/tunnel configure.json --device-backend kernel
-    sudo ./build-wsl-reload/tunnel configure.json --device-backend tun
+    sudo ./build-wsl-reload/tunnel config/default.json --device-backend kernel
+    sudo ./build-wsl-reload/tunnel config/default.json --device-backend tun
 配置校验和归一化只校验字段；不会加载模块或声称当前主机能够运行该后端。
 仅 address_server 的配置不创建设备，device_backend 对其没有作用。
 Linux 继承外部 TUN fd 时须同时传入 --device-backend tun，例如 --device-backend tun --tun-fd 7；默认 kernel 不接受 TUN fd。
@@ -53,12 +53,12 @@ Linux 继承外部 TUN fd 时须同时传入 --device-backend tun，例如 --dev
     sudo depmod -a
     sudo modprobe tunnel_kmod
 构建脚本仅保留模块及构建信息，临时编译文件自动清理；--headers 可指定另一套配置完整的目标内核头文件。
-modprobe 会加载所需的 UDP tunnel 等依赖。详细 ABI、容量和生命周期说明见 kernel/README.txt。
+modprobe 会加载所需的 UDP tunnel 等依赖。详细 ABI、容量和生命周期说明见 kernel/README.md。
 模块不是跨版本通用二进制；换内核后重新构建。Secure Boot/模块签名遵循宿主系统设置。
 
 当前 WSL 6.18.40.1-microsoft-standard-WSL2 已准备匹配开发树、安装模块并通过完整实际运行测试；未替换内核、重启 WSL 或修改启动配置。
 主链路 15/15、ABI 9/9、外层 IPv6/RPF 3/3、子网/NAT 10/10 通过，真实模块 BTF 注册通过；原宿主网络和远控进程保持不变。
-最终报告位于 build/kernel/tests/wsl-6.18.40.1-final/；初次 BTF 差异及修复过程保留在 测试结果.txt。
+The final report is under build/kernel/tests/wsl-6.18.40.1-final/; initial BTF differences and fixes are recorded in [test-results.md](test-results.md).
 测试后已重新加载最终模块，/dev/tunnel_kmod 可用；运行核验在模块产物目录的 runtime-ready.json。
 标准安装位置为 /lib/modules/6.18.40.1-microsoft-standard-WSL2/extra/tunnel_kmod.ko；启动节点前执行 sudo modprobe tunnel_kmod。
 持久副本为 /usr/local/lib/tunnel/6.18.40.1-microsoft-standard-WSL2/tunnel_kmod.ko。
@@ -71,7 +71,7 @@ WSL 的 /lib/modules 使用覆盖层；重启后若安装文件丢失，可按�
         source /home/tunnel-wsl-build/environment.sh
         python3 tools/build_kernel.py --headers /usr/src/tunnel-wsl-6.18.40.1-microsoft-standard-WSL2 --cc "$CC" --btf-base /sys/kernel/btf/vmlinux --output build/kernel/6.18.40.1-microsoft-standard-WSL2
     )
-/usr/src/tunnel-wsl-6.18.40.1-microsoft-standard-WSL2 指向保留的匹配源码与构建树；详情见 kernel/README.txt。
+/usr/src/tunnel-wsl-6.18.40.1-microsoft-standard-WSL2 指向保留的匹配源码与构建树；详情见 kernel/README.md。
 上述 --btf-base 使用当前运行内核的真实 BTF，解决本地重建 vmlinux 的调试类型编号与官方内核不同的问题；
 仅适用于构建目标就是当前运行内核的情况，不能将该路径用于其他版本内核。工具校验重新生成 BTF 前后代码、数据段和导入符号 CRC 均未改变。
 新模块构建后需重新安装并更新持久副本；已有节点使用模块时，应先正常停止这些节点再卸载、加载新模块。
@@ -110,8 +110,8 @@ Windows 可运行 build/gui/TunnelUI/TunnelUI.exe，保留同目录的 _internal
 共享资源离线加载，不开放本地HTTP端口；Python宿主经认证的环回IPC连接后台，令牌不传给页面。
 保存配置先通过原生核心校验，运行时立即应用。Peer差异只重建受影响邻接，其余网络资源变动在原进程内重建并重新连接，身份密钥保留。
 配置无变化不打断连接；校验失败保留原状态，应用失败尝试恢复原资源，恢复失败明确返回错误。GUI和命令行共用配置目录锁、版本检查及保存失败回滚。
-无需GUI的配置/管理工具见命令行说明.txt；Windows包附带TunnelCtl.exe，源码入口为python -m tunnel_cli。
-源码启动、平台依赖、打包与配置目录见 gui/README.txt；Android 构建见 android/README.txt。
+The headless configuration tool is documented in [cli.md](cli.md); the Windows package includes TunnelCtl.exe and the source entry point is python -m tools.tunnel_cli.
+源码启动、平台依赖、打包与配置目录见 gui/README.md；Android 构建见 android/README.md。
 
 构建
 
@@ -123,12 +123,12 @@ Linux / WSL 安装：
     cmake -S . -B build-wsl -G Ninja -DCMAKE_BUILD_TYPE=Debug
     cmake --build build-wsl --parallel 2
     ctest --test-dir build-wsl --output-on-failure
-    ./build-wsl/tunnel --check configure.json
+    ./build-wsl/tunnel --check config/default.json
 
 本机 Windows 已配置 Zig 0.14.1、libevent/OpenSSL 动态库，可直接执行：
     .\.build-tools\cmake\data\bin\cmake.exe --build build --parallel 2
     .\.build-tools\cmake\data\bin\ctest.exe --test-dir build --output-on-failure
-    .\build\tunnel.exe --check .\configure.json
+    .\build\tunnel.exe --check .\config/default.json
 
 新环境使用 CMAKE_PREFIX_PATH / OPENSSL_ROOT_DIR 指定与编译器 ABI 相符的依赖。
 本机 DLL 包括 libcrypto-3-x64.dll、libssl-3-x64.dll、libevent_core-7.dll、libwinpthread-1.dll。
@@ -139,7 +139,7 @@ Windows 真正运行还需管理员权限以及位于 tunnel.exe 同目录的官
 
 运行
 
-    tunnel [configure.json] [--check | --normalize-config] [--tun-name NAME]
+    tunnel [config/default.json] [--check | --normalize-config] [--tun-name NAME]
            [--tun-fd FD] [--status-file PATH] [--run-for SECONDS] [--stdio-control] [--watch-config]
     tunnel --generate-key
     tunnel server.json --export-client NODE_ADDRESS
@@ -169,7 +169,7 @@ config_apply通过私有候选文件path传递完整配置（最多1 MiB），�
 状态 JSON 每 250 毫秒更新，含 peers、routes、end_sessions 和丢包/转发计数，不输出 PSK 或私钥。
 监控文件写入失败会记录并在下次更新重试，不中断网络转发。
 
-configure.json 使用演示公网地址和占位 PSK，实际互通须改成两端真实可达的固定公布地址，
+config/default.json 使用演示公网地址和占位 PSK，实际互通须改成两端真实可达的固定公布地址，
 并在双方 peers 中相互配置一致的 shared_key，以及本机各自的虚拟地址和共同网络。
 顶层 address 是本机身份；peers[].address 是对端地址；顶层 networks 是本机虚拟 IP/前缀。
 例如 "networks": ["10.1.0.2/24"] 同时表示本机地址 10.1.0.2 和网段 10.1.0.0/24。
@@ -275,9 +275,9 @@ tcp_transport.cpp / udp_transport.cpp：有界非阻塞传输。
 device.cpp：平台设备创建、地址/MTU 配置和 IP 包读写。
 subnet_platform.cpp：导入路由、各平台内核 NAT、转发设置与正常退出恢复。
 return_flows.cpp：内网请求和允许回包对应关系，不进行 NAT 地址/端口转换。
-gui/：共享页面、桌面宿主和 Windows 打包脚本；见 gui/README.txt。
+gui/：共享页面、桌面宿主和 Windows 打包脚本；见 gui/README.md。
 remote_desktop/：独立后台、OpenSSL TLS协议、持久设备授权、核心成员证明桥与原生采集/输入后端。
-android/：VpnService、WebView 界面宿主、JNI 与 Gradle 工程；见 android/README.txt。
+android/：VpnService、WebView 界面宿主、JNI 与 Gradle 工程；见 android/README.md。
 
 默认运行参数
 
@@ -305,7 +305,7 @@ device_addresses 覆盖宿主设备 fd 更新；真实动态地址检查另行�
     sudo ./build-wsl/device_address_tests --live
     .\build\device_address_tests.exe --live
 定时换会话、宿主持有的进程身份、POSIX 继承 TUN fd 的读写/释放也有回归覆盖。
-本次各平台检查数量和原始结果路径见 测试结果.txt。
+Platform check counts and raw result paths are listed in [test-results.md](test-results.md).
 
 真实 Linux 网络测试（root）：
     sudo python3 tests/network_integration.py --binary build-wsl/tunnel
@@ -371,4 +371,4 @@ Linux实际TUN、Xvfb桌面与键鼠整链路（root，iproute2/Xvfb/libXtst及P
 Linux 真设备 14 项已在 ASan/UBSan 构建下执行，无检测报告。
 平台结果只代表上述环境和场景；本机没有 Android SDK/NDK/设备或 macOS 编译环境，
 尚不能据此声称 Android/macOS 构建成功、后台生命周期通过或达到某个吞吐量。
-热加载JNI另使用临时解压的JDK17在WSL进行宿主JVM测试，不能替代Android设备验证，见android/README.txt。
+热加载JNI另使用临时解压的JDK17在WSL进行宿主JVM测试，不能替代Android设备验证，见android/README.md。

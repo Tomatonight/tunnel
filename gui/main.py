@@ -123,7 +123,7 @@ def main():
     base = Path(sys.executable).parent if frozen else Path(__file__).resolve().parent.parent
     native = "tunnel.exe" if os.name == "nt" else "tunnel"
     default_binary = base / native if frozen else base / "build" / native
-    example = resources() / "configure.json" if frozen else base / "configure.json"
+    example = resources() / "default.json" if frozen else base / "config" / "default.json"
     controller = Controller(args.binary or default_binary, args.config_dir, example)
     token = secrets.token_hex(32)
     import webview

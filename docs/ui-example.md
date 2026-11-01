@@ -4,7 +4,7 @@
 
 ## 1. 打开界面
 
-先按 [README](../README.md#从源码构建) 构建当前平台的核心，并按 [GUI 文档](../gui/README.txt) 安装 Python 与 WebView 依赖。在仓库根目录运行：
+先按 [README](../README.md#从源码构建) 构建当前平台的核心，并按 [GUI 文档](../gui/README.md) 安装 Python 与 WebView 依赖。在仓库根目录运行：
 
 ```bash
 python gui/main.py --binary build/tunnel --config-dir build/ui-example

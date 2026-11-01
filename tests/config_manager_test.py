@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from remote_desktop.daemon import ConfigurationManager
-from tunnel_cli import freeze_network_permissions, pointer, redact
+from tools.tunnel_cli import freeze_network_permissions, pointer, redact
 
 
 class ManagerTests(unittest.TestCase):

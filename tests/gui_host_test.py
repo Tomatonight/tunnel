@@ -33,7 +33,7 @@ def configuration():
 class HostTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tunnel-gui-test-")
-        self.host = Controller(args.binary, self.temp.name, ROOT / "configure.json")
+        self.host = Controller(args.binary, self.temp.name, ROOT / "config" / "default.json")
         self.config = configuration()
 
     def tearDown(self):
@@ -151,7 +151,10 @@ class HostTests(unittest.TestCase):
         source = json.dumps(document)
         normalized = self.call("normalize_config", text=source)
         self.assertTrue(normalized["ok"], normalized)
-        self.assertEqual(set(json.loads(normalized["data"]["text"])), {"address_server"})
+        normalized_document = json.loads(normalized["data"]["text"])
+        self.assertEqual(set(normalized_document) - {"address_server", "device_backend"}, set())
+        expected_backend = "kernel" if sys.platform.startswith("linux") else "tun"
+        self.assertEqual(normalized_document.get("device_backend"), expected_backend)
         for _ in range(2):
             result = self.call("start", text=source)
             self.assertTrue(result["ok"], result)

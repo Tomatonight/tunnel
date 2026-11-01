@@ -33,7 +33,7 @@
   测试核心：build-wsl-reload/tunnel，SHA256：
   6e331b3c2cf02326edde04626084b77fe56fafbfe7240142b57fa5d8364cdc24。
   6.8/7.0 的旧模块产物与历史记录按原哈希保留，未将此次 WSL 结果视为它们重新验证。
-  重编、加载和 WSL 覆盖层恢复命令见 开发说明.txt 与 kernel/README.txt；仍未进行吞吐量或长时间压力测试。
+Rebuild, load, and WSL overlay recovery commands are in [development.md](development.md) and [kernel README](../kernel/README.md); throughput and long-duration stress tests remain separate.
 
 Linux 默认使用内核隧道设备
   省略 device_backend 时，Linux（不含 Android）选择 kernel，其他平台选择 tun。
@@ -96,7 +96,7 @@ Linux 可选三层 net_device 后端
 
   模块需按部署主机的实际运行内核重编译；本轮不代表其他内核/架构已经验证。
   未进行吞吐量、长时间压力、ASan/UBSan 或 macOS/Android 实机回归。
-  模块构建：python3 tools/build_kernel.py；操作方法见开发说明.txt 和 kernel/README.txt。
+Build the module with python3 tools/build_kernel.py; usage is documented in [development.md](development.md) and [kernel README](../kernel/README.md).
 
 以下为此前版本验证记录，不能视为本轮重新执行。
 
@@ -213,7 +213,7 @@ TCP数据封装（本轮）
   macOS采集/输入源码已编写，未在Mac上安装、编译打包或实机验证；Android本版不提供远控端。
   无自动安装开机系统服务；无人值守后台在当前用户图形会话中运行，重启后需重新启动或自行配置登录启动。
   单屏JPEG最多8fps，未声称硬件视频编码、高帧率、音频/剪贴板/文件传输或多屏支持。
-  示例examples/desktop-host.json、desktop-client.json已通过核心配置校验；运行方式见remote_desktop/README.txt。
+  示例examples/desktop-host.json、desktop-client.json已通过核心配置校验；运行方式见remote_desktop/README.md。
 
 以下保留此前内网路由阶段的验证记录。
 
@@ -256,7 +256,7 @@ TCP数据封装（本轮）
   真实主备测试等待确定性主出口完成通告收敛后再采样，避免把初始临时备用出口当成固定预期。
   Windows WinNAT出口数据互通未在本轮验证；macOS/Android仅源代码/静态检查，无目标SDK/实机验证。
   Windows SNAT仅IPv4且受WinNAT内部前缀限制；Windows/Android同族多tunnel地址不导入内网路由。
-  一个发布前缀应走同一物理出口，宿主出口变化后需重连刷新；具体能力边界见开发说明.txt。
+A published prefix must use one physical egress; reconnect after the host egress changes. See [development.md](development.md) for platform limits.
 
 共享接入密钥简化
   address_server 现可仅配置 address、shared_key 和 networks，无需手写 clients 名单。
@@ -440,4 +440,4 @@ ASan + UBSan
   共享 C++ 核心和继承 fd 测试不能替代 APK 编译、VPN 授权/撤销、前后台与网络切换实机测试。
   未执行吞吐量、长时间压力或密码学审计；RPF 只验证稳定拓扑，未承诺切换期间严格跨路径去重。
 
-复现命令和部署说明见 开发说明.txt；Android 依赖和构建步骤见 android/README.txt。
+Reproduction and deployment commands are in [development.md](development.md); Android dependencies and build steps are in [Android README](../android/README.md).

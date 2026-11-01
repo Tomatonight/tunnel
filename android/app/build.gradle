@@ -1,6 +1,6 @@
 plugins { id 'com.android.application' }
 def depsRoot = providers.gradleProperty('tunnelDeps').orNull
-if (depsRoot == null) throw new GradleException('Set -PtunnelDeps=/absolute/path/to/android-deps (see android/README.txt)')
+if (depsRoot == null) throw new GradleException('Set -PtunnelDeps=/absolute/path/to/android-deps (see android/README.md)')
 android {
     namespace 'org.example.tunnel'
     compileSdk 36
