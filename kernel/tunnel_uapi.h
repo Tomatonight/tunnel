@@ -4,7 +4,7 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
-#define TNLK_ABI 1
+#define TNLK_ABI 2
 #define TNLK_MAX_BLOB (1024U * 1024U)
 #define TNLK_MAX_PACKET 65536U
 #define TNLK_MAX_NETWORKS 128U
@@ -16,8 +16,10 @@
 
 /* Local ioctl ABI only: integers use native byte order, addresses use network
  * byte order. No pointers except the explicitly aligned blob address. Wire
- * serialization remains exactly protocol.cpp / crypto.cpp version 1. */
+ * serialization is defined by protocol.cpp forwarding version 2. */
 struct tnlk_ip { __u8 family; __u8 bytes[16]; } __attribute__((packed));
+/* Endpoint storage is used for both transport peers (port != 0) and virtual
+ * node identities in route/session/prefix records (port == 0). */
 struct tnlk_endpoint { struct tnlk_ip ip; __u16 port; } __attribute__((packed));
 struct tnlk_network { struct tnlk_ip address; __u8 prefix; } __attribute__((packed));
 struct tnlk_keys { __u8 id[16]; __u8 send[32]; __u8 receive[32]; };

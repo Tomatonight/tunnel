@@ -272,9 +272,10 @@ Configure parse_config(const std::string& text) {
         });
         const std::string config_path = "configuration";
         const std::string listen_path = "listen";
-        const bool only_server = doc.is_object() && doc.count("address_server") && !doc.count("address") && !doc.count("listen") && !doc.count("networks") && !doc.count("peers") && !doc.count("address_clients");
-        const bool simplified = doc.is_object() && (doc.count("address") || doc.count("networks") || doc.count("address_clients") || only_server);
-        keys(doc, simplified ? std::set<std::string>{"address", "networks", "tun_mtu", "transport_mtu", "thread_num", "listen", "peers", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"} :
+        const bool has_endpoint = doc.is_object() && doc.count("endpoint");
+        const bool only_server = doc.is_object() && doc.count("address_server") && !has_endpoint && !doc.count("listen") && !doc.count("networks") && !doc.count("peers") && !doc.count("address_clients");
+        const bool simplified = doc.is_object() && (has_endpoint || doc.count("networks") || doc.count("address_clients") || only_server);
+        keys(doc, simplified ? std::set<std::string>{"endpoint", "networks", "tun_mtu", "transport_mtu", "thread_num", "listen", "peers", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"} :
                               std::set<std::string>{"tun_mtu", "transport_mtu", "thread_num", "listen", "peers", "address_server", "advertise_routes", "remote_desktop", "device_backend"}, config_path);
         number(doc, "thread_num", 1, 1, 1);
         Configure result;
@@ -300,7 +301,7 @@ Configure parse_config(const std::string& text) {
         const auto& enabled = simplified && !listen.count("enabled") ? default_enabled : field(listen, "enabled", listen_path);
         if (!enabled.is_boolean()) throw config_error("listen.enabled: expected boolean");
         result.listen.enabled = enabled.get<bool>();
-        result.listen.address = simplified ? endpoint(field(doc, "address", config_path), "address", false) :
+        result.listen.address = simplified ? endpoint(field(doc, "endpoint", config_path), "endpoint", false) :
                                              endpoint(field(listen, "address", listen_path), "listen.address", false);
         result.listen.bind_address = result.listen.address;
         result.listen.bind_address.ip.bytes.fill(0);
@@ -329,9 +330,9 @@ Configure parse_config(const std::string& text) {
         std::set<Endpoint> endpoints;
         for (std::size_t i = 0; i < peers.size(); ++i) {
             const auto p = "peers[" + std::to_string(i) + "]";
-            keys(peers[i], {"address", "shared_key", "networks", "transport"}, p);
+            keys(peers[i], {"endpoint", "shared_key", "networks", "transport"}, p);
             PeerConfig peer;
-            peer.address = endpoint(field(peers[i], "address", p), p + ".address", false);
+            peer.address = endpoint(field(peers[i], "endpoint", p), p + ".endpoint", false);
             if (peer.address == result.listen.address) throw config_error(p + ": peer is the local node");
             if (peer.address.ip.family != family) throw config_error(p + ": first transport version requires one outer IP family");
             if (!endpoints.insert(peer.address).second) throw config_error(p + ": duplicate peer");
@@ -411,7 +412,7 @@ std::string serialize_config(const Configure& config) {
         for (const auto& owner : owners) if (!local.count(owner.first)) throw config_error("undeclared managed local network");
         json doc = json::object();
         const bool overlay = config.listen.address.port != 0;
-        if (overlay) { doc["address"] = config.listen.address.str(); doc["networks"] = json::array(); }
+        if (overlay) { doc["endpoint"] = config.listen.address.str(); doc["networks"] = json::array(); }
         auto all_refs = json::array();
         for (const auto& item : local) {
             if (!owners.count(item.first)) doc["networks"].push_back(item.second.str() + "/" + std::to_string(item.first.prefix));
@@ -437,7 +438,7 @@ std::string serialize_config(const Configure& config) {
             return left->address < right->address;
         });
         for (const auto* peer : peers) {
-            json value = {{"address", peer->address.str()}, {"shared_key", peer->shared_key}};
+            json value = {{"endpoint", peer->address.str()}, {"shared_key", peer->shared_key}};
             if (peer->transport != "udp") value["transport"] = peer->transport;
             const auto refs = serialized_refs(peer->networks, local);
             if (refs.empty()) throw config_error("cannot serialize a peer without network authorization");

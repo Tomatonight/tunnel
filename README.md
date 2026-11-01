@@ -83,11 +83,11 @@ Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/
 ```json
 {
   "device_backend": "tun",
-  "address": "192.0.2.10:65535",
+  "endpoint": "192.0.2.10:65535",
   "networks": ["10.1.0.1/24"],
   "peers": [
     {
-      "address": "192.0.2.20:65535",
+      "endpoint": "192.0.2.20:65535",
       "shared_key": "REPLACE_WITH_THE_GENERATED_SHARED_KEY"
     }
   ]
@@ -99,11 +99,11 @@ Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/
 ```json
 {
   "device_backend": "tun",
-  "address": "192.0.2.20:65535",
+  "endpoint": "192.0.2.20:65535",
   "networks": ["10.1.0.2/24"],
   "peers": [
     {
-      "address": "192.0.2.10:65535",
+      "endpoint": "192.0.2.10:65535",
       "shared_key": "REPLACE_WITH_THE_GENERATED_SHARED_KEY"
     }
   ]
@@ -119,7 +119,7 @@ sudo ./build/tunnel node-a.json --watch-config
 
 在 A 端执行 `ping 10.1.0.2` 检查连通性。Windows 在管理员终端中使用 `.\build\tunnel.exe`，多配置构建器的程序通常位于 `build\Release\`。
 
-公布地址不是绑定通配地址；默认绑定同地址族的本地通配地址及相同端口。UDP 模式需要 TCP/UDP 端点均可达；使用 NAT 时自行配置端口映射。若选择 TCP，在 peer 对象中添加 `"transport": "tcp"`，两端版本均须支持；程序不自动从 UDP 回退到 TCP。多网络时还须明确填写每个 peer 允许使用的网段。
+endpoint 不是绑定通配地址；默认绑定同地址族的本地通配地址及相同端口。UDP 模式需要 TCP/UDP 端点均可达；使用 NAT 时自行配置端口映射。虚拟网络内的节点身份由该网络的 tunnel_ip 决定。若选择 TCP，在 peer 对象中添加 `"transport": "tcp"`，两端版本均须支持；程序不自动从 UDP 回退到 TCP。多网络时还须明确填写每个 peer 允许使用的网段。
 
 上述配置显式选择 `tun`，无需安装本项目的内核模块。省略 `device_backend` 时，**Linux 默认使用 `kernel`，其他平台（包括 Android）默认使用 `tun`**。
 

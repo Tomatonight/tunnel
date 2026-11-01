@@ -3,8 +3,8 @@
 #include <limits>
 #include <stdexcept>
 
-Gossip::Gossip(Endpoint local, const std::vector<NetworkConfig>& networks,
-               const std::vector<AdvertisedRoute>& advertised) : local_(local), local_prefixes_(advertised) {
+Gossip::Gossip(const std::vector<NetworkConfig>& networks,
+               const std::vector<AdvertisedRoute>& advertised) : local_prefixes_(advertised) {
     for (const auto& n : networks) {
         for (const auto& old : configured_networks_)
             if (old.overlaps(n.tunnel)) throw std::invalid_argument("duplicate or overlapping local networks");
@@ -56,7 +56,6 @@ std::vector<Network> Gossip::active_local_prefixes(const Network& network) const
     return local_networks_.count(network) && found != active_local_prefixes_.end() ? found->second : std::vector<Network>();
 }
 void Gossip::set_authorized_networks(const Endpoint& peer, const std::vector<Network>& networks) {
-    if (peer == local_) throw std::invalid_argument("cannot authorize self as a peer");
     for (const auto& n : networks) if (!local_networks_.count(n)) throw std::invalid_argument("node has not joined this network");
     const std::set<Network> selected(networks.begin(), networks.end());
     records_.erase(std::remove_if(records_.begin(), records_.end(),
@@ -64,7 +63,14 @@ void Gossip::set_authorized_networks(const Endpoint& peer, const std::vector<Net
     allowed_[peer] = selected;
     prefixes_dirty_ = true;
 }
-void Gossip::confirm_allocated_address(const Network& network, const Endpoint& node, const IpAddress& address) {
+void Gossip::set_peer_nodes(const Endpoint& peer, const std::map<Network, NodeId>& nodes) {
+    for (const auto& item : nodes) {
+        if (!local_networks_.count(item.first) || !item.second.unicast() || !item.first.usable_host(item.second))
+            throw std::invalid_argument("invalid peer network identity");
+    }
+    peer_nodes_[peer] = nodes;
+}
+void Gossip::confirm_allocated_address(const Network& network, const NodeId& node, const IpAddress& address) {
     records_.erase(std::remove_if(records_.begin(), records_.end(), [&](const Record& record) {
         const auto& a = record.announcement;
         return a.network == network && ((a.destination == node && a.tunnel_ip != address) ||
@@ -73,7 +79,6 @@ void Gossip::confirm_allocated_address(const Network& network, const Endpoint& n
     prefixes_dirty_ = true;
 }
 void Gossip::authorize(const Endpoint& peer, const std::vector<Network>& networks) {
-    if (peer == local_) throw std::invalid_argument("cannot authorize self as a peer");
     for (const auto& n : networks) if (!local_networks_.count(n)) throw std::invalid_argument("node has not joined this network");
     set_available(peer, false);
     allowed_[peer] = std::set<Network>(networks.begin(), networks.end());
@@ -93,6 +98,7 @@ void Gossip::set_available(const Endpoint& peer, bool available) {
 void Gossip::forget_peer(const Endpoint& peer) {
     set_available(peer, false);
     allowed_.erase(peer);
+    peer_nodes_.erase(peer);
 }
 bool Gossip::announce(const Endpoint& peer, const PathAnnouncement& message) {
     if (records_.size() >= 8192) {
@@ -102,12 +108,16 @@ bool Gossip::announce(const Endpoint& peer, const PathAnnouncement& message) {
         if (!existing) return false;
     }
     auto allowed = allowed_.find(peer);
-    if (!available_.count(peer) || allowed == allowed_.end() || !allowed->second.count(message.network) ||
-        !message.network.usable_host(message.tunnel_ip) || message.destination == local_ ||
-        message.path.empty() || message.path.size() > 64 || message.path.front() != peer ||
-        message.path.back() != message.destination) return false;
     const auto local = local_networks_.find(message.network);
-    if (local == local_networks_.end() || message.tunnel_ip == local->second || message.prefixes.size() > 64 ||
+    const auto identity = peer_nodes_.find(peer);
+    if (!available_.count(peer) || allowed == allowed_.end() || !allowed->second.count(message.network) ||
+        local == local_networks_.end() || !message.network.usable_host(message.tunnel_ip) || message.destination == local->second ||
+        message.path.empty() || message.path.size() > 64 ||
+        message.path.back() != message.destination) return false;
+    if (identity == peer_nodes_.end()) return false;
+    const auto identity_for_network = identity->second.find(message.network);
+    if (identity_for_network == identity->second.end() ||
+        message.path.front() != identity_for_network->second || message.tunnel_ip == local->second || message.prefixes.size() > 64 ||
         std::all_of(message.public_key.begin(), message.public_key.end(), [](unsigned char b) { return b == 0; })) return false;
     std::set<Network> prefixes;
     for (const auto& prefix : message.prefixes) {
@@ -115,9 +125,9 @@ bool Gossip::announce(const Endpoint& peer, const PathAnnouncement& message) {
             prefix.overlaps(message.network) || !prefixes.insert(prefix).second) return false;
         for (const auto& old : prefixes) if (!(old == prefix) && old.overlaps(prefix)) return false;
     }
-    std::set<Endpoint> visited;
+    std::set<NodeId> visited;
     for (const auto& node : message.path)
-        if (node == local_ || !node.ip.unicast() || !node.port || !visited.insert(node).second) return false;
+        if (!node.unicast() || !visited.insert(node).second) return false;
     for (const auto& record : records_) {
         const auto& old = record.announcement;
         if (!(old.network == message.network)) continue;
@@ -129,13 +139,13 @@ bool Gossip::announce(const Endpoint& peer, const PathAnnouncement& message) {
     Record record; record.peer = peer; record.announcement = message; record.order = ++next_order_;
     records_.push_back(std::move(record)); return true;
 }
-void Gossip::withdraw(const Endpoint& peer, const Network& network, const Endpoint& destination) {
+void Gossip::withdraw(const Endpoint& peer, const Network& network, const NodeId& destination) {
     records_.erase(std::remove_if(records_.begin(), records_.end(), [&](const Record& r) {
         return r.peer == peer && r.announcement.network == network && r.announcement.destination == destination;
     }), records_.end());
     prefixes_dirty_ = true;
 }
-std::vector<Endpoint> Gossip::next_hops(const Network& network, const Endpoint& destination) const {
+std::vector<Endpoint> Gossip::next_hops(const Network& network, const NodeId& destination) const {
     std::size_t best = std::numeric_limits<std::size_t>::max();
     std::set<Endpoint> selected;
     for (const auto& record : records_) {
@@ -146,7 +156,7 @@ std::vector<Endpoint> Gossip::next_hops(const Network& network, const Endpoint& 
     }
     return std::vector<Endpoint>(selected.begin(), selected.end());
 }
-bool Gossip::select_unicast(const Network& network, const Endpoint& destination, std::uint64_t flow, Endpoint* peer) const {
+bool Gossip::select_unicast(const Network& network, const NodeId& destination, std::uint64_t flow, Endpoint* peer) const {
     const auto candidates = next_hops(network, destination);
     if (!peer || candidates.empty()) return false;
     // Stable mixing; unlike std::hash, explicitly reproducible across platforms.
@@ -154,26 +164,27 @@ bool Gossip::select_unicast(const Network& network, const Endpoint& destination,
     flow ^= flow >> 27; flow *= 0x94d049bb133111ebULL; flow ^= flow >> 31;
     *peer = candidates[flow % candidates.size()]; return true;
 }
-bool Gossip::accept_rpf(const Network& network, const Endpoint& source, const Endpoint& incoming) const {
-    if (source == local_) return false;
+bool Gossip::accept_rpf(const Network& network, const NodeId& source, const Endpoint& incoming) const {
+    const auto local = local_networks_.find(network);
+    if (local != local_networks_.end() && source == local->second) return false;
     const auto candidates = next_hops(network, source);
     return !candidates.empty() && incoming == candidates.front();
 }
-bool Gossip::public_key(const Endpoint& destination, PublicKey* key) const {
+bool Gossip::public_key(const Network& network, const NodeId& destination, PublicKey* key) const {
     const Record* latest = nullptr;
     for (const auto& r : records_)
-        if (r.announcement.destination == destination && (!latest || r.order > latest->order)) latest = &r;
+        if (r.announcement.network == network && r.announcement.destination == destination && (!latest || r.order > latest->order)) latest = &r;
     if (!latest || !key) return false;
     *key = latest->announcement.public_key; return true;
 }
-bool Gossip::node_for_ip(const Network& network, const IpAddress& ip, Endpoint* node) const {
+bool Gossip::node_for_ip(const Network& network, const IpAddress& ip, NodeId* node) const {
     if (!node) return false;
     for (const auto& r : records_) if (r.announcement.network == network && r.announcement.tunnel_ip == ip) {
         *node = r.announcement.destination; return true;
     }
     return false;
 }
-bool Gossip::ip_for_node(const Network& network, const Endpoint& node, IpAddress* ip) const {
+bool Gossip::ip_for_node(const Network& network, const NodeId& node, IpAddress* ip) const {
     if (!ip) return false;
     for (const auto& r : records_) if (r.announcement.network == network && r.announcement.destination == node) {
         *ip = r.announcement.tunnel_ip; return true;
@@ -195,7 +206,10 @@ void Gossip::rebuild_prefixes() const {
     }
     for (const auto& item : latest) raw_prefixes_[item.first] = item.second->announcement.prefixes;
     for (const auto& item : active_local_prefixes_) if (local_networks_.count(item.first)) {
-        const Origin origin(item.first, local_); raw_prefixes_[origin] = item.second; distances[origin] = 0;
+        const auto local = local_networks_.find(item.first);
+        if (local != local_networks_.end()) {
+            const Origin origin(item.first, local->second); raw_prefixes_[origin] = item.second; distances[origin] = 0;
+        }
     }
     // Sort by subnet base, then prefix length: ancestors precede descendants.
     // At most 128 ancestors can overlap one canonical CIDR, avoiding a quadratic
@@ -231,7 +245,7 @@ void Gossip::rebuild_prefixes() const {
     }
     prefixes_dirty_ = false;
 }
-std::vector<Network> Gossip::prefixes_for_node(const Network& network, const Endpoint& node) const {
+std::vector<Network> Gossip::prefixes_for_node(const Network& network, const NodeId& node) const {
     rebuild_prefixes(); const auto found = usable_prefixes_.find(Origin(network, node));
     return found == usable_prefixes_.end() ? std::vector<Network>() : found->second;
 }
@@ -240,7 +254,7 @@ std::vector<Network> Gossip::advertised_prefixes(const Network& network) const {
     for (const auto& item : gateways_) if (item.first.first == network) result.push_back(item.first.second);
     return result;
 }
-bool Gossip::select_gateway(const Network& network, const Network& prefix, Endpoint* gateway) const {
+bool Gossip::select_gateway(const Network& network, const Network& prefix, NodeId* gateway) const {
     if (!gateway) return false;
     rebuild_prefixes(); const auto found = gateways_.find(std::make_pair(network, prefix));
     if (found == gateways_.end()) return false;
@@ -248,28 +262,34 @@ bool Gossip::select_gateway(const Network& network, const Network& prefix, Endpo
 }
 std::vector<PathAnnouncement> Gossip::export_to(const Endpoint& peer) const {
     rebuild_prefixes();
-    std::map<std::pair<Network, Endpoint>, PathAnnouncement> selected;
+    std::map<std::pair<Network, NodeId>, PathAnnouncement> selected;
     const auto allowed = allowed_.find(peer);
-    if (!available_.count(peer) || allowed == allowed_.end()) return {};
+    const auto identities = peer_nodes_.find(peer);
+    if (!available_.count(peer) || allowed == allowed_.end() || identities == peer_nodes_.end()) return {};
     for (const auto& r : records_) {
         const auto& a = r.announcement;
+        const auto peer_node = identities->second.find(a.network);
+        if (peer_node == identities->second.end()) continue;
         if (!allowed->second.count(a.network) || a.path.size() >= 64 ||
-            std::find(a.path.begin(), a.path.end(), peer) != a.path.end()) continue;
+            std::find(a.path.begin(), a.path.end(), peer_node->second) != a.path.end()) continue;
         auto key = std::make_pair(a.network, a.destination); auto it = selected.find(key);
         if (it == selected.end() || a.path.size() < it->second.path.size() ||
             (a.path.size() == it->second.path.size() && a.path < it->second.path)) selected[key] = a;
     }
     std::vector<PathAnnouncement> result;
     for (auto& item : selected) {
-        auto a = item.second; a.path.insert(a.path.begin(), local_);
+        auto a = item.second;
+        const auto local = local_networks_.find(item.first.first);
+        if (local == local_networks_.end()) continue;
+        a.path.insert(a.path.begin(), local->second);
         a.prefixes = raw_prefixes_.at(item.first);
-        public_key(a.destination, &a.public_key); result.push_back(std::move(a));
+        public_key(a.network, a.destination, &a.public_key); result.push_back(std::move(a));
     }
     return result;
 }
 std::vector<PathAnnouncement> Gossip::snapshot() const {
     rebuild_prefixes();
-    std::map<std::pair<Network, Endpoint>, PathAnnouncement> selected;
+    std::map<std::pair<Network, NodeId>, PathAnnouncement> selected;
     for (const auto& r : records_) selected[{r.announcement.network, r.announcement.destination}] = r.announcement;
     std::vector<PathAnnouncement> result;
     for (const auto& item : selected) {
@@ -278,7 +298,7 @@ std::vector<PathAnnouncement> Gossip::snapshot() const {
         // attributes: use the same latest-origin values as export_to(), even
         // if records are later updated in place or reordered internally.
         a.prefixes = raw_prefixes_.at(item.first);
-        public_key(a.destination, &a.public_key);
+        public_key(a.network, a.destination, &a.public_key);
         result.push_back(std::move(a));
     }
     return result;

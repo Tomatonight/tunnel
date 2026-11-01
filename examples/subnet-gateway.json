@@ -1,17 +1,19 @@
 {
-  "address": "192.0.2.10:65535",
-  "networks": ["10.1.0.1/16"],
-  "peers": [
-    {
-      "address": "192.0.2.20:65535",
-      "shared_key": "replace-with-the-same-random-peer-secret"
-    }
-  ],
-  "advertise_routes": [
-    {
-      "tunnel": "10.1.0.0/16",
-      "prefix": "10.2.0.0/16",
-      "snat": true
-    }
-  ]
+    "networks":  [
+                     "10.1.0.1/16"
+                 ],
+    "peers":  [
+                  {
+                      "shared_key":  "replace-with-the-same-random-peer-secret",
+                      "endpoint":  "192.0.2.20:65535"
+                  }
+              ],
+    "advertise_routes":  [
+                             {
+                                 "tunnel":  "10.1.0.0/16",
+                                 "prefix":  "10.2.0.0/16",
+                                 "snat":  true
+                             }
+                         ],
+    "endpoint":  "192.0.2.10:65535"
 }

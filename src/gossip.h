@@ -10,15 +10,15 @@
 // Its length is the hop count seen by the receiving node.
 struct PathAnnouncement {
     Network network;
-    Endpoint destination;
+    NodeId destination;
     IpAddress tunnel_ip;
     PublicKey public_key{};
-    std::vector<Endpoint> path;
+    std::vector<NodeId> path;
     std::vector<Network> prefixes;
 };
 class Gossip {
 public:
-    Gossip(Endpoint local, const std::vector<NetworkConfig>& networks,
+    Gossip(const std::vector<NetworkConfig>& networks,
            const std::vector<AdvertisedRoute>& advertised = {});
     void authorize(const Endpoint& peer, const std::vector<Network>& networks);
     void forget_peer(const Endpoint& peer); // Remove adjacency routes and cached authorization.
@@ -31,22 +31,23 @@ public:
     // not repeatedly withdraw and reintroduce their conflicting declarations.
     std::vector<Network> active_local_prefixes(const Network&) const;
     void set_authorized_networks(const Endpoint&, const std::vector<Network>&);
+    void set_peer_nodes(const Endpoint&, const std::map<Network, NodeId>&);
     // A freshly verified allocator grant is authoritative for this binding.
     // Clear superseded candidates without touching other virtual networks.
-    void confirm_allocated_address(const Network&, const Endpoint&, const IpAddress&);
+    void confirm_allocated_address(const Network&, const NodeId&, const IpAddress&);
     bool announce(const Endpoint& peer, const PathAnnouncement& message);
-    void withdraw(const Endpoint& peer, const Network& network, const Endpoint& destination);
-    std::vector<Endpoint> next_hops(const Network& network, const Endpoint& destination) const;
-    bool select_unicast(const Network& network, const Endpoint& destination, std::uint64_t flow, Endpoint* peer) const;
-    bool accept_rpf(const Network& network, const Endpoint& source, const Endpoint& incoming) const;
-    bool public_key(const Endpoint& destination, PublicKey* key) const;
-    bool node_for_ip(const Network& network, const IpAddress& ip, Endpoint* node) const;
-    bool ip_for_node(const Network&, const Endpoint&, IpAddress*) const;
+    void withdraw(const Endpoint& peer, const Network& network, const NodeId& destination);
+    std::vector<Endpoint> next_hops(const Network& network, const NodeId& destination) const;
+    bool select_unicast(const Network& network, const NodeId& destination, std::uint64_t flow, Endpoint* peer) const;
+    bool accept_rpf(const Network& network, const NodeId& source, const Endpoint& incoming) const;
+    bool public_key(const Network& network, const NodeId& destination, PublicKey* key) const;
+    bool node_for_ip(const Network& network, const IpAddress& ip, NodeId* node) const;
+    bool ip_for_node(const Network&, const NodeId&, IpAddress*) const;
     // Includes active local announcements. Conflicting external prefixes are
     // unusable without removing the owning node's ordinary overlay paths.
-    std::vector<Network> prefixes_for_node(const Network&, const Endpoint&) const;
+    std::vector<Network> prefixes_for_node(const Network&, const NodeId&) const;
     std::vector<Network> advertised_prefixes(const Network&) const;
-    bool select_gateway(const Network&, const Network& prefix, Endpoint* gateway) const;
+    bool select_gateway(const Network&, const Network& prefix, NodeId* gateway) const;
     std::vector<PathAnnouncement> export_to(const Endpoint& peer) const;
     std::vector<PathAnnouncement> snapshot() const;
     std::size_t size() const { return records_.size(); }
@@ -56,19 +57,19 @@ private:
         PathAnnouncement announcement;
         std::uint64_t order;
     };
-    Endpoint local_;
     std::map<Network, IpAddress> local_networks_;
     std::vector<Network> configured_networks_;
     std::vector<AdvertisedRoute> local_prefixes_;
     std::map<Network, std::vector<Network>> active_local_prefixes_;
     std::map<Endpoint, std::set<Network>> allowed_;
+    std::map<Endpoint, std::map<Network, NodeId>> peer_nodes_;
     std::set<Endpoint> available_;
     std::vector<Record> records_;
     std::uint64_t next_order_ = 0;
-    using Origin = std::pair<Network, Endpoint>;
+    using Origin = std::pair<Network, NodeId>;
     mutable bool prefixes_dirty_ = true;
     mutable std::map<Origin, std::vector<Network>> raw_prefixes_;
     mutable std::map<Origin, std::vector<Network>> usable_prefixes_;
-    mutable std::map<std::pair<Network, Network>, Endpoint> gateways_;
+    mutable std::map<std::pair<Network, Network>, NodeId> gateways_;
     void rebuild_prefixes() const;
 };

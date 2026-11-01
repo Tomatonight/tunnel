@@ -16,6 +16,7 @@ struct IpAddress {
     bool operator!=(const IpAddress& rhs) const { return !(*this == rhs); }
     bool operator<(const IpAddress& rhs) const;
 };
+using NodeId = IpAddress;
 struct Endpoint {
     IpAddress ip;
     std::uint16_t port = 0;

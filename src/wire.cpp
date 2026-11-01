@@ -35,11 +35,11 @@ Json route(const PathAnnouncement& a) {
 }
 PathAnnouncement route(const Json& j) {
     PathAnnouncement a; a.network = Network::parse(j.at("network").get<std::string>());
-    a.destination = Endpoint::parse(j.at("node").get<std::string>());
+    a.destination = IpAddress::parse(j.at("node").get<std::string>());
     a.tunnel_ip = IpAddress::parse(j.at("ip").get<std::string>()); a.public_key = key(j.at("key"));
     const auto& path = j.at("path");
     if (!path.is_array() || path.empty() || path.size() > 64) throw std::invalid_argument("path length");
-    for (const auto& p : path) a.path.push_back(Endpoint::parse(p.get<std::string>()));
+    for (const auto& p : path) a.path.push_back(IpAddress::parse(p.get<std::string>()));
     if (j.count("prefixes")) {
         const auto& prefixes = j.at("prefixes");
         if (!prefixes.is_array() || prefixes.size() > 64) throw std::invalid_argument("advertised prefix limit");

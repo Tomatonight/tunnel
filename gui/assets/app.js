@@ -112,7 +112,7 @@
     const retryStop = state.phase === "stopping" && !!state.error;
     const transitional = state.phase === "starting" || (state.phase === "stopping" && !retryStop);
     const validText = $("config-editor").value.trim().length > 0;
-    const serviceOnly = active ? !!(state.status && !state.status.node && state.status.address_service && state.status.address_service.server && state.status.address_service.server.enabled) : !!(formModel && formModel.serverOnly);
+    const serviceOnly = active ? !!(state.status && !state.status.endpoint && state.status.address_service && state.status.address_service.server && state.status.address_service.server.enabled) : !!(formModel && formModel.serverOnly);
     $("connection-button").disabled = !bridgeReady || busy || transitional || (!active && !validText);
     $("connection-button").classList.toggle("disconnect", active);
     text($("connection-label"), retryStop ? "重试断开" : state.phase === "starting" ? "正在启动" : state.phase === "stopping" ? "正在停止" : active ? serviceOnly ? "停止服务" : "断开网络" : serviceOnly ? "启动服务" : "连接网络");
@@ -274,13 +274,15 @@
     const object = (value, allowed, name) => {
       if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !allowed.includes(key))) throw new Error(name + " 包含表单无法表达的字段；已保留完整 JSON。");
     };
-    object(doc, ["address", "networks", "peers", "listen", "tun_mtu", "transport_mtu", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"], "配置");
-    if (doc.address !== undefined && typeof doc.address !== "string") throw new Error("本机公布地址格式不正确。");
+    object(doc, ["endpoint", "networks", "peers", "listen", "tun_mtu", "transport_mtu", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"], "配置");
+    const onlyServer = doc.address_server !== undefined && doc.endpoint === undefined && doc.networks === undefined &&
+      doc.peers === undefined && doc.listen === undefined && doc.address_clients === undefined;
+    if (!onlyServer && typeof doc.endpoint !== "string") throw new Error("endpoint format invalid");
     const networkList = (value, name) => {
       if (!Array.isArray(value) || !value.every((cidr) => typeof cidr === "string" && subnetReference(cidr))) throw new Error(name + " 必须是有效的 CIDR 列表。");
       return value.map((cidr) => ({ id: ++networkSerial, cidr }));
     };
-    const model = blankModel(); model.address = doc.address || "";
+    const model = blankModel(); model.address = doc.endpoint || "";
     if (doc.device_backend !== undefined && !["tun", "kernel"].includes(doc.device_backend)) throw new Error("隧道设备必须选择 tun 或 kernel。");
     model.deviceBackend = doc.device_backend || "auto";
     model.networks = networkList(doc.networks || [], "本机网络");
@@ -338,13 +340,13 @@
     if (!model.serverOnly && (!model.address || !localNetworks(model).length)) throw new Error("本机需要公布地址及手动或自动获取的虚拟网络。");
     if (doc.peers !== undefined && !Array.isArray(doc.peers)) throw new Error("连接节点必须是列表。");
     model.peers = (doc.peers || []).map((peer) => {
-      object(peer, ["address", "shared_key", "networks", "transport"], "节点");
-      if (typeof peer.address !== "string" || typeof peer.shared_key !== "string") throw new Error("节点地址或共享密钥格式不正确。");
+      object(peer, ["endpoint", "shared_key", "networks", "transport"], "节点");
+      if (typeof peer.endpoint !== "string" || typeof peer.shared_key !== "string") throw new Error("节点地址或共享密钥格式不正确。");
       if (peer.transport !== undefined && !["udp", "tcp"].includes(peer.transport)) throw new Error("节点的数据封装必须为 udp 或 tcp。");
       if (peer.networks === undefined && localNetworks(model).length !== 1) throw new Error("多个虚拟网络时，节点必须明确列出允许的网络。");
       const selected = peer.networks === undefined ? new Set([localNetworks(model)[0].id]) : ids(peer.networks);
       if (!selected.size) throw new Error("节点至少需要一个获授权的虚拟网络。");
-      return { address: peer.address, key: peer.shared_key, transport: peer.transport || "udp", ids: selected };
+      return { address: peer.endpoint, key: peer.shared_key, transport: peer.transport || "udp", ids: selected };
     });
     if (doc.listen !== undefined) {
       object(doc.listen, ["enabled", "bind_address", "networks"], "监听设置");
@@ -368,7 +370,7 @@
     const doc = {};
     if (model.deviceBackend !== "auto") doc.device_backend = model.deviceBackend;
     if (!model.serverOnly) {
-      doc.address = model.address.trim();
+      doc.endpoint = model.address.trim();
       if (model.networks.length || !model.clients.length) doc.networks = model.networks.map((network) => network.cidr.trim());
       if (model.clients.length) doc.address_clients = model.clients.map((client) => ({ address: client.address.trim(), shared_key: client.key, networks: client.networks.map((network) => network.cidr.trim()) }));
       if (model.published.length) doc.advertise_routes = model.published.map((route) => {
@@ -387,7 +389,7 @@
         doc.remote_desktop = remote;
       }
     if (model.peers.length) doc.peers = model.peers.map((peer) => {
-      const result = { address: peer.address.trim(), shared_key: peer.key };
+      const result = { endpoint: peer.address.trim(), shared_key: peer.key };
       if (peer.transport !== "udp") result.transport = peer.transport;
       if (available.length !== 1 || !peer.ids.has(available[0].id)) result.networks = refs(peer.ids);
       return result;
@@ -500,9 +502,9 @@
       heading.append(element("h4", "", "节点 " + (index + 1)), smallButton("移除节点", "remove-peer", () => {
         formModel.peers = formModel.peers.filter((entry) => entry !== peer); renderForm(); synchronizeForm();
       }));
-      const addressLabel = element("label", "form-field"); const address = inputControl("peer-address", peer.address, "例如 100.0.0.2:65535", "对端公布地址 " + (index + 1));
+      const addressLabel = element("label", "form-field"); const address = inputControl("peer-address", peer.address, "例如 100.0.0.2:65535", "对端传输端点 " + (index + 1));
       address.addEventListener("input", () => { peer.address = address.value; synchronizeForm(); });
-      addressLabel.append(element("span", "", "对端公布地址"), address);
+      addressLabel.append(element("span", "", "对端传输端点"), address);
       const transportLabel = element("label", "form-field"); const transport = element("select", "form-input peer-transport");
       transport.setAttribute("aria-label", "数据封装 " + (index + 1));
       for (const [value, label] of [["udp", "UDP（默认）"], ["tcp", "TCP"]]) { const option = element("option", "", label); option.value = value; transport.append(option); }
@@ -643,8 +645,8 @@
       heading.append(element("h4", "", "授权节点 " + (index + 1)), smallButton("移除授权", "remove-authorized-client", () => {
         server.clients = server.clients.filter((item) => item !== client); renderForm(); synchronizeForm();
       }));
-      const label = element("label", "form-field"); const address = inputControl("authorized-client-address", client.address, "例如 100.0.0.2:65535", "授权节点公布地址");
-      address.addEventListener("input", () => { client.address = address.value; synchronizeForm(); }); label.append(element("span", "", "节点公布地址（必须与客户端一致）"), address);
+      const label = element("label", "form-field"); const address = inputControl("authorized-client-address", client.address, "例如 100.0.0.2:65535", "授权节点传输端点");
+      address.addEventListener("input", () => { client.address = address.value; synchronizeForm(); }); label.append(element("span", "", "节点传输端点（必须与客户端一致）"), address);
       card.append(heading, label, serviceKeyField(client, "authorized-client-key"), element("p", "field-hint", "允许申请的地址池（新增池不会自动授权）"), element("div", "network-choices"),
         smallButton("导出接入配置", "service-export export-access", () => action(() => exportAccess(client))));
       $("authorized-client-fields").append(card);
@@ -655,7 +657,7 @@
     await request("normalize_config", { text: configuration() });
     const server = formModel.server;
     const networkRefs = server.pools.filter((pool) => !client || client.ids.has(pool.id)).map((pool) => subnetReference(pool.cidr) || pool.cidr.trim());
-    const value = JSON.stringify({ address: (client ? client.address : server.exportAddress).trim(), address_clients: [{ address: server.address.trim(), shared_key: client ? client.key : server.key, networks: networkRefs }] }, null, 2) + "\n";
+    const value = JSON.stringify({ endpoint: (client ? client.address : server.exportAddress).trim(), address_clients: [{ address: server.address.trim(), shared_key: client ? client.key : server.key, networks: networkRefs }] }, null, 2) + "\n";
     await request("normalize_config", { text: value });
     $("access-export-text").value = value; $("access-export-dialog").showModal();
   }
@@ -667,11 +669,11 @@
       if (!Array.isArray(incoming.address_clients) || !incoming.address_clients.length) throw new Error("此配置没有地址分配客户端设置，请使用常规 JSON 导入。");
       if (merge) {
         const supplied = JSON.parse(raw);
-        const extra = Object.keys(supplied).filter((key) => !["address", "address_clients", "networks", "peers"].includes(key));
+        const extra = Object.keys(supplied).filter((key) => !["endpoint", "address_clients", "networks", "peers"].includes(key));
         if (extra.length || (supplied.networks && supplied.networks.length) || (supplied.peers && supplied.peers.length)) throw new Error("合并只接受服务端导出的接入配置。完整配置请使用替换操作，原文不会丢失。");
         const current = JSON.parse(configuration());
-        if (current.address && current.address !== incoming.address) throw new Error("接入配置的节点公布地址与当前地址不同。请核对地址，或明确选择替换当前配置。");
-        current.address = incoming.address;
+        if (current.endpoint && current.endpoint !== incoming.endpoint) throw new Error("接入配置的节点 endpoint 与当前地址不同。请核对地址，或明确选择替换当前配置。");
+        current.endpoint = incoming.endpoint;
         if (current.networks) current.networks = current.networks.filter((cidr) => cidr.trim());
         // Freeze old single-network shorthand before adding a managed network.
         (current.peers || []).forEach((peer, index) => {
@@ -758,7 +760,9 @@
       const row = element("tr");
       const address = element("td");
       const wrap = element("div", "peer-endpoint");
-      wrap.append(element("span", "peer-mark", "◇"), element("span", "", peer.node || "未知节点"));
+      const identities = peer.identities && typeof peer.identities === "object" ? Object.entries(peer.identities).map(([network, ip]) => network + "=" + ip).join(" ") : "";
+      wrap.append(element("span", "peer-mark", "◇"), element("span", "", peer.endpoint || "未知 endpoint"));
+      if (identities) wrap.append(element("small", "subtle", identities));
       address.append(wrap);
       const statusCell = element("td");
       const peerState = Number.isInteger(peer.state) && peer.state >= 0 && peer.state < peerLabels.length ? peer.state : 0;
@@ -870,7 +874,9 @@
     $("phase-pill").classList.toggle("stale", stale);
     $("phase-pill").classList.toggle("degraded", !!overlayErrors.length);
     text($("phase-label"), stale ? "状态更新延迟" : overlayErrors.length ? "隧道异常" : phaseLabels[state.phase]);
-    text($("local-address"), status && status.node || "—"); text($("local-device"), status && status.device || "—");
+    text($("local-address"), status && status.endpoint || "—");
+    const localIdentities = status && Array.isArray(status.network_identities) ? status.network_identities.filter((entry) => entry && entry.ip).map((entry) => entry.network + "=" + entry.ip).join(" ") : "";
+    text($("local-identities"), localIdentities || "—"); text($("local-device"), status && status.device || "—");
     text($("local-platform"), state.platform || "—"); text($("host-label"), state.platform ? state.platform + " 本机宿主" : "本机宿主已连接");
     text($("config-path"), state.config_path || "应用私有配置");
     text($("metric-sessions"), status ? sessions.filter((session) => session.ready === true).length : "—");

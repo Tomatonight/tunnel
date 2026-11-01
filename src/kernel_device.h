@@ -10,19 +10,19 @@ struct KernelPeer {
 };
 struct KernelRoute {
     Network network;
-    Endpoint destination;
+    NodeId destination;
     IpAddress ip;
     std::vector<Endpoint> hops;
 };
 struct KernelEnd {
     Network network;
-    Endpoint destination;
+    NodeId destination;
     const CryptoSession* crypto = nullptr;
     bool ready = false;
 };
 struct KernelPrefix {
     Network network, prefix;
-    Endpoint publisher;
+    NodeId publisher;
     bool selected = false;
 };
 struct KernelState {

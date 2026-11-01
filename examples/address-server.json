@@ -1,7 +1,10 @@
 {
-  "address_server": {
-    "address": "192.0.2.254:65534",
-    "shared_key": "replace-with-random-allocation-key",
-    "networks": ["10.1.0.0/24", "fd00:1::/64"]
-  }
+    "address_server":  {
+                           "address":  "192.0.2.254:65534",
+                           "shared_key":  "replace-with-random-allocation-key",
+                           "networks":  [
+                                            "10.1.0.0/24",
+                                            "fd00:1::/64"
+                                        ]
+                       }
 }

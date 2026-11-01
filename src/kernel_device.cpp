@@ -186,6 +186,7 @@ tnlk_ip native_ip(const IpAddress& a) {
     tnlk_ip r{}; r.family = static_cast<__u8>(a.family); std::copy(a.bytes.begin(), a.bytes.end(), r.bytes); return r;
 }
 tnlk_endpoint native_endpoint(const Endpoint& a) { tnlk_endpoint r{}; r.ip = native_ip(a.ip); r.port = a.port; return r; }
+tnlk_endpoint native_endpoint(const NodeId& a) { tnlk_endpoint r{}; r.ip = native_ip(a); r.port = 0; return r; }
 tnlk_network native_network(const Network& a) { tnlk_network r{}; r.address = native_ip(a.address); r.prefix = static_cast<__u8>(a.prefix); return r; }
 IpAddress from_ip(const tnlk_ip& a) { IpAddress r; r.family = a.family; std::copy(a.bytes, a.bytes + 16, r.bytes.begin()); return r; }
 Endpoint from_endpoint(const tnlk_endpoint& a) { Endpoint r; r.ip = from_ip(a.ip); r.port = a.port; return r; }

@@ -1,11 +1,13 @@
 {
-  "device_backend": "tun",
-  "address": "192.0.2.20:65535",
-  "networks": ["10.1.0.2/24"],
-  "peers": [
-    {
-      "address": "192.0.2.10:65535",
-      "shared_key": "replace-with-the-same-random-secret-on-both-nodes"
-    }
-  ]
+    "device_backend":  "tun",
+    "networks":  [
+                     "10.1.0.2/24"
+                 ],
+    "peers":  [
+                  {
+                      "shared_key":  "replace-with-the-same-random-secret-on-both-nodes",
+                      "endpoint":  "192.0.2.10:65535"
+                  }
+              ],
+    "endpoint":  "192.0.2.20:65535"
 }

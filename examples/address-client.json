@@ -1,17 +1,23 @@
 {
-  "address": "192.0.2.1:65535",
-  "address_clients": [
-    {
-      "address": "192.0.2.254:65534",
-      "shared_key": "replace-with-random-allocation-key",
-      "networks": ["10.1.0.0/24", "fd00:1::/64"]
-    }
-  ],
-  "peers": [
-    {
-      "address": "192.0.2.2:65535",
-      "shared_key": "replace-with-random-a-b-peer-key",
-      "networks": ["10.1.0.0/24", "fd00:1::/64"]
-    }
-  ]
+    "address_clients":  [
+                            {
+                                "address":  "192.0.2.254:65534",
+                                "shared_key":  "replace-with-random-allocation-key",
+                                "networks":  [
+                                                 "10.1.0.0/24",
+                                                 "fd00:1::/64"
+                                             ]
+                            }
+                        ],
+    "peers":  [
+                  {
+                      "shared_key":  "replace-with-random-a-b-peer-key",
+                      "networks":  [
+                                       "10.1.0.0/24",
+                                       "fd00:1::/64"
+                                   ],
+                      "endpoint":  "192.0.2.2:65535"
+                  }
+              ],
+    "endpoint":  "192.0.2.1:65535"
 }

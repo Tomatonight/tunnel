@@ -17,7 +17,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Time = Clock::time_point;
 using Json = wire::Json;
-using RouteKey = std::pair<Network, Endpoint>;
+using RouteKey = std::pair<Network, NodeId>;
 long long elapsed(Time now, Time then) { return std::chrono::duration_cast<std::chrono::milliseconds>(now - then).count(); }
 std::uint64_t random_token() {
     std::uint64_t value = 0;
@@ -33,7 +33,7 @@ Bytes probe_packet(unsigned char kind, std::uint64_t token) {
     Bytes b{kind}; for (int i = 56; i >= 0; i -= 8) b.push_back(static_cast<unsigned char>(token >> i)); return b;
 }
 std::string endpoints(const Endpoint& a, const Endpoint& b) { return a < b ? a.str() + "|" + b.str() : b.str() + "|" + a.str(); }
-Bytes remote_payload(const Network& network, const Endpoint& node, const IpAddress& ip, const Bytes& payload) {
+Bytes remote_payload(const Network& network, const NodeId& node, const IpAddress& ip, const Bytes& payload) {
     const auto prefix = "Tunnel remote desktop membership v1\n" + network.str() + "\n" + node.str() + "\n" + ip.str() + "\n";
     Bytes result(prefix.begin(), prefix.end()); result.insert(result.end(), payload.begin(), payload.end()); return result;
 }
@@ -96,7 +96,7 @@ struct Node::Impl {
     std::map<Endpoint, unsigned> attempts;
     std::map<RouteKey, EndSession> end_sessions;
     using SubnetKey = std::pair<Network, Network>;
-    std::map<SubnetKey, Endpoint> subnet_gateways;
+    std::map<SubnetKey, NodeId> subnet_gateways;
     std::map<SubnetKey, std::string> subnet_errors;
     std::map<Network, ReturnFlows> return_flows;
     std::vector<AdvertisedRoute> active_exports;
@@ -120,7 +120,7 @@ struct Node::Impl {
     Impl(EventLoop& l, Configure c, std::unique_ptr<PacketDevice> d, NodeOptions o, Endpoint previous_server = {})
         : loop(l), config(std::move(c)), options(std::move(o)),
           identity(options.identity ? options.identity : std::make_shared<IdentityKey>()), key(identity->public_key()),
-          routes(config.listen.address, config.networks, config.advertise_routes), device(std::move(d)) {
+          routes(config.networks, config.advertise_routes), device(std::move(d)) {
         if ((!device && !config.networks.empty()) || !options.tick_ms || !options.heartbeat_ms || options.failure_timeout_ms <= options.heartbeat_ms ||
             !options.reconnect_ms || !options.handshake_timeout_ms || !options.session_lifetime_ms)
             throw std::invalid_argument("invalid node/device timing configuration");
@@ -143,6 +143,12 @@ struct Node::Impl {
         for (const auto& p : config.peers) if (p.address == e) return &p;
         return nullptr;
     }
+    NodeId local_node(const Network& network) const {
+        const auto active = tunnels.find(network);
+        if (active != tunnels.end()) return active->second.config().tunnel_ip;
+        for (const auto& n : config.networks) if (n.tunnel == network) return n.tunnel_ip;
+        return NodeId{};
+    }
     KernelDataPlane* kernel() const { return dynamic_cast<KernelDataPlane*>(device.get()); }
     void sync_kernel() noexcept {
         auto* k = kernel();
@@ -161,7 +167,7 @@ struct Node::Impl {
             std::set<RouteKey> targets;
             for (const auto& p : routes.snapshot()) if (tunnels.count(p.network)) targets.insert({p.network, p.destination});
             for (const auto& p : active) for (const auto& n : p.second->networks)
-                if (tunnels.count(n.first)) targets.insert({n.first, p.first});
+                if (tunnels.count(n.first)) targets.insert({n.first, n.second});
             for (const auto& target : targets) {
                 KernelRoute r; r.network = target.first; r.destination = target.second;
                 if (!routes.ip_for_node(target.first, target.second, &r.ip)) continue;
@@ -179,8 +185,8 @@ struct Node::Impl {
                     state.prefixes.push_back(std::move(p));
                 }
             }
-            for (const auto& n : tunnels) for (const auto& prefix : routes.prefixes_for_node(n.first, config.listen.address)) {
-                KernelPrefix p; p.network = n.first; p.prefix = prefix; p.publisher = config.listen.address; p.selected = true;
+            for (const auto& n : tunnels) for (const auto& prefix : routes.prefixes_for_node(n.first, local_node(n.first))) {
+                KernelPrefix p; p.network = n.first; p.prefix = prefix; p.publisher = local_node(n.first); p.selected = true;
                 state.prefixes.push_back(std::move(p));
             }
             for (const auto& entry : end_sessions) if (entry.second.crypto && tunnels.count(entry.first.first)) {
@@ -224,12 +230,14 @@ struct Node::Impl {
                 l.probe = 0; if (before != PEER_STATE_ESTABLISHED) established(l);
             }
         } else if (event.kind == KernelEvent::NeedSession) {
-            if (!tunnels.count(event.network) || routes.next_hops(event.network, event.peer).empty()) return;
-            ensure_end({event.network, event.peer});
+            const NodeId node = event.peer.ip;
+            if (!tunnels.count(event.network) || routes.next_hops(event.network, node).empty()) return;
+            ensure_end({event.network, node});
         } else if (event.kind == KernelEvent::Rekey) {
             if (event.network.address.family == 4 || event.network.address.family == 6) {
-                end_sessions.erase({event.network, event.peer});
-                if (tunnels.count(event.network)) ensure_end({event.network, event.peer});
+                const NodeId node = event.peer.ip;
+                end_sessions.erase({event.network, node});
+                if (tunnels.count(event.network)) ensure_end({event.network, node});
             } else if (found != active.end()) fail(*found->second);
         }
     }
@@ -238,11 +246,11 @@ struct Node::Impl {
         if (options.log) try { options.log(text); } catch (...) {}
     }
     bool local_export(const Network& network, const IpAddress& ip) const {
-        for (const auto& prefix : routes.prefixes_for_node(network, config.listen.address))
+        for (const auto& prefix : routes.prefixes_for_node(network, local_node(network)))
             if (prefix.usable_host(ip)) return true;
         return false;
     }
-    bool published_by(const Network& network, const Endpoint& node, const IpAddress& ip) const {
+    bool published_by(const Network& network, const NodeId& node, const IpAddress& ip) const {
         for (const auto& prefix : routes.prefixes_for_node(network, node)) if (prefix.usable_host(ip)) return true;
         return false;
     }
@@ -251,7 +259,7 @@ struct Node::Impl {
         for (const auto& peer : config.peers) if (prefix.contains(peer.address.ip)) return true;
         for (const auto& client : config.address_clients) if (prefix.contains(client.address.ip)) return true;
         if (config.address_server.enabled && prefix.contains(config.address_server.address.ip)) return true;
-        for (const auto& path : routes.snapshot()) if (prefix.contains(path.destination.ip)) return true;
+        for (const auto& path : routes.snapshot()) if (prefix.contains(path.destination)) return true;
         return false;
     }
     void sync_subnets(bool force = false) {
@@ -281,7 +289,7 @@ struct Node::Impl {
             }
             if (!previous.empty() || !active_exports.empty()) dirty = true;
         }
-        std::vector<ImportedRoute> desired; std::map<SubnetKey, Endpoint> gateways;
+        std::vector<ImportedRoute> desired; std::map<SubnetKey, NodeId> gateways;
         std::map<SubnetKey, std::string> errors;
         for (const auto& network : tunnels) {
             std::set<Network> candidates;
@@ -291,9 +299,9 @@ struct Node::Impl {
                 bool local = false;
                 for (const auto& setting : config.advertise_routes) if (setting.prefix == prefix) local = true;
                 if (local) continue; // Never redirect our own LAN back into TUN.
-                const SubnetKey id{network.first, prefix}; Endpoint gateway;
+                const SubnetKey id{network.first, prefix}; NodeId gateway;
                 if (!routes.select_gateway(network.first, prefix, &gateway)) { errors[id] = "conflicting or unreachable subnet announcement"; continue; }
-                if (gateway == config.listen.address) continue;
+                if (gateway == local_node(network.first)) continue;
                 if (protects_transport(prefix)) { errors[id] = "subnet overlaps an overlay or allocation transport address"; continue; }
                 ImportedRoute route; route.tunnel = network.first; route.prefix = prefix; route.source = network.second.config().tunnel_ip;
                 desired.push_back(route); gateways[id] = gateway;
@@ -516,19 +524,20 @@ struct Node::Impl {
         std::vector<Network> authorized;
         for (const auto& n : l.networks) authorized.push_back(n.first);
         routes.set_authorized_networks(l.remote, authorized);
+        routes.set_peer_nodes(l.remote, l.networks);
         for (const auto& old : previous) {
             const auto current = l.networks.find(old.first);
             if (current == l.networks.end() || current->second != old.second)
-                routes.withdraw(l.remote, old.first, l.remote);
+                routes.withdraw(l.remote, old.first, old.second);
         }
         if (l.networks.empty()) { fail(l); return; }
         if (l.peer && l.peer->state() == PEER_STATE_ESTABLISHED) {
             for (const auto& n : l.networks) {
                 const auto old = previous.find(n.first);
                 if (old != previous.end() && old->second == n.second) continue;
-                if (l.permitted.at(n.first).port) routes.confirm_allocated_address(n.first, l.remote, n.second);
-                PathAnnouncement a; a.network = n.first; a.destination = l.remote; a.tunnel_ip = n.second;
-                a.public_key = l.key; a.path.push_back(l.remote);
+                if (l.permitted.at(n.first).port) routes.confirm_allocated_address(n.first, n.second, n.second);
+                PathAnnouncement a; a.network = n.first; a.destination = n.second; a.tunnel_ip = n.second;
+                a.public_key = l.key; a.path.push_back(n.second);
                 if (!routes.announce(l.remote, a)) ++counters["route_rejected"];
             }
         }
@@ -591,8 +600,8 @@ struct Node::Impl {
             if (l->dead || !l->peer || l->peer->state() != PEER_STATE_ESTABLISHED) continue;
             const auto remote = l->networks.find(network);
             if (remote == l->networks.end()) continue;
-            PathAnnouncement a; a.network = network; a.destination = l->remote; a.tunnel_ip = remote->second;
-            a.public_key = l->key; a.path.push_back(l->remote);
+            PathAnnouncement a; a.network = network; a.destination = remote->second; a.tunnel_ip = remote->second;
+            a.public_key = l->key; a.path.push_back(remote->second);
             if (changed) {
                 if (routes.announce(l->remote, a)) dirty = true;
                 // Local address replacement discarded indirect candidates too.
@@ -617,7 +626,7 @@ struct Node::Impl {
                 }
                 const auto* p = peer_config(l.remote); if (!p) throw std::runtime_error("unknown authenticated peer");
                 l.hello_sent = true;
-                send(l, {{"type", "hello"}, {"version", 1}, {"node", config.listen.address.str()}, {"key", wire::hex(key)},
+                send(l, {{"type", "hello"}, {"version", 1}, {"endpoint", config.listen.address.str()}, {"key", wire::hex(key)},
                     {"network_updates", true}, {"offers", network_offers(l)}, {"networks", local_membership(l)},
                     {"tcp_data", true}, {"transport", p->transport}});
             }
@@ -643,7 +652,8 @@ struct Node::Impl {
         }
     }
     void hello(Link& l, const Json& j) {
-        if (l.hello_received || j.at("version") != 1 || Endpoint::parse(j.at("node").get<std::string>()) != l.remote)
+        if (l.hello_received || j.at("version") != 1 || !j.count("endpoint") ||
+            Endpoint::parse(j.at("endpoint").get<std::string>()) != l.remote)
             throw std::invalid_argument("invalid peer hello");
         const auto* p = peer_config(l.remote); if (!p) throw std::invalid_argument("unknown peer");
         const auto requested_transport = j.value("transport", std::string("udp"));
@@ -705,9 +715,9 @@ struct Node::Impl {
     void established(Link& l) {
         routes.set_available(l.remote, true);
         for (const auto& n : l.networks) {
-            if (l.permitted.at(n.first).port) routes.confirm_allocated_address(n.first, l.remote, n.second);
-            PathAnnouncement a; a.network = n.first; a.destination = l.remote; a.tunnel_ip = n.second;
-            a.public_key = l.key; a.path.push_back(l.remote);
+            if (l.permitted.at(n.first).port) routes.confirm_allocated_address(n.first, n.second, n.second);
+            PathAnnouncement a; a.network = n.first; a.destination = n.second; a.tunnel_ip = n.second;
+            a.public_key = l.key; a.path.push_back(n.second);
             if (!routes.announce(l.remote, a)) { fail(l); return; }
         }
         invalidate_end(); attempts[l.remote] = 0; dirty = true; ++counters["peer_up"];
@@ -772,7 +782,7 @@ struct Node::Impl {
             if (routes.announce(l.remote, a)) { invalidate_end(); dirty = true; } else ++counters["route_rejected"];
         } else if (type == "withdraw") {
             const auto n = Network::parse(j.at("network").get<std::string>());
-            const auto d = Endpoint::parse(j.at("node").get<std::string>());
+            const auto d = IpAddress::parse(j.at("node").get<std::string>());
             if (!l.permitted.count(n)) throw std::invalid_argument("unauthorized withdrawal");
             routes.withdraw(l.remote, n, d); invalidate_end(); dirty = true;
         } else if (type == "e2e") receive_end(l, j);
@@ -787,8 +797,8 @@ struct Node::Impl {
             if (l.dead || l.peer->state() != PEER_STATE_ESTABLISHED) continue;
             std::map<RouteKey, std::string> next;
             for (const auto& n : l.networks) {
-                PathAnnouncement a; a.network = n.first; a.destination = config.listen.address;
-                a.tunnel_ip = tunnels.at(n.first).config().tunnel_ip; a.public_key = key; a.path.push_back(config.listen.address);
+                PathAnnouncement a; a.network = n.first; a.destination = local_node(n.first);
+                a.tunnel_ip = local_node(n.first); a.public_key = key; a.path.push_back(local_node(n.first));
                 a.prefixes = routes.active_local_prefixes(n.first);
                 next[{a.network, a.destination}] = wire::route(a).dump();
             }
@@ -809,13 +819,13 @@ struct Node::Impl {
         for (auto it = end_sessions.begin(); it != end_sessions.end();) {
             PublicKey current; IpAddress address;
             if (!routes.ip_for_node(it->first.first, it->first.second, &address) ||
-                !routes.public_key(it->first.second, &current) || current != it->second.key) {
+                !routes.public_key(it->first.first, it->first.second, &current) || current != it->second.key) {
                 return_flows[it->first.first].erase_peer(it->first.second); it = end_sessions.erase(it);
             }
             else ++it;
         }
     }
-    Link* next_link(const Network& network, const Endpoint& node, std::uint64_t flow) {
+    Link* next_link(const Network& network, const NodeId& node, std::uint64_t flow) {
         Endpoint next;
         if (!routes.select_unicast(network, node, flow, &next)) return nullptr;
         auto it = active.find(next);
@@ -825,12 +835,12 @@ struct Node::Impl {
     }
     void route_end(Json message) {
         const auto network = Network::parse(message.at("network").get<std::string>());
-        const auto destination = Endpoint::parse(message.at("destination").get<std::string>());
+        const auto destination = IpAddress::parse(message.at("destination").get<std::string>());
         auto* next = next_link(network, destination, 0);
         if (next) send(*next, message); else ++counters["no_route"];
     }
     Json end_message(const RouteKey& target, const std::string& op) {
-        return {{"type", "e2e"}, {"network", target.first.str()}, {"source", config.listen.address.str()},
+        return {{"type", "e2e"}, {"network", target.first.str()}, {"source", local_node(target.first).str()},
             {"destination", target.second.str()}, {"op", op}, {"hops", protocol::default_hop_limit}};
     }
     void flush_end(const RouteKey& target, EndSession& s) {
@@ -845,7 +855,7 @@ struct Node::Impl {
     }
     void progress_end(const RouteKey& target, EndSession& s) {
         if (s.tls->ready() && !s.crypto) {
-            const auto context = target.first.str() + "|" + endpoints(config.listen.address, target.second) + "|" + s.id;
+            const auto context = target.first.str() + "|" + local_node(target.first).str() + "|" + target.second.str() + "|" + s.id;
             s.crypto = s.tls->session(CryptoScope::EndToEnd, context);
         }
         if (s.crypto && !s.sent_ready) { s.tls->write(Bytes{1}); s.sent_ready = true; }
@@ -872,32 +882,32 @@ struct Node::Impl {
         auto it = end_sessions.find(target);
         if (it != end_sessions.end()) return &it->second;
         PublicKey remote;
-        if (end_sessions.size() >= 256 || !routes.public_key(target.second, &remote) ||
+        if (end_sessions.size() >= 256 || !routes.public_key(target.first, target.second, &remote) ||
             routes.next_hops(target.first, target.second).empty()) return nullptr;
         auto& s = end_sessions[target]; s.key = remote;
-        s.client = config.listen.address < target.second;
+        s.client = local_node(target.first) < target.second;
         if (s.client) begin_end(target, s);
         else { route_end(end_message(target, "request")); s.requested = Clock::now(); }
         return &s;
     }
     void receive_end(Link& incoming, Json j) {
         const auto n = Network::parse(j.at("network").get<std::string>());
-        const auto source = Endpoint::parse(j.at("source").get<std::string>());
-        const auto destination = Endpoint::parse(j.at("destination").get<std::string>());
+        const auto source = IpAddress::parse(j.at("source").get<std::string>());
+        const auto destination = IpAddress::parse(j.at("destination").get<std::string>());
         const auto hops = j.at("hops").get<unsigned>();
-        if (!hops || hops > protocol::default_hop_limit || !incoming.networks.count(n) || source == config.listen.address ||
-            !source.ip.unicast() || !destination.ip.unicast()) { ++counters["control_rejected"]; return; }
-        if (destination != config.listen.address) {
+        if (!hops || hops > protocol::default_hop_limit || !incoming.networks.count(n) || source == local_node(n) ||
+            !source.unicast() || !destination.unicast()) { ++counters["control_rejected"]; return; }
+        if (destination != local_node(n)) {
             if (hops == 1) { ++counters["hop_limit_drop"]; return; }
             auto* next = next_link(n, destination, 0);
             if (next && next != &incoming) { j["hops"] = hops - 1; send(*next, j); ++counters["control_forwarded"]; }
             return;
         }
         const RouteKey target{n, source}; PublicKey remote;
-        if (!tunnels.count(n) || !routes.public_key(source, &remote) || routes.next_hops(n, source).empty()) return;
+        if (!tunnels.count(n) || !routes.public_key(n, source, &remote) || routes.next_hops(n, source).empty()) return;
         const auto op = j.at("op").get<std::string>();
         if (op == "request") {
-            if (!(config.listen.address < source)) return;
+            if (!(local_node(n) < source)) return;
             auto it = end_sessions.find(target);
             if (it != end_sessions.end() && it->second.confirmed && elapsed(Clock::now(), it->second.created) >= options.heartbeat_ms)
                 end_sessions.erase(it);
@@ -909,7 +919,7 @@ struct Node::Impl {
         if (bytes.empty()) throw std::invalid_argument("empty handshake record");
         auto it = end_sessions.find(target);
         if (op == "start") {
-            if (!(source < config.listen.address)) return;
+            if (!(source < local_node(n))) return;
             std::uint64_t attempt = 0;
             if (j.count("attempt")) {
                 if (!j.at("attempt").is_number_unsigned() || !(attempt = j.at("attempt").get<std::uint64_t>()))
@@ -935,7 +945,7 @@ struct Node::Impl {
         }
         catch (...) { ++counters["e2e_rejected"]; end_sessions.erase(target); }
     }
-    bool imported_gateway(const Network& network, const IpAddress& ip, Endpoint* peer) const {
+    bool imported_gateway(const Network& network, const IpAddress& ip, NodeId* peer) const {
         for (const auto& item : subnet_gateways) if (item.first.first == network && item.first.second.usable_host(ip)) {
             *peer = item.second; return true;
         }
@@ -954,21 +964,21 @@ struct Node::Impl {
         if (tunnel == tunnels.end() || !tunnel->second.inspect(packet, &info, false, true) || info.kind != protocol::PacketKind::Unicast) return;
         if (info.source == tunnel->second.config().tunnel_ip) {
             if (target.first.usable_host(info.destination)) {
-                Endpoint destination;
+                NodeId destination;
                 if (!routes.node_for_ip(target.first, info.destination, &destination) || destination != target.second) return;
             } else {
-                Endpoint current;
+                NodeId current;
                 if (!imported_gateway(target.first, info.destination, &current) || !published_by(target.first, target.second, info.destination) ||
                     !return_flows[target.first].remember(packet, target.second)) { ++counters["subnet_request_drop"]; return; }
             }
         } else {
-            Endpoint destination; IpAddress requested; bool related = false;
+            NodeId destination; IpAddress requested; bool related = false;
             if (!return_flows[target.first].reply(packet, &destination, &related, Clock::now(), &requested) || destination != target.second ||
                 !local_export(target.first, requested) || (!related && !local_export(target.first, info.source))) {
                 ++counters["subnet_unsolicited_drop"]; return;
             }
         }
-        protocol::ForwardHeader header; header.network = target.first; header.source = config.listen.address;
+        protocol::ForwardHeader header; header.network = target.first; header.source = local_node(target.first);
         header.destination = target.second; header.flow_id = info.flow_id;
         auto* next = next_link(target.first, target.second, info.flow_id);
         if (!next) { ++counters["no_route"]; return; }
@@ -993,7 +1003,7 @@ struct Node::Impl {
                 if (info.source != local) {
                     // The LAN may only return packets for requests which this
                     // gateway previously delivered. No LAN-initiated sessions.
-                    Endpoint destination; IpAddress requested; bool related = false;
+                    NodeId destination; IpAddress requested; bool related = false;
                     auto flows = return_flows.find(item.first);
                     if (info.kind != protocol::PacketKind::Unicast || flows == return_flows.end() ||
                         !flows->second.reply(packet, &destination, &related, Clock::now(), &requested) ||
@@ -1007,16 +1017,16 @@ struct Node::Impl {
                 if (info.kind != protocol::PacketKind::Unicast) {
                     if (!item.second.inspect(packet, &info, true)) continue;
                     protocol::ForwardHeader h; h.kind = info.kind; h.network = item.first;
-                    h.source = config.listen.address; h.flow_id = info.flow_id;
+                    h.source = local_node(item.first); h.flow_id = info.flow_id;
                     flood(h, packet, nullptr); ++counters["flood_sent"]; return;
                 }
                 if (info.destination == item.second.config().tunnel_ip) { device->send(packet); return; }
-                Endpoint destination;
+                NodeId destination;
                 if (item.first.usable_host(info.destination)) {
                     if (!routes.node_for_ip(item.first, info.destination, &destination)) { ++counters["no_route"]; return; }
                 } else {
                     if (!imported_gateway(item.first, info.destination, &destination)) { ++counters["no_route"]; return; }
-                    Endpoint previous;
+                    NodeId previous;
                     if (return_flows[item.first].request_peer(packet, &previous) && published_by(item.first, previous, info.destination) &&
                         !routes.next_hops(item.first, previous).empty()) destination = previous;
                     if (!return_flows[item.first].remember(packet, destination)) { ++counters["subnet_request_drop"]; return; }
@@ -1032,9 +1042,9 @@ struct Node::Impl {
     void forward(Link& incoming, const Bytes& plain) {
         protocol::ForwardHeader h; Bytes payload;
         if (!protocol::decode(plain, &h, &payload) || !incoming.networks.count(h.network) || !tunnels.count(h.network) ||
-            h.source == config.listen.address) { ++counters["invalid_forward"]; return; }
+            h.source == local_node(h.network)) { ++counters["invalid_forward"]; return; }
         if (h.kind == protocol::PacketKind::Unicast) {
-            if (h.destination != config.listen.address) {
+            if (h.destination != local_node(h.network)) {
                 if (h.hop_limit <= 1) { ++counters["hop_limit_drop"]; return; }
                 auto* next = next_link(h.network, h.destination, h.flow_id);
                 if (next && next != &incoming) { --h.hop_limit; send_data(*next, protocol::encode(h, payload)); ++counters["unicast_forwarded"]; }
@@ -1055,7 +1065,7 @@ struct Node::Impl {
                     ++counters["subnet_requests_delivered"];
                 }
             } else {
-                Endpoint gateway; IpAddress requested; bool related = false;
+                NodeId gateway; IpAddress requested; bool related = false;
                 if (info.destination != tunnels.at(h.network).config().tunnel_ip ||
                     !return_flows[h.network].reply(packet, &gateway, &related, Clock::now(), &requested) || gateway != h.source ||
                     !published_by(h.network, h.source, requested) || (!related && !published_by(h.network, h.source, info.source))) {
@@ -1187,7 +1197,7 @@ struct Node::Impl {
             if (method == "remote_info") {
                 const auto& remote = config.remote_desktop;
                 Json selected = Json::array(); for (const auto& n : remote.networks) selected.push_back(n.str());
-                result = {{"node", config.listen.address.port ? config.listen.address.str() : std::string()},
+                result = {{"endpoint", config.listen.address.port ? config.listen.address.str() : std::string()},
                     {"public_key", wire::hex(key)}, {"networks", Json::array()},
                     {"remote_desktop", {{"enabled", remote.enabled}, {"networks", selected}, {"access", remote.access},
                         {"unattended", remote.unattended}, {"port", remote.port}, {"device_name", remote.device_name}}}};
@@ -1202,19 +1212,19 @@ struct Node::Impl {
                 if (method == "remote_sign") {
                     if (!started || device_failed || local == tunnels.end()) throw std::invalid_argument("inactive_network");
                     const auto& ip = local->second.config().tunnel_ip;
-                    result = {{"node", config.listen.address.str()}, {"network", network.str()}, {"source_ip", ip.str()},
-                        {"signature", wire::hex(identity->sign(remote_payload(network, config.listen.address, ip, payload)))}};
+                    result = {{"node", ip.str()}, {"network", network.str()}, {"source_ip", ip.str()},
+                        {"signature", wire::hex(identity->sign(remote_payload(network, ip, ip, payload)))}};
                 } else {
                     const auto node_text = remote_string(request, "node", 80);
                     const auto source_text = remote_string(request, "source_ip", 64);
-                    const auto node = Endpoint::parse(node_text);
+                    const auto node = IpAddress::parse(node_text);
                     const auto source = IpAddress::parse(source_text);
                     const auto signature = wire::unhex(remote_string(request, "signature", 128), 64);
                     if (node.str() != node_text || source.str() != source_text || signature.size() != 64)
                         throw std::invalid_argument("invalid_request");
                     bool reachable = false, valid = false;
                     PublicKey remote_key{}; IpAddress current_ip;
-                    if (started && !device_failed && local != tunnels.end() && node != config.listen.address) {
+                    if (started && !device_failed && local != tunnels.end() && node != local_node(network)) {
                         for (const auto& next : routes.next_hops(network, node)) {
                             const auto link = active.find(next);
                             if (link != active.end() && !link->second->dead && link->second->networks.count(network) &&
@@ -1224,7 +1234,7 @@ struct Node::Impl {
                             }
                         }
                         valid = reachable && routes.ip_for_node(network, node, &current_ip) && current_ip == source &&
-                            routes.public_key(node, &remote_key) && IdentityKey::verify(remote_key, remote_payload(network, node, source, payload), signature);
+                            routes.public_key(network, node, &remote_key) && IdentityKey::verify(remote_key, remote_payload(network, node, source, payload), signature);
                     }
                     result = {{"valid", valid}, {"node", node.str()}, {"network", network.str()}, {"source_ip", source.str()}};
                 }
@@ -1244,7 +1254,8 @@ struct Node::Impl {
     Json status() const {
         unsigned pending_connections = 0;
         for (const auto& l : links) if (!l->dead && !l->hello_received) ++pending_connections;
-        Json result{{"node", config.listen.address.port ? config.listen.address.str() : std::string()}, {"public_key", wire::hex(key)}, {"device", device ? device->name() : std::string()},
+        Json result{{"endpoint", config.listen.address.port ? config.listen.address.str() : std::string()},
+                    {"network_identities", Json::array()}, {"public_key", wire::hex(key)}, {"device", device ? device->name() : std::string()},
                     {"pending_connections", pending_connections},
                     {"running", started}, {"counters", counters}, {"peers", Json::array()}, {"routes", Json::array()},
                     {"end_sessions", Json::array()}, {"networks", Json::array()}, {"address_errors", Json::object()}};
@@ -1260,7 +1271,7 @@ struct Node::Impl {
             bool available = false;
             for (const auto& active : active_exports) if (active.tunnel == route.tunnel && active.prefix == route.prefix) available = true;
             std::string error = export_error;
-            const auto usable = routes.prefixes_for_node(route.tunnel, config.listen.address);
+            const auto usable = routes.prefixes_for_node(route.tunnel, local_node(route.tunnel));
             if (available && std::find(usable.begin(), usable.end(), route.prefix) == usable.end()) {
                 available = false; error = "conflicting subnet announcement";
             }
@@ -1272,6 +1283,7 @@ struct Node::Impl {
             const auto active_network = tunnels.find(n.tunnel);
             Json entry{{"network", n.tunnel.str()}, {"managed", n.allocation_server.port != 0},
                 {"active", active_network != tunnels.end()}, {"ip", active_network == tunnels.end() ? std::string() : active_network->second.config().tunnel_ip.str()}};
+            result["network_identities"].push_back({{"network", n.tunnel.str()}, {"ip", entry["ip"]}});
             if (n.allocation_server.port) entry["server"] = n.allocation_server.str();
             result["networks"].push_back(entry);
         }
@@ -1279,19 +1291,22 @@ struct Node::Impl {
         for (const auto& p : config.peers) {
             auto it = active.find(p.address);
             Json networks = Json::array();
-            if (it != active.end()) for (const auto& n : it->second->networks) networks.push_back(n.first.str());
-            result["peers"].push_back({{"node", p.address.str()}, {"state", it == active.end() ? 0 : int(it->second->peer->state())},
-                {"networks", networks}, {"configured_transport", p.transport},
+            Json identities = Json::object();
+            if (it != active.end()) for (const auto& n : it->second->networks) {
+                networks.push_back(n.first.str()); identities[n.first.str()] = n.second.str();
+            }
+            result["peers"].push_back({{"endpoint", p.address.str()}, {"state", it == active.end() ? 0 : int(it->second->peer->state())},
+                {"networks", networks}, {"identities", identities}, {"configured_transport", p.transport},
                 {"transport", it == active.end() ? p.transport : (it->second->data_tcp ? "tcp" : "udp")}});
         }
         std::set<RouteKey> seen;
         for (const auto& a : routes.snapshot()) seen.insert({a.network, a.destination});
         // Direct destinations may be excluded from every split-horizon export.
         for (const auto& p : active) for (const auto& n : p.second->networks)
-            if (!routes.next_hops(n.first, p.first).empty()) seen.insert({n.first, p.first});
+            if (!routes.next_hops(n.first, n.second).empty()) seen.insert({n.first, n.second});
         for (const auto& target : seen) {
             Json hops = Json::array(); for (const auto& h : routes.next_hops(target.first, target.second)) hops.push_back(h.str());
-            PublicKey pub{}; routes.public_key(target.second, &pub);
+            PublicKey pub{}; routes.public_key(target.first, target.second, &pub);
             IpAddress ip; const bool has_ip = routes.ip_for_node(target.first, target.second, &ip);
             result["routes"].push_back({{"network", target.first.str()}, {"node", target.second.str()}, {"next_hops", hops}, {"key", wire::hex(pub)},
                 {"ip", has_ip ? ip.str() : std::string()}});
@@ -1345,8 +1360,8 @@ wire::Json Node::apply_config(const Configure& requested) {
     if (previous_base == next_base && !restore_device) {
         result["mode"] = "peers";
         std::map<std::string, Json> before, after;
-        for (const auto& peer : previous_json.value("peers", Json::array())) before[peer.at("address").get<std::string>()] = peer;
-        for (const auto& peer : next_json.value("peers", Json::array())) after[peer.at("address").get<std::string>()] = peer;
+        for (const auto& peer : previous_json.value("peers", Json::array())) before[peer.at("endpoint").get<std::string>()] = peer;
+        for (const auto& peer : next_json.value("peers", Json::array())) after[peer.at("endpoint").get<std::string>()] = peer;
         std::set<Endpoint> changed;
         for (const auto& peer : before) if (!after.count(peer.first) || after.at(peer.first) != peer.second) changed.insert(Endpoint::parse(peer.first));
         for (const auto& peer : after) if (!before.count(peer.first) || before.at(peer.first) != peer.second) changed.insert(Endpoint::parse(peer.first));

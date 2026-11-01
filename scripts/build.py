@@ -28,6 +28,18 @@ def run(command: list[str]) -> None:
     subprocess.run(command, cwd=ROOT, check=True)
 
 
+def usable_ninja(path: str) -> bool:
+    """Return whether a Ninja path is a working executable, not a broken wrapper."""
+    try:
+        subprocess.run([path, "--version"], cwd=ROOT, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        print(f"Ignoring unusable Ninja: {path}", flush=True)
+        return False
+    return True
+
+
 def copy_windows_runtime(build_dir: Path, preserved: Path | None = None) -> None:
     if os.name != "nt":
         return
@@ -133,7 +145,19 @@ def main() -> int:
             ROOT / ".build-tools" / "cmake" / "data" / "bin" / ("cmake.exe" if os.name == "nt" else "cmake"),
         )
         local_ninja = ROOT / ".build-tools" / "bin" / ("ninja.exe" if os.name == "nt" else "ninja")
-        ninja = str(local_ninja) if local_ninja.is_file() else shutil.which("ninja")
+        ninja = None
+        candidates = []
+        if local_ninja.is_file():
+            candidates.append(str(local_ninja))
+        path_ninja = shutil.which("ninja")
+        if path_ninja:
+            candidates.append(path_ninja)
+        if os.name != "nt" and Path("/usr/bin/ninja").is_file():
+            candidates.append("/usr/bin/ninja")
+        for candidate in dict.fromkeys(candidates):
+            if usable_ninja(candidate):
+                ninja = candidate
+                break
 
         configure = [cmake, "-S", str(ROOT), "-B", str(build_dir), "-DBUILD_TESTING=OFF", "-DLIBEVENT_STATIC_LINK=OFF"]
         local_toolchain = ROOT / ".build-tools" / "zig-toolchain.cmake"

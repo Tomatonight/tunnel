@@ -124,6 +124,13 @@ static bool tk_unicast(const struct tnlk_ip *ip)
 }
 static bool tk_endpoint_valid(const struct tnlk_endpoint *e)
 { return e->port && tk_unicast(&e->ip); }
+/* Virtual node identities share the endpoint storage in the local ABI, but
+ * deliberately carry no transport port.  Transport peers continue to use
+ * tk_endpoint_valid above. */
+static bool tk_node_valid(const struct tnlk_endpoint *e)
+{ return !e->port && tk_unicast(&e->ip); }
+static bool tk_node_equal(const struct tnlk_endpoint *a, const struct tnlk_endpoint *b)
+{ return !memcmp(&a->ip, &b->ip, sizeof(a->ip)); }
 static bool tk_contains(const struct tnlk_network *n, const struct tnlk_ip *ip)
 {
 	u32 bytes = n->prefix / 8, bits = n->prefix % 8;
@@ -284,7 +291,7 @@ static struct tnlk_route *tk_route(struct tk_state *s, u32 network, const struct
 {
 	u32 i;
 	for (i = 0; i < s->header->routes; ++i)
-		if (s->routes[i].network == network && tk_endpoint_equal(&s->routes[i].destination, e)) return &s->routes[i];
+		if (s->routes[i].network == network && tk_node_equal(&s->routes[i].destination, e)) return &s->routes[i];
 	return NULL;
 }
 static struct tnlk_route *tk_route_ip(struct tk_state *s, u32 network, const struct tnlk_ip *ip)
@@ -309,7 +316,7 @@ static bool tk_published(struct tk_state *s, u32 network, const struct tnlk_endp
 	u32 i;
 	for (i = 0; i < s->header->prefixes; ++i) {
 		const struct tnlk_prefix *p = &s->prefixes[i];
-		if (p->network == network && (!selected || p->selected) && tk_endpoint_equal(&p->publisher, publisher) &&
+		if (p->network == network && (!selected || p->selected) && tk_node_equal(&p->publisher, publisher) &&
 		    tk_host(&p->prefix, ip)) return true;
 	}
 	return false;
@@ -488,7 +495,7 @@ static bool tk_remember(struct tk *t, u32 network, const u8 *data, u32 size,
 	bool related;
 	if (!tk_flow_key(t, network, data, size, p, false, &key, &lifetime, &related)) return false;
 	flow = tk_flow_find(t, &key);
-	if (p->later) return flow && tk_endpoint_equal(&flow->peer, peer);
+	if (p->later) return flow && tk_node_equal(&flow->peer, peer);
 	if (!flow) for (i = 0; i < TK_FLOW_LIMIT; ++i) {
 		if (!tk_unexpired(t->flows[i].expires)) { flow = &t->flows[i]; break; }
 	}
@@ -589,12 +596,12 @@ static bool tk_send(struct tk *t, u32 peer_index, const u8 *plain, u32 size)
 	kfree_sensitive(record); return sent;
 }
 static void tk_header(u8 *header, u8 kind, const struct tnlk_network *network,
-		      const struct tnlk_endpoint *source, const struct tnlk_endpoint *destination, u64 flow, u32 length)
+		      const struct tnlk_ip *source, const struct tnlk_endpoint *destination, u64 flow, u32 length)
 {
-	memset(header, 0, TK_FORWARD_HEADER); header[0] = 1; header[1] = kind; header[2] = TK_HOP_LIMIT;
+	memset(header, 0, TK_FORWARD_HEADER); header[0] = 2; header[1] = kind; header[2] = TK_HOP_LIMIT;
 	memcpy(header + 4, network, sizeof(*network));
-	memcpy(header + 22, &source->ip, sizeof(source->ip)); tw_put16(header + 39, source->port);
-	if (destination) { memcpy(header + 41, &destination->ip, sizeof(destination->ip)); tw_put16(header + 58, destination->port); }
+	memcpy(header + 22, source, sizeof(*source));
+	if (destination) { memcpy(header + 41, &destination->ip, sizeof(destination->ip)); }
 	else header[41] = 4; /* IpAddress's default unspecified family in protocol.cpp */
 	tw_put64(header + 60, flow); tw_put16(header + 68, length);
 }
@@ -614,7 +621,7 @@ static void tk_unicast_send(struct tk *t, u32 network, const struct tnlk_endpoin
 	int next = tk_next(s, tk_route(s, network, destination), flow), error;
 	if (next < 0) { tk_drop(t, TNLK_NO_ROUTE); return; }
 	for (i = 0; i < s->header->ends; ++i)
-		if (s->ends[i].network == network && s->ends[i].ready && tk_endpoint_equal(&s->ends[i].destination, destination)) break;
+		if (s->ends[i].network == network && s->ends[i].ready && tk_node_equal(&s->ends[i].destination, destination)) break;
 	if (i == s->header->ends) {
 		tk_drop(t, TNLK_NO_SESSION);
 		if (__ratelimit(&t->notifications)) tk_event(t, TNLK_EVENT_NEED_SESSION, destination, &s->nets[network].network, 0, NULL, 0);
@@ -622,7 +629,7 @@ static void tk_unicast_send(struct tk *t, u32 network, const struct tnlk_endpoin
 	}
 	plain = kmalloc(length, GFP_ATOMIC);
 	if (!plain) { tk_drop(t, TNLK_RESOURCE_DROP); return; }
-	tk_header(plain, 1, &s->nets[network].network, &t->config.local, destination, flow, size + TK_RECORD_OVERHEAD);
+	tk_header(plain, 1, &s->nets[network].network, &s->nets[network].local_ip, destination, flow, size + TK_RECORD_OVERHEAD);
 	memcpy(aad, plain, sizeof(aad)); aad[2] = 0;
 	memcpy(plain + TK_FORWARD_HEADER + TK_RECORD_HEADER, packet, size);
 	error = tk_seal(s->end_crypto[i], &s->ends[i].keys, 2, plain + TK_FORWARD_HEADER, size, aad, sizeof(aad));
@@ -641,6 +648,7 @@ static void tk_from_device(struct tk *t, const u8 *data, u32 size)
 	if (!tk_live(t)) { tk_drop(t, TNLK_POLICY_DROP); return; }
 	for (n = 0; n < s->header->networks; ++n) {
 		struct tk_packet p;
+		struct tnlk_endpoint local_node = { .ip = s->nets[n].local_ip, .port = 0 };
 		struct tnlk_endpoint *destination;
 		struct tnlk_route *route;
 		struct tk_flow *binding;
@@ -649,8 +657,8 @@ static void tk_from_device(struct tk *t, const u8 *data, u32 size)
 		if (!tk_ip_equal(&p.source, &s->nets[n].local_ip)) {
 			if (p.kind != 1) continue;
 			binding = tk_flow_lookup(t, n, data, size, &p, true, &related);
-			if (!binding || !tk_published(s, n, &t->config.local, &binding->key.destination, true) ||
-			    (!related && !tk_published(s, n, &t->config.local, &p.source, true))) continue;
+			if (!binding || !tk_published(s, n, &local_node, &binding->key.destination, true) ||
+			    (!related && !tk_published(s, n, &local_node, &p.source, true))) continue;
 			route = tk_route(s, n, &binding->peer);
 			if (!route || !tk_ip_equal(&route->ip, &p.destination)) continue;
 			tk_unicast_send(t, n, &binding->peer, data, size, p.flow); return;
@@ -660,7 +668,7 @@ static void tk_from_device(struct tk *t, const u8 *data, u32 size)
 			if (!tk_inspect(t, n, data, size, &p, false)) break;
 			plain = kmalloc(TK_FORWARD_HEADER + size, GFP_ATOMIC);
 			if (!plain) { tk_drop(t, TNLK_RESOURCE_DROP); return; }
-			tk_header(plain, p.kind, &s->nets[n].network, &t->config.local, NULL, p.flow, size);
+			tk_header(plain, p.kind, &s->nets[n].network, &s->nets[n].local_ip, NULL, p.flow, size);
 			memcpy(plain + TK_FORWARD_HEADER, data, size);
 			tk_flood(t, n, plain, TK_FORWARD_HEADER + size, -1); kfree_sensitive(plain); return;
 		}
@@ -686,25 +694,28 @@ static void tk_forward(struct tk *t, u32 incoming, u8 *plain, u32 size)
 	struct tk_state *s = t->state;
 	struct tnlk_network network;
 	struct tnlk_endpoint source, destination;
+	struct tnlk_endpoint local_node;
 	struct tnlk_route *source_route;
 	struct tk_packet p;
 	u8 *payload, aad[TK_FORWARD_AAD];
 	u32 n, payload_size, i;
 	u64 flow;
 	int decoded, next;
-	if (size < TK_FORWARD_HEADER || plain[0] != 1 || plain[1] < 1 || plain[1] > 3 || !plain[2] || plain[3]) goto invalid;
+	if (size < TK_FORWARD_HEADER || plain[0] != 2 || plain[1] < 1 || plain[1] > 3 || !plain[2] || plain[3]) goto invalid;
 	memcpy(&network, plain + 4, sizeof(network));
 	memcpy(&source.ip, plain + 22, sizeof(source.ip)); source.port = tw_get16(plain + 39);
 	memcpy(&destination.ip, plain + 41, sizeof(destination.ip)); destination.port = tw_get16(plain + 58);
-	if (!tk_endpoint_valid(&source) || tk_endpoint_equal(&source, &t->config.local) || !tk_ip_valid(&destination.ip)) goto invalid;
-	if (plain[1] == 1) { if (!tk_endpoint_valid(&destination)) goto invalid; }
+	if (!tk_node_valid(&source) || !tk_ip_valid(&destination.ip)) goto invalid;
+	if (plain[1] == 1) { if (!tk_node_valid(&destination)) goto invalid; }
 	else { static const u8 zero[16]; if (destination.port || memcmp(destination.ip.bytes, zero, 16)) goto invalid; }
 	payload_size = tw_get16(plain + 68);
 	if (payload_size + TK_FORWARD_HEADER != size) goto invalid;
 	for (n = 0; n < s->header->networks; ++n) if (tk_network_equal(&s->nets[n].network, &network)) break;
 	if (n == s->header->networks || !(s->peers[incoming].networks[n / 8] & (1 << (n % 8)))) goto invalid;
+	local_node.ip = s->nets[n].local_ip; local_node.port = 0;
+	if (tk_ip_equal(&source.ip, &s->nets[n].local_ip)) goto invalid;
 	payload = plain + TK_FORWARD_HEADER; flow = tw_get64(plain + 60);
-	if (plain[1] == 1 && !tk_endpoint_equal(&destination, &t->config.local)) {
+	if (plain[1] == 1 && !tk_ip_equal(&destination.ip, &s->nets[n].local_ip)) {
 		if (plain[2] <= 1) goto invalid;
 		next = tk_next(s, tk_route(s, n, &destination), flow);
 		if (next < 0 || next == incoming) { tk_drop(t, TNLK_NO_ROUTE); return; }
@@ -723,7 +734,7 @@ static void tk_forward(struct tk *t, u32 incoming, u8 *plain, u32 size)
 		return;
 	}
 	for (i = 0; i < s->header->ends; ++i)
-		if (s->ends[i].network == n && tk_endpoint_equal(&s->ends[i].destination, &source)) break;
+		if (s->ends[i].network == n && tk_node_equal(&s->ends[i].destination, &source)) break;
 	if (i == s->header->ends) { tk_drop(t, TNLK_NO_SESSION); return; }
 	memcpy(aad, plain, sizeof(aad)); aad[2] = 0;
 	decoded = tk_open_record(s->end_crypto[i], &s->ends[i].keys, 2, payload, payload_size, aad, sizeof(aad));
@@ -732,13 +743,13 @@ static void tk_forward(struct tk *t, u32 incoming, u8 *plain, u32 size)
 	if (!tk_inspect(t, n, payload, payload_size, &p, true) || p.kind != 1 || p.flow != flow) goto invalid;
 	if (tk_ip_equal(&p.source, &source_route->ip)) {
 		if (!tk_ip_equal(&p.destination, &s->nets[n].local_ip) &&
-		    (!tk_published(s, n, &t->config.local, &p.destination, true) || !tk_remember(t, n, payload, payload_size, &p, &source))) goto invalid;
+		    (!tk_published(s, n, &local_node, &p.destination, true) || !tk_remember(t, n, payload, payload_size, &p, &source))) goto invalid;
 	} else {
 		struct tk_flow *binding;
 		bool related;
 		if (!tk_ip_equal(&p.destination, &s->nets[n].local_ip)) goto invalid;
 		binding = tk_flow_lookup(t, n, payload, payload_size, &p, true, &related);
-		if (!binding || !tk_endpoint_equal(&binding->peer, &source) ||
+		if (!binding || !tk_node_equal(&binding->peer, &source) ||
 		    !tk_published(s, n, &source, &binding->key.destination, false) ||
 		    (!related && !tk_published(s, n, &source, &p.source, false))) goto invalid;
 	}
@@ -851,7 +862,7 @@ static bool tk_has_end(struct tk_state *s, u32 network, const struct tnlk_endpoi
 {
 	u32 i;
 	for (i = 0; i < s->header->ends; ++i)
-		if (s->ends[i].network == network && tk_endpoint_equal(&s->ends[i].destination, destination)) return true;
+		if (s->ends[i].network == network && tk_node_equal(&s->ends[i].destination, destination)) return true;
 	return false;
 }
 /* Retain established return permission across unrelated route/ECMP updates,
@@ -874,10 +885,13 @@ static void tk_prune_flows(struct tk *t, struct tk_state *old, struct tk_state *
 		before = tk_route(old, a, &flow->peer); after = tk_route(next, b, &flow->peer);
 		if (!before || !after || !tk_ip_equal(&before->ip, &after->ip) ||
 		    (tk_has_end(old, a, &flow->peer) && !tk_has_end(next, b, &flow->peer))) goto discard;
+		{
+			struct tnlk_endpoint local_node = { .ip = next->nets[b].local_ip, .port = 0 };
 		if (tk_ip_equal(&flow->key.source, &next->nets[b].local_ip))
 			valid = tk_published(next, b, &flow->peer, &flow->key.destination, false);
 		else valid = tk_ip_equal(&flow->key.source, &after->ip) &&
-			tk_published(next, b, &t->config.local, &flow->key.destination, true);
+			tk_published(next, b, &local_node, &flow->key.destination, true);
+		}
 discard:
 		if (!valid) flow->expires = 0;
 	}
@@ -904,8 +918,8 @@ static int tk_validate_state(struct tk *t, struct tk_state *s)
 	}
 	for (i = 0; i < s->header->routes; ++i) {
 		struct tnlk_route *r = &s->routes[i];
-		if (r->network >= s->header->networks || !tk_endpoint_valid(&r->destination) ||
-		    tk_endpoint_equal(&r->destination, &t->config.local) || !tk_host(&s->nets[r->network].network, &r->ip) ||
+		if (r->network >= s->header->networks || !tk_node_valid(&r->destination) ||
+		    tk_ip_equal(&r->destination.ip, &s->nets[r->network].local_ip) || !tk_host(&s->nets[r->network].network, &r->ip) ||
 		    tk_ip_equal(&r->ip, &s->nets[r->network].local_ip) || !r->nhops || r->nhops > TNLK_MAX_HOPS) return -EINVAL;
 		for (j = 0; j < r->nhops; ++j) {
 			if (r->hops[j] >= s->header->peers || !s->peers[r->hops[j]].ready ||
@@ -913,19 +927,19 @@ static int tk_validate_state(struct tk *t, struct tk_state *s)
 			for (k = 0; k < j; ++k) if (r->hops[k] == r->hops[j]) return -EINVAL;
 		}
 		for (j = 0; j < i; ++j)
-			if (s->routes[j].network == r->network && (tk_endpoint_equal(&s->routes[j].destination, &r->destination) || tk_ip_equal(&s->routes[j].ip, &r->ip))) return -EINVAL;
+			if (s->routes[j].network == r->network && (tk_node_equal(&s->routes[j].destination, &r->destination) || tk_ip_equal(&s->routes[j].ip, &r->ip))) return -EINVAL;
 	}
 	for (i = 0; i < s->header->ends; ++i) {
 		struct tnlk_end *e = &s->ends[i];
-		if (e->network >= s->header->networks || !tk_endpoint_valid(&e->destination) ||
-		    tk_endpoint_equal(&e->destination, &t->config.local) || !tk_keys_valid(&e->keys) || e->ready > 1) return -EINVAL;
+		if (e->network >= s->header->networks || !tk_node_valid(&e->destination) ||
+		    tk_ip_equal(&e->destination.ip, &s->nets[e->network].local_ip) || !tk_keys_valid(&e->keys) || e->ready > 1) return -EINVAL;
 		for (j = 0; j < i; ++j)
 			if (!memcmp(e->keys.id, s->ends[j].keys.id, 16) ||
-			    (e->network == s->ends[j].network && tk_endpoint_equal(&e->destination, &s->ends[j].destination))) return -EINVAL;
+			    (e->network == s->ends[j].network && tk_node_equal(&e->destination, &s->ends[j].destination))) return -EINVAL;
 	}
 	for (i = 0; i < s->header->prefixes; ++i) {
 		struct tnlk_prefix *p = &s->prefixes[i];
-		if (p->network >= s->header->networks || !tk_network_valid(&p->prefix) || !tk_endpoint_valid(&p->publisher) || p->selected > 1 ||
+		if (p->network >= s->header->networks || !tk_network_valid(&p->prefix) || !tk_node_valid(&p->publisher) || p->selected > 1 ||
 		    p->prefix.address.family != s->nets[p->network].network.address.family) return -EINVAL;
 		if (tk_contains(&p->prefix, &s->nets[p->network].network.address) || tk_contains(&s->nets[p->network].network, &p->prefix.address)) return -EINVAL;
 	}
@@ -988,7 +1002,7 @@ static int tk_snapshot(struct tk *t, const struct tnlk_blob *blob)
 		for (i = 0; i < h->ends; ++i) for (j = 0; j < old->header->ends; ++j) {
 			if (memcmp(s->ends[i].keys.id, old->ends[j].keys.id, 16)) continue;
 			if (memcmp(&s->ends[i].keys, &old->ends[j].keys, sizeof(struct tnlk_keys)) ||
-			    !tk_endpoint_equal(&s->ends[i].destination, &old->ends[j].destination) ||
+			    !tk_node_equal(&s->ends[i].destination, &old->ends[j].destination) ||
 			    !tk_network_equal(&s->nets[s->ends[i].network].network, &old->nets[old->ends[j].network].network)) {
 				error = -EKEYREJECTED; goto unlock;
 			}

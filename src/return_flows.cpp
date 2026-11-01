@@ -92,9 +92,9 @@ bool error_tuple(const Bytes& bytes, const Packet& p, std::string& key) {
     return parse(quotation, inner, true) && p.destination == inner.source && tuple(quotation, inner, false, key, lifetime);
 }
 }
-bool ReturnFlows::remember(const Bytes& bytes, const Endpoint& peer, Time now) {
-    Packet packet; if (!peer.port || !parse(bytes, packet)) return false;
-    if (packet.later) { Endpoint found; return request_peer(bytes, &found, now) && found == peer; }
+bool ReturnFlows::remember(const Bytes& bytes, const NodeId& peer, Time now) {
+    Packet packet; if (!peer.unicast() || !parse(bytes, packet)) return false;
+    if (packet.later) { NodeId found; return request_peer(bytes, &found, now) && found == peer; }
     std::string key; unsigned lifetime;
     if (!tuple(bytes, packet, false, key, lifetime)) return false;
     auto found = flows_.find(key);
@@ -107,7 +107,7 @@ bool ReturnFlows::remember(const Bytes& bytes, const Endpoint& peer, Time now) {
     }
     return true;
 }
-bool ReturnFlows::request_peer(const Bytes& bytes, Endpoint* peer, Time now) const {
+bool ReturnFlows::request_peer(const Bytes& bytes, NodeId* peer, Time now) const {
     Packet packet; if (!peer || !parse(bytes, packet)) return false;
     std::string key; unsigned lifetime;
     if (packet.later) {
@@ -119,7 +119,7 @@ bool ReturnFlows::request_peer(const Bytes& bytes, Endpoint* peer, Time now) con
     if (found == flows_.end() || found->second.expires <= now) return false;
     *peer = found->second.peer; return true;
 }
-bool ReturnFlows::reply(const Bytes& bytes, Endpoint* peer, bool* related, Time now, IpAddress* requested) {
+bool ReturnFlows::reply(const Bytes& bytes, NodeId* peer, bool* related, Time now, IpAddress* requested) {
     Packet packet; if (!peer || !parse(bytes, packet)) return false;
     if (related) *related = false;
     std::string key; unsigned lifetime; bool error = false;
@@ -150,7 +150,7 @@ void ReturnFlows::expire(Time now) {
         if (it->second.expires <= now || !flows_.count(it->second.flow)) it = fragments_.erase(it); else ++it;
     }
 }
-void ReturnFlows::erase_peer(const Endpoint& peer) {
+void ReturnFlows::erase_peer(const NodeId& peer) {
     for (auto it = flows_.begin(); it != flows_.end();) { if (it->second.peer == peer) it = flows_.erase(it); else ++it; }
     expire();
 }
