@@ -47,12 +47,10 @@ Linux 不使用内核模块时必须明确设置 "device_backend": "tun"；缺�
 仅 address_server 的配置不创建设备，device_backend 对其没有作用。
 Linux 继承外部 TUN fd 时须同时传入 --device-backend tun，例如 --device-backend tun --tun-fd 7；默认 kernel 不接受 TUN fd。
 
-使用与正在运行的内核匹配的开发头文件和构建目录，先编译并加载模块：
-    python3 tools/build_kernel.py
-    sudo install -D -m 644 build/kernel/tunnel_kmod.ko /lib/modules/$(uname -r)/extra/tunnel_kmod.ko
-    sudo depmod -a
-    sudo modprobe tunnel_kmod
-构建脚本仅保留模块及构建信息，临时编译文件自动清理；--headers 可指定另一套配置完整的目标内核头文件。
+使用与正在运行的内核匹配的开发头文件和构建目录，执行项目脚本：
+    bash build.sh
+    bash run-gui.sh
+build.sh 仅保留模块及构建信息，临时编译文件自动清理；--headers 可指定另一套配置完整的目标内核头文件。run-gui.sh 缺少模块产物时会先调用 build.sh，再以系统权限加载模块。
 modprobe 会加载所需的 UDP tunnel 等依赖。详细 ABI、容量和生命周期说明见 kernel/README.md。
 模块不是跨版本通用二进制；换内核后重新构建。Secure Boot/模块签名遵循宿主系统设置。
 

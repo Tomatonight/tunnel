@@ -17,11 +17,11 @@ TCP 数据也由内核加解密，只把已加密的逐跳记录通过控制设�
 ----
 1. 安装目标 Linux 内核对应的开发头文件、make、C 编译器及 iproute2。
 2. 推荐在项目根目录执行：
-     python3 tools/build_kernel.py
-   工具在临时目录编译，仅保存 .ko 和构建信息，避免源码目录积累中间文件。
+     bash build.sh
+   构建脚本会调用内核模块构建工具，在临时目录编译，仅保存 .ko 和构建信息，避免源码目录积累中间文件。
    也可在本目录执行 make。默认使用 /lib/modules/$(uname -r)/build。
    指定另一套配置完整的目标头文件：make KDIR=/path/to/kernel/build
-3. 使用工具构建后，在项目根目录安装并加载（root）：
+3. 使用 `bash run-gui.sh` 启动时，脚本会在缺少模块产物时重新执行 `bash build.sh`，核心随后以系统权限加载匹配模块。若需要手动安装，使用工具构建后，在项目根目录执行（root）：
      install -D -m 644 build/kernel/tunnel_kmod.ko /lib/modules/$(uname -r)/extra/tunnel_kmod.ko
      depmod -a
      modprobe tunnel_kmod

@@ -125,19 +125,14 @@ endpoint 不是绑定通配地址；默认绑定同地址族的本地通配地�
 
 ## Linux 内核设备
 
-先安装与**正在运行的内核**匹配的开发头文件和构建工具，再在仓库根目录构建、安装模块：
+先安装与**正在运行的内核**匹配的开发头文件和构建工具，再使用项目构建脚本生成模块：
 
 ```bash
-python3 tools/build_kernel.py
-sudo install -D -m 644 build/kernel/tunnel_kmod.ko \
-    /lib/modules/$(uname -r)/extra/tunnel_kmod.ko
-sudo depmod -a
-sudo modprobe tunnel_kmod
-
-sudo ./build/tunnel node-a.json --device-backend kernel
+bash build.sh
+bash run-gui.sh
 ```
 
-也可将配置改为 `"device_backend": "kernel"`，或移除该字段以使用 Linux 默认值。模块未安装/加载时会明确报错，不自动退回 TUN。内核更新后需重新构建；模块二进制不能跨内核版本通用。
+Linux 默认使用 `kernel`。`build.sh` 会在当前内核上生成 `build/kernel/tunnel_kmod.ko`，`run-gui.sh` 会在缺少该产物时自动重新构建，并在取得系统权限后加载模块。不要使用 `--skip-kernel-module` 启动默认 kernel 配置。也可将配置改为 `"device_backend": "tun"` 使用用户态 TUN。内核更新后需重新构建；模块二进制不能跨内核版本通用。
 
 WSL 也需要与其运行内核匹配的构建树，普通发行版头文件不能直接替代。已在 WSL `6.18.40.1-microsoft-standard-WSL2` 完成实际运行验证，其他版本以对应编译和测试结果为准。构建要求、ABI、WSL 和 BTF 处理见 [内核后端说明](kernel/README.md)。
 

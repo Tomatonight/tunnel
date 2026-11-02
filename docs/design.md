@@ -51,7 +51,7 @@ UDP模式使用独立UDP socket；TCP模式的数据复用已经认证的TCP/TLS
 增加第二个网络后，原先省略授权列表的配置报错，不能自动给已有 peer 开放新网络。
 peers 可省略，表示没有允许连接的对端；只有填入 peers 的节点才能认证接入。
 
-顶层 endpoint 是本机用于控制和数据传输的物理地址；它不再作为节点身份。每个虚拟网络的 tunnel_ip 才是该网络内的节点身份。
+顶层 endpoint 是本机对外公布的传输端点，在完整 listen 配置中对应 listen.address；它用于控制和数据传输，不再作为节点身份。每个虚拟网络的 tunnel_ip 才是该网络内的节点身份。
 不能把 0.0.0.0 或 :: 这样的通配地址作为 endpoint。
 可选的 listen.bind_address 表示实际本地绑定地址；省略时使用 endpoint 所属地址族的
 本地通配地址和相同端口号。TCP 监听和全局 UDP socket 使用同一个本地绑定端点。

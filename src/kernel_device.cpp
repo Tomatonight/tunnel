@@ -145,11 +145,13 @@ void install_kernel_module(bool& loaded_by_process) {
         command = {insmod, module};
     } else {
         const auto modprobe = executable_path("modprobe");
-        if (modprobe.empty()) throw std::runtime_error("cannot install tunnel_kmod.ko: module file was not found and modprobe was not found; build the module or install it first");
+        if (modprobe.empty()) throw std::runtime_error("cannot install tunnel_kmod.ko: build/kernel/tunnel_kmod.ko was not found and modprobe was not found; run 'bash build.sh' without --skip-kernel-module, or set device_backend to tun");
         command = {modprobe, "tunnel_kmod"};
     }
     const auto result = run_command(command);
     if (!command_succeeded(result)) {
+        if (module.empty() && result.output.find("Module tunnel_kmod not found") != std::string::npos)
+            throw std::runtime_error("tunnel_kmod is not installed and build/kernel/tunnel_kmod.ko is missing; run 'bash build.sh' without --skip-kernel-module, then start the GUI again");
         throw std::runtime_error("cannot install tunnel kernel module (" + command_error(command, result) + "); run as root/CAP_SYS_MODULE or install a matching module");
     }
     if (!module_loaded()) {
