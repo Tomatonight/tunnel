@@ -114,22 +114,30 @@ The headless configuration tool is documented in [cli.md](cli.md); the Windows p
 
 构建
 
-依赖 C++11、CMake、libevent core、OpenSSL 3.x 的 SSL/Crypto。
-Linux / WSL 安装：
+依赖 C++11 编译器命令行工具（`g++`/`clang++`）、libevent core、OpenSSL 3.x 的 SSL/Crypto。
+构建脚本 scripts/build.py 直接调用编译器，不依赖 CMake/Ninja。
+
+编译器与依赖自动发现（可通过环境变量覆盖）：
+    TUNNEL_CXX              指定编译器；默认 PATH 中的 g++/clang++，Windows 还会查找 C:\msys64\mingw64\bin 等常见目录
+    TUNNEL_DEPS_ROOT        额外的 include/lib 前缀，多个用路径分隔符分隔
+    TUNNEL_CFLAGS/TUNNEL_LDFLAGS          追加编译/链接参数
+    TUNNEL_EVENT_LIBS/TUNNEL_OPENSSL_LIBS 覆盖库参数；默认用真实链接探测 -levent_core 与 -lssl -lcrypto
+
+Linux / WSL：
     sudo apt-get update
-    sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev libevent-dev iproute2 iputils-ping nftables
+    sudo apt-get install -y --no-install-recommends build-essential libssl-dev libevent-dev iproute2 iputils-ping nftables
 
-    cmake -S . -B build-wsl -G Ninja -DCMAKE_BUILD_TYPE=Debug
-    cmake --build build-wsl --parallel 2
-    ctest --test-dir build-wsl --output-on-failure
-    ./build-wsl/tunnel --check config/default.json
+    ./build.sh --tests              # 等价于 python3 scripts/build.py --tests
+    ./build/tunnel --check config/default.json
 
-本机 Windows 已配置 Zig 0.14.1、libevent/OpenSSL 动态库，可直接执行：
-    .\.build-tools\cmake\data\bin\cmake.exe --build build --parallel 2
-    .\.build-tools\cmake\data\bin\ctest.exe --test-dir build --output-on-failure
-    .\build\tunnel.exe --check .\config/default.json
+Windows（MSYS2 MinGW-w64）：
+    winget install MSYS2.MSYS2
+    # 在 MSYS2 MINGW64 终端里：pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-libevent
+    build.bat --tests
+    .\build\tunnel.exe --check .\config\default.json
 
-新环境使用 CMAKE_PREFIX_PATH / OPENSSL_ROOT_DIR 指定与编译器 ABI 相符的依赖。
+产物统一在 build/（tunnel 或 tunnel.exe）。Windows 下脚本会按 PE 导入表递归复制 MinGW/OpenSSL/libevent 运行库 DLL 和 third_party/windows 的 wintun.dll 到该目录，因此无需修改 PATH。
+增量编译：build/obj 缓存目标文件，头文件依赖由 -MMD 记录；编译器或编译参数变化时自动重建缓存。
 本机 DLL 包括 libcrypto-3-x64.dll、libssl-3-x64.dll、libevent_core-7.dll、libwinpthread-1.dll。
 Windows 真正运行还需管理员权限以及位于 tunnel.exe 同目录的官方、架构匹配的 wintun.dll。
 本地已放入 Wintun 0.14.1 AMD64 DLL；官方 ZIP SHA256 与 Authenticode 签名均已核验。

@@ -1,3 +1,6 @@
+# Build entry point: scripts/build.py (build.bat / build.sh) drives gcc/g++
+# or clang/clang++ directly and does NOT use this file. The CMake project is
+# kept in sync for IDEs and external packagers only.
 cmake_minimum_required(VERSION 3.16)
 project(tunnel LANGUAGES CXX)
 

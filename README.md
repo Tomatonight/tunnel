@@ -26,7 +26,7 @@
 
 Directory layout is intentionally small: `src/` contains the cross-platform C++ core; `config/` contains the repository default configuration; `examples/` contains sample node profiles; `gui/`, `remote_desktop/`, `android/`, and `kernel/` contain platform or feature code; `tests/` contains automated tests; `tools/` contains development utilities; `third_party/` contains bundled runtime dependencies; `docs/` contains documentation; and `build/` contains generated files only.
 
-On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script configures CMake and builds a Release core; add `--tests` to build and run CTest in the same invocation. Add `--build-type Debug` for a debug build and `--gui` on Windows to package the desktop application under `build/gui/TunnelUI-live/`.
+On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script compiles and links everything with the system C++ compiler driver (`g++`/`clang++`) directly -- CMake and Ninja are not required -- and builds a Release core; add `--tests` to build and run the native test suite in the same invocation. Add `--build-type Debug` for a debug build and `--gui` on Windows to package the desktop application under `build/gui/TunnelUI-live/`.
 
 On Windows, run `build.bat --gui` once, then double-click `run-gui.vbs` or `run-gui.bat` to start the packaged desktop UI without opening a console window. The first launch may show a standard UAC prompt because the TUN adapter requires administrator rights; approve it to open the GUI. On Linux and macOS, run `./build.sh` first, then use `./run-gui.sh`. If the Linux core has no TUN capability, run `sudo bash run-gui.sh` once; the launcher grants the capability and opens the WebView as the desktop user. The normal user path never starts a hidden sudo password prompt. Run the command-line manager with `run-cli.bat` or `./run-cli.sh`; arguments after the script are passed to the CLI, for example `./run-cli.sh status`.
 
@@ -41,11 +41,11 @@ python3 scripts/build.py --tests --skip-gui-deps --skip-kernel-module
 ```
 
 The default build compiles the core without test targets. Use `--tests` when
-you want the native CTest targets built and executed as part of the same
+you want the native test executables built and executed as part of the same
 command; `--skip-gui-deps` and `--skip-kernel-module` keep that check usable on
 machines that only have the core toolchain installed.
 
-Android continues to use Gradle from `android/`; the Linux kernel module continues to use `tools/build_kernel.py`. These platform builds keep their own outputs and do not reuse incompatible CMake caches.
+Android continues to use Gradle from `android/`; the Linux kernel module continues to use `tools/build_kernel.py`. These platform builds keep their own outputs and do not reuse the compiler object cache.
 
 ## 平台与当前边界
 
@@ -62,19 +62,27 @@ Android continues to use Gradle from `android/`; the Linux kernel module continu
 
 ## 从源码构建
 
-需要 CMake 3.16+、C++11 编译器、OpenSSL 3.x 和 libevent core。在仓库根目录执行。Ubuntu/Debian 示例：
+需要 C++11 编译器命令行工具（`g++` 或 `clang++`）、OpenSSL 3.x 和 libevent core。构建脚本直接调用编译器，不依赖 CMake/Ninja。在仓库根目录执行。Ubuntu/Debian 示例：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build libssl-dev libevent-dev \
+sudo apt-get install -y build-essential libssl-dev libevent-dev \
     python3 iproute2 iputils-ping nftables
 
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 2
-ctest --test-dir build --output-on-failure
+./build.sh                 # 或 python3 scripts/build.py
+./build.sh --tests         # 编译并运行原生测试
 ```
 
-Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/libevent，必要时通过 `CMAKE_PREFIX_PATH`、`OPENSSL_ROOT_DIR` 指定依赖。运行时需要管理员权限，并将官方、架构匹配的 `wintun.dll` 放到核心程序旁。具体平台说明见 [开发说明](docs/development.md)；Android 构建入口见 [Android 文档](android/README.md)。
+Windows 使用 MinGW-w64 的 `g++`（MSYS2）：
+
+```powershell
+winget install MSYS2.MSYS2
+# 在 MSYS2 MINGW64 终端中：
+pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-libevent
+build.bat
+```
+
+脚本会自动发现编译器（`TUNNEL_CXX` 优先，其次 `PATH`，再次 `C:\msys64\mingw64\bin` 等常见安装目录）和依赖前缀（编译器自身前缀、`TUNNEL_DEPS_ROOT`、`.deps/*`），并把 MinGW/OpenSSL/libevent 的运行库 DLL 复制到 `build/`。运行时需要管理员权限和 `wintun.dll`（已同时复制）。具体平台说明见 [开发说明](docs/development.md)；Android 构建入口见 [Android 文档](android/README.md)。
 
 ## 两节点快速开始
 
@@ -180,4 +188,4 @@ Linux GTK/WebKit 后端通常需要系统 `gi` 包和 WebKit 运行库，安装�
 | Design and implementation | [Design](docs/design.md), [Development](docs/development.md) |
 | Verification | [Test results](docs/test-results.md), [Tests](tests/) |
 
-示例中的地址和密钥均需替换。普通 CTest 不要求创建真实隧道设备；真实网络、内核模块和 SNAT 集成测试需要 Linux 管理权限，运行方式及已验证范围见开发说明和测试记录。
+示例中的地址和密钥均需替换。普通原生测试不要求创建真实隧道设备；真实网络、内核模块和 SNAT 集成测试需要 Linux 管理权限，运行方式及已验证范围见开发说明和测试记录。

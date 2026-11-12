@@ -108,7 +108,8 @@ void configuration_tests(const json& base) {
     d["listen"]["shared_key"] = ""; invalid_config(d);
     d = base; d["listen"]["bind_address"] = "0.0.0.0:65535"; CHECK(parse_config(d.dump()).listen.bind_address.ip.unspecified()); roundtrip_policy(d);
     d = base; d["listen"] = {{"enabled", false}};
-    auto outbound_only = parse_config(d.dump()); CHECK(!outbound_only.listen.enabled && outbound_only.listen.bind_address.ip.unspecified() && outbound_only.listen.bind_address.port == 0);
+    auto outbound_only_listen_flag = parse_config(d.dump());
+    CHECK(!outbound_only_listen_flag.listen.enabled && outbound_only_listen_flag.listen.bind_address.ip.unspecified() && outbound_only_listen_flag.listen.bind_address.port == 0);
     roundtrip_policy(d);
     d = base; d["listen"]["bind_address"] = "100.0.0.1:65536"; invalid_config(d);
     d = base; d["peers"][0]["endpoint"] = "100.0.0.1:65535"; invalid_config(d);
