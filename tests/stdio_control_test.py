@@ -13,7 +13,6 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import time
@@ -50,13 +49,8 @@ def main():
             if existing.prefixlen and existing.overlaps(subnet):
                 raise SystemExit(f"Test subnet {subnet} overlaps an existing route {prefix}; no changes made.")
     config = work / "config.json"
-    # Reserve a loopback port while choosing it; this node has no peers/listener.
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
     config.write_text(json.dumps({"device_backend": "tun", "tun_mtu": 1280, "transport_mtu": 1500,
-        "listen": {"enabled": False, "address": f"127.0.0.1:{port}",
-                   "bind_address": f"127.0.0.1:{port}",
+        "listen": {"enabled": False,
                    "networks": [{"tunnel": str(subnet), "tunnel_ip": str(subnet.network_address + 1)}]},
         "peers": []}), encoding="utf-8")
     made_namespace = False

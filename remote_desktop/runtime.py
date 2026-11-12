@@ -6,8 +6,8 @@ bounded and sent before capture; the tunnel loop never runs a desktop backend.
 import base64
 from collections import deque
 import hashlib
+import hmac
 import ipaddress
-import io
 import secrets
 import socket
 import threading
@@ -15,6 +15,14 @@ import time
 
 from .security import (Identity, DeviceStore, canonical, fingerprint, certificate_key,
                        client_context, receive, send)
+from .rfb import RfbSession, WebSocketBridge, close_socket
+
+
+# Pull one compressed frame at the display refresh cadence.  There is still
+# only one frame in flight, so a slow link lowers the achieved FPS without
+# building a stale frame backlog.
+REMOTE_FPS = 60
+FRAME_INTERVAL = 1.0 / REMOTE_FPS
 
 
 def _nonce(value):
@@ -43,6 +51,16 @@ def _shutdown(sock):
             sock.close()
         except OSError:
             pass
+
+
+def _low_latency(sock):
+    """Disable Nagle buffering for the interactive desktop TCP stream."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        # Keep compatibility with test doubles and unusual socket providers;
+        # the protocol remains correct if this hint is unavailable.
+        pass
 
 
 def _revoke(session):
@@ -84,15 +102,18 @@ class Runtime:
     def configure(self, config):
         if not isinstance(config, dict):
             raise ValueError("Invalid remote desktop configuration")
-        allowed = {"enabled", "networks", "access", "unattended", "port", "device_name"}
+        allowed = {"enabled", "networks", "shared_key", "port", "device_name"}
         if set(config) - allowed:
             raise ValueError("Unknown remote desktop field")
-        result = dict(enabled=False, networks=[], access="authorized_devices", unattended=False, port=47831, device_name="")
+        result = dict(enabled=False, networks=[], shared_key="",
+                      port=47831, device_name="")
         result.update(config)
-        if type(result["enabled"]) is not bool or type(result["unattended"]) is not bool:
+        if type(result["enabled"]) is not bool:
             raise ValueError("Remote desktop flags must be booleans")
-        if result["access"] not in ("authorized_devices", "all_tunnel_nodes"):
-            raise ValueError("Invalid remote desktop access mode")
+        if not isinstance(result["shared_key"], str) or len(result["shared_key"].encode("utf-8")) > 4096:
+            raise ValueError("Invalid remote desktop shared key")
+        if result["enabled"] and not result["shared_key"]:
+            raise ValueError("Remote desktop shared_key is required when enabled")
         if type(result["port"]) is not int or not 1 <= result["port"] <= 65535:
             raise ValueError("Invalid remote desktop port")
         if not isinstance(result["networks"], list) or len(result["networks"]) > 64:
@@ -108,12 +129,15 @@ class Runtime:
         with self.lock:
             old = self.config
             self.config = result
-            if result["device_name"]:
-                self.identity.name = result["device_name"]
+            # An empty name means "use the host name".  Recompute it on every
+            # policy update so clearing a previously custom name takes effect
+            # immediately instead of leaving stale identity text in handshakes.
+            display_name = result["device_name"] or socket.gethostname()
+            self.identity.name = display_name.encode("utf-8")[:128].decode("utf-8", errors="ignore")
             if old != result:
                 self.policy_epoch += 1
                 # A policy change is immediate; reconnecting obtains a new,
-                # explicitly checked grant, including changes to unattended.
+                # explicitly checked grant.
                 for session in list(self.sessions.values()):
                     _revoke(session)
                 for pending in self.pending.values():
@@ -141,6 +165,35 @@ class Runtime:
             source_ip=source_ip, payload=canonical(transcript).hex(), signature=proof.get("signature", ""))
         if not result.get("valid"):
             raise ValueError("Desktop peer is not a current authenticated tunnel member")
+
+    def _backend_factory(self):
+        if self.backend_factory:
+            return self.backend_factory()
+        from .platforms import DesktopBackend
+        return DesktopBackend()
+
+    def _rfb_backend_factory(self, viewport=None):
+        if self.backend_factory:
+            return self.backend_factory()
+        from .platforms import DesktopBackend
+        # The RFB path is already JPEG/Tight encoded by the backend. Keep
+        # common 4K and 2560x1600 displays at native size: noVNC scales the
+        # canvas, while avoiding an expensive pre-encode resize on every
+        # frame. 4:2:0 at quality 85 keeps text sharp enough for control while
+        # cutting JPEG CPU time and wire size versus 4:4:4/quality 90.
+        max_width, max_height = 3840, 2160
+        if isinstance(viewport, dict):
+            if type(viewport.get("width")) is int:
+                max_width = max(64, min(max_width, viewport["width"]))
+            if type(viewport.get("height")) is int:
+                max_height = max(64, min(max_height, viewport["height"]))
+        backend = DesktopBackend(max_width=max_width, max_height=max_height,
+                                 quality=85, subsampling=2)
+        if isinstance(viewport, dict):
+            # Make the initial ServerInit framebuffer match the controller's
+            # first viewport. Later noVNC resize requests use the same setter.
+            backend.set_capture_bounds(max_width, max_height)
+        return backend
 
     def _monitor(self):
         while not self.stopping.is_set():
@@ -225,42 +278,22 @@ class Runtime:
                     sock.close()
                     self.gates.release()
 
-    def _approval(self, sock, identity, network, requested):
+    def _approval(self, sock, identity, network, requested, presented_key=""):
         with self.lock:
             epoch = self.policy_epoch
-            mode = self.config["access"]
-            saved = self.store.get("devices", identity["fingerprint"])
-            permitted = "control" if mode == "all_tunnel_nodes" else saved["permission"] if saved else None
-            if permitted and self.config["unattended"]:
-                return ("view" if requested == "view" else permitted), epoch
-            if len(self.pending) >= 16:
-                raise ValueError("Too many pending desktop requests")
-            identifier = secrets.token_hex(12)
-            pending = dict(identity, request_id=identifier, network=network, requested=requested,
-                           event=threading.Event(), rejected=False, permission=None, epoch=epoch)
-            self.pending[identifier] = pending
-        self.log("Desktop approval requested: " + identity["fingerprint"][:16])
-        try:
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and not self.stopping.is_set():
-                with self.lock:
-                    if epoch != self.policy_epoch:
-                        raise ValueError("Desktop authorization policy changed")
-                send(sock, {"op": "pending", "request_id": identifier})
-                if pending["event"].wait(2):
-                    if pending["rejected"]:
-                        raise ValueError("Desktop request rejected")
-                    return ("view" if requested == "view" else pending["permission"]), epoch
-            raise ValueError("Desktop approval timed out")
-        finally:
-            with self.lock:
-                self.pending.pop(identifier, None)
+            configured_key = self.config["shared_key"]
+            if not configured_key or not isinstance(presented_key, str) or not hmac.compare_digest(presented_key, configured_key):
+                raise ValueError("Remote desktop shared key rejected")
+            # A valid remote desktop PSK is the complete authorization
+            # decision; there is no approval or device-trust round trip.
+            return ("view" if requested == "view" else "control"), epoch
 
     def _serve(self, raw, address, network):
         sock = raw
         backend = None
         identifier = None
         try:
+            _low_latency(raw)
             raw.settimeout(8)
             sock = self.identity.server_context().wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
             with self.lock:
@@ -281,13 +314,19 @@ class Runtime:
             requested = request.get("permission", "control")
             if requested not in ("view", "control"):
                 raise ValueError("Invalid desktop permission")
+            protocol = request.get("protocol", "jpeg")
+            if protocol not in ("jpeg", "rfb"):
+                raise ValueError("Unsupported desktop protocol")
+            presented_key = request.get("shared_key", "")
+            if not isinstance(presented_key, str) or len(presented_key.encode("utf-8")) > 4096:
+                raise ValueError("Invalid remote desktop shared key")
             from cryptography.hazmat.primitives import serialization
             der = self.identity.cert.public_bytes(serialization.Encoding.DER)
             transcript = {"version": 1, "network": network, "server_nonce": hello["nonce"],
                           "client_nonce": _nonce(request.get("nonce")), "server_ip": local["tunnel_ip"],
                           "client_ip": address, "server_key": self.identity.public_key,
                           "client_key": identity["public_key"], "certificate": hashlib.sha256(der).hexdigest(),
-                          "permission": requested}
+                          "permission": requested, "protocol": protocol}
             self._verify(network, request.get("proof"), transcript, address)
             Identity.verify(identity["public_key"], canonical(transcript), request.get("signature", ""))
             # Prove the actual server-side virtual endpoint before asking the
@@ -296,7 +335,7 @@ class Runtime:
             decision = receive(sock, 4096)
             if decision.get("op") != "continue":
                 return
-            permission, epoch = self._approval(sock, identity, network, requested)
+            permission, epoch = self._approval(sock, identity, network, requested, presented_key)
             self._member(network)
             self._verify(network, request["proof"], transcript, address)
             with self.lock:
@@ -306,14 +345,19 @@ class Runtime:
                     raise ValueError("Desktop is busy with another controller")
                 identifier = secrets.token_hex(12)
                 session = dict(identity, session_id=identifier, network=network, permission=permission, socket=sock, revoked=False,
-                    member_proof=request["proof"], member_transcript=transcript, source_ip=address)
+                    protocol=protocol, member_proof=request["proof"], member_transcript=transcript, source_ip=address)
                 self.sessions[identifier] = session
-            if self.backend_factory:
-                backend = self.backend_factory()
-            else:
-                from .platforms import DesktopBackend
-                backend = DesktopBackend()
             self.log("Desktop connected: " + identity["fingerprint"][:16] + " (" + permission + ")")
+            if protocol == "rfb":
+                send(sock, {"op": "ready", "session_id": identifier, "permission": permission,
+                            "protocol": "rfb", "capabilities": {"capture": True, "mouse": True,
+                            "keyboard": permission == "control", "clipboard": False}})
+                sock.settimeout(None)
+                backend = self._rfb_backend_factory(request.get("viewport"))
+                RfbSession(sock, lambda: backend, server_name=self.identity.name,
+                           allow_input=permission == "control").serve()
+                return
+            backend = self._backend_factory()
             send(sock, {"op": "ready", "session_id": identifier, "permission": permission, "capabilities": backend.capabilities()})
             checked = 0
             sequence = 0
@@ -343,7 +387,7 @@ class Runtime:
                             backend.input(event)
                         else:
                             raise ValueError("This desktop session is view-only")
-                delay = 0.125 - (time.monotonic() - last_frame)
+                delay = FRAME_INTERVAL - (time.monotonic() - last_frame)
                 if delay > 0:
                     self.stopping.wait(delay)
                 frame = backend.capture()
@@ -352,6 +396,13 @@ class Runtime:
                 send(sock, {"op": "frame", "sequence": sequence,
                     "jpeg": base64.b64encode(frame["jpeg"]).decode("ascii"),
                     "width": frame["width"], "height": frame["height"], "permission": session["permission"]})
+        except EOFError:
+            # A browser closing the noVNC WebSocket is a normal end of a
+            # desktop session. Keep it distinct from an authentication,
+            # protocol, or capture failure in the activity log.
+            self.log("Desktop connection closed")
+        except (ConnectionResetError, BrokenPipeError, TimeoutError) as error:
+            self.log("Desktop connection lost: " + str(error))
         except Exception as error:
             try:
                 send(sock, {"op": "error", "error": str(error)[:300]})
@@ -376,12 +427,13 @@ class Runtime:
             _shutdown(sock)
             self.gates.release()
 
-    def _connect(self, viewer, address, network, port, permission):
+    def _connect(self, viewer, address, network, port, permission, protocol="jpeg", viewport=None, shared_key=""):
         sock = None
         try:
             _, local = self._member(network)
             raw = socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM)
             sock = raw
+            _low_latency(raw)
             with self.lock:
                 viewer["socket"] = raw
                 if viewer["stop"].is_set() or self.stopping.is_set():
@@ -405,10 +457,18 @@ class Runtime:
             transcript = {"version": 1, "network": network, "server_nonce": _nonce(hello.get("nonce")),
                           "client_nonce": nonce, "server_ip": address, "client_ip": local["tunnel_ip"],
                           "server_key": server_key, "client_key": self.identity.public_key,
-                          "certificate": hashlib.sha256(der).hexdigest(), "permission": permission}
-            send(sock, {"op": "hello", "version": 1, "network": network, "nonce": nonce,
+                          "certificate": hashlib.sha256(der).hexdigest(), "permission": permission,
+                          "protocol": protocol}
+            hello_message = {"op": "hello", "version": 1, "network": network, "nonce": nonce,
                         "identity": self.identity.info(), "permission": permission,
-                        "proof": self._proof(network, transcript), "signature": self.identity.sign(canonical(transcript))})
+                        "protocol": protocol,
+                        "proof": self._proof(network, transcript), "signature": self.identity.sign(canonical(transcript))}
+            if protocol == "rfb" and isinstance(viewport, dict):
+                hello_message["viewport"] = viewport
+            if not isinstance(shared_key, str) or not shared_key:
+                raise ValueError("Remote desktop shared key is required")
+            hello_message["shared_key"] = shared_key
+            send(sock, hello_message)
             proof = receive(sock, 16384)
             if proof.get("op") != "proof":
                 raise ValueError(proof.get("error", "Missing desktop server proof"))
@@ -417,13 +477,8 @@ class Runtime:
                 if viewer["stop"].is_set() or self.stopping.is_set():
                     raise ValueError("Desktop connection cancelled")
                 viewer["identity"] = identity
-                if not self.store.get("hosts", identity["fingerprint"]):
-                    self.untrusted[identity["fingerprint"]] = identity
-                    if len(self.untrusted) > 16:
-                        self.untrusted.pop(next(iter(self.untrusted)))
-                    viewer["status"] = "trust_required"
-                    send(sock, {"op": "cancel"})
-                    return
+                # Tunnel membership plus the remote PSK is the complete
+                # desktop authentication decision.
             send(sock, {"op": "continue"})
             while not viewer["stop"].is_set():
                 reply = receive(sock, 16384)
@@ -437,6 +492,17 @@ class Runtime:
                         raise ValueError("Desktop connection cancelled")
                     viewer.update(status="connected", permission=reply["permission"], capabilities=reply["capabilities"])
                 break
+            if protocol == "rfb":
+                bridge = WebSocketBridge(sock, viewer["stop"])
+                with self.lock:
+                    viewer["bridge"] = bridge
+                    viewer["ws_url"] = bridge.start()
+                    viewer["protocol"] = "rfb"
+                bridge.thread.join()
+                with self.lock:
+                    if viewer["status"] == "connected":
+                        viewer["status"] = "disconnected"
+                return
             checked = 0
             while not viewer["stop"].is_set():
                 if time.monotonic() - checked > 1:
@@ -454,19 +520,26 @@ class Runtime:
                     or not 1 <= reply["width"] <= 4096 or not 1 <= reply["height"] <= 4096
                     or not isinstance(reply.get("jpeg"), str)):
                     raise ValueError("Invalid remote desktop image")
-                # Check encoded image dimensions too; untrusted metadata must
-                # not trick the WebView into decoding an oversized JPEG.
-                from PIL import Image
+                # Validate the bounded base64/JPEG envelope without parsing
+                # the JPEG through Pillow on every frame. The desktop peer is
+                # already authenticated, and the WebView performs the actual
+                # image decode; a second image scan here added visible frame
+                # latency on slower machines.
                 picture = base64.b64decode(reply["jpeg"], validate=True)
-                with Image.open(io.BytesIO(picture)) as image:
-                    if image.format != "JPEG" or image.size != (reply["width"], reply["height"]):
-                        raise ValueError("Remote image dimensions do not match")
-                    image.verify()
+                if len(picture) < 4 or picture[:2] != b"\xff\xd8" or picture[-2:] != b"\xff\xd9":
+                    raise ValueError("Invalid remote JPEG image")
                 with self.lock:
                     viewer["frame"] = reply
             viewer["status"] = "disconnected"
         except Exception as error:
-            viewer.update(status="error" if not viewer["stop"].is_set() else "disconnected", error=str(error)[:300])
+            # Closing the socket is the normal path for an explicit
+            # disconnect.  The worker can observe the resulting socket error
+            # after the stop event is set; do not surface that expected
+            # shutdown as a stale viewer error.
+            if viewer["stop"].is_set() or self.stopping.is_set():
+                viewer.update(status="disconnected", error="")
+            else:
+                viewer.update(status="error", error=str(error)[:300])
         finally:
             _shutdown(sock)
             viewer["socket"] = None
@@ -474,10 +547,72 @@ class Runtime:
     def _public_viewer(self):
         if not self.viewer:
             return None
-        return {k: v for k, v in self.viewer.items() if k not in ("socket", "stop", "events", "frame", "thread")}
+        # The PSK is needed only inside the TLS handshake.  Never echo it
+        # through the local status RPC, where it could end up in GUI logs or
+        # browser state snapshots.
+        return {k: v for k, v in self.viewer.items() if k not in
+                ("socket", "stop", "events", "frame", "thread", "bridge", "shared_key")}
+
+    def _request_vnc_connect(self, payload):
+        """Start or observe an RFB viewer and expose its loopback WebSocket."""
+        session_id = payload.get("session_id")
+        with self.lock:
+            viewer = self.viewer
+            if session_id:
+                if not viewer or viewer.get("session_id") != session_id:
+                    raise ValueError("Desktop session no longer exists")
+            else:
+                if viewer and viewer.get("status") in ("connecting", "pending", "connected"):
+                    raise ValueError("Disconnect the current desktop first")
+                if viewer:
+                    viewer["stop"].set()
+                    _shutdown(viewer.get("socket"))
+                address = str(ipaddress.ip_address(payload["address"]))
+                network = str(ipaddress.ip_network(payload["tunnel"], strict=True))
+                if ipaddress.ip_address(address) not in ipaddress.ip_network(network):
+                    raise ValueError("Desktop address must belong to the selected tunnel")
+                port = payload.get("port", 47831)
+                permission = payload.get("permission", "control")
+                if type(port) is not int or not 1 <= port <= 65535 or permission not in ("view", "control"):
+                    raise ValueError("Invalid remote desktop connection")
+                shared_key = payload.get("shared_key", "")
+                if not isinstance(shared_key, str) or not shared_key or len(shared_key.encode("utf-8")) > 4096:
+                    raise ValueError("Remote desktop shared key is required")
+                viewport = payload.get("viewport")
+                if viewport is not None:
+                    if (not isinstance(viewport, dict) or type(viewport.get("width")) is not int
+                            or type(viewport.get("height")) is not int
+                            or not 64 <= viewport["width"] <= 3840
+                            or not 64 <= viewport["height"] <= 2160):
+                        raise ValueError("Invalid remote desktop viewport")
+                    viewport = {"width": viewport["width"], "height": viewport["height"]}
+                viewer = {"session_id": secrets.token_hex(12), "address": address, "network": network,
+                    "status": "connecting", "permission": permission, "protocol": "rfb", "error": "",
+                    "socket": None, "bridge": None, "ws_url": "", "stop": threading.Event(),
+                    "events": deque(), "frame": None, "viewport": viewport, "shared_key": shared_key}
+                self.viewer = viewer
+                thread = threading.Thread(target=self._connect, args=(viewer, address, network, port, permission, "rfb", viewport, shared_key), daemon=True)
+                viewer["thread"] = thread
+                thread.start()
+        # Do not hold Runtime.lock while the handshake thread updates status.
+        # A short wait makes the GUI receive trust/pending/ws_url in one call,
+        # while slow links still report connecting and can be polled safely.
+        # Return connecting/pending promptly; the GUI polls this session while
+        # other local RPC requests (including approval) remain available.
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            with self.lock:
+                status = viewer.get("status")
+                if status != "connecting" and not (status == "connected" and not viewer.get("ws_url")):
+                    break
+            time.sleep(0.05)
+        with self.lock:
+            return self._public_viewer()
 
     def request(self, action, payload=None):
         payload = payload or {}
+        if action == "remote_vnc_connect":
+            return self._request_vnc_connect(payload)
         with self.lock:
             if action == "remote_state":
                 return {"identity": self.identity.info(), "config": dict(self.config),
@@ -500,54 +635,19 @@ class Runtime:
                 permission = payload.get("permission", "control")
                 if type(port) is not int or not 1 <= port <= 65535 or permission not in ("view", "control"):
                     raise ValueError("Invalid remote desktop connection")
+                shared_key = payload.get("shared_key", "")
+                if not isinstance(shared_key, str) or not shared_key or len(shared_key.encode("utf-8")) > 4096:
+                    raise ValueError("Remote desktop shared key is required")
                 viewer = {"session_id": secrets.token_hex(12), "address": address, "network": network,
                     "status": "connecting", "permission": permission, "error": "", "socket": None,
-                    "stop": threading.Event(), "events": deque(), "frame": None}
+                    "stop": threading.Event(), "events": deque(), "frame": None, "shared_key": shared_key}
                 self.viewer = viewer
-                thread = threading.Thread(target=self._connect, args=(viewer, address, network, port, permission), daemon=True)
+                thread = threading.Thread(target=self._connect, args=(viewer, address, network, port, permission, "jpeg", None, shared_key), daemon=True)
                 viewer["thread"] = thread
                 thread.start()
                 return self._public_viewer()
-            if action == "remote_trust":
-                identity = self.untrusted.get(payload["fingerprint"])
-                if not identity:
-                    raise ValueError("No verified desktop identity awaiting trust")
-                self.store.put("hosts", identity)
-                return {"message": "Desktop identity saved"}
-            if action == "remote_authorize":
-                pending = self.pending.get(payload.get("request_id"))
-                if (not pending or pending["rejected"] or pending["event"].is_set()
-                    or pending["epoch"] != self.policy_epoch):
-                    raise ValueError("Desktop approval request has expired")
-                permission = payload.get("permission", "control")
-                if permission not in ("view", "control") or type(payload.get("remember", False)) is not bool:
-                    raise ValueError("Invalid desktop grant")
-                if payload.get("remember", False):
-                    self.store.put("devices", dict(_identity(pending), permission=permission))
-                pending["permission"] = permission
-                pending["event"].set()
-                return {"message": "Desktop request approved"}
-            if action == "remote_reject":
-                pending = self.pending.get(payload.get("request_id"))
-                if pending:
-                    pending["rejected"] = True
-                    pending["event"].set()
-                return {"message": "Desktop request rejected"}
-            if action == "remote_revoke":
-                key = payload["fingerprint"]
-                self.store.remove("devices", key)
-                # Prevent a previously approved but not yet registered session
-                # from racing a revocation. Existing unrelated sessions survive.
-                self.policy_epoch += 1
-                for pending in self.pending.values():
-                    if pending["fingerprint"] == key:
-                        pending["rejected"] = True
-                        pending["event"].set()
-                if self.config["access"] == "authorized_devices":
-                    for session in self.sessions.values():
-                        if session["fingerprint"] == key:
-                            _revoke(session)
-                return {"message": "Device authorization removed"}
+            if action in ("remote_trust", "remote_authorize", "remote_reject", "remote_revoke"):
+                raise ValueError("Remote desktop uses pre-shared key authentication; approval is not supported")
             if action == "remote_terminate":
                 pending = self.pending.get(payload.get("session_id"))
                 if pending:
@@ -574,22 +674,30 @@ class Runtime:
                     if frame and frame["sequence"] != payload.get("after"):
                         result.update(frame)
                     return result
-                event = payload.get("event")
                 if viewer["status"] != "connected":
                     raise ValueError("Desktop is not connected")
-                if not isinstance(event, dict) or len(canonical(event)) > 1024:
-                    raise ValueError("Invalid desktop input")
-                if viewer["permission"] != "control" and event.get("type") != "release_all":
-                    raise ValueError("Desktop is view-only")
+                submitted = payload.get("events")
+                if submitted is None:
+                    submitted = [payload.get("event")]
+                if not isinstance(submitted, list) or not submitted or len(submitted) > 32:
+                    raise ValueError("Invalid desktop input batch")
+                validated = []
+                for event in submitted:
+                    if not isinstance(event, dict) or len(canonical(event)) > 1024:
+                        raise ValueError("Invalid desktop input")
+                    if viewer["permission"] != "control" and event.get("type") != "release_all":
+                        raise ValueError("Desktop is view-only")
+                    validated.append(event)
                 events = viewer["events"]
-                if event.get("type") == "mouse_move" and events and events[-1].get("type") == "mouse_move":
-                    events[-1] = event
-                elif len(events) < 128:
-                    events.append(event)
-                else:
-                    events.clear()
-                    events.append({"type": "release_all"})
-                    raise ValueError("Desktop input queue full; keys released")
+                for event in validated:
+                    if event.get("type") == "mouse_move" and events and events[-1].get("type") == "mouse_move":
+                        events[-1] = event
+                    elif len(events) < 128:
+                        events.append(event)
+                    else:
+                        events.clear()
+                        events.append({"type": "release_all"})
+                        raise ValueError("Desktop input queue full; keys released")
                 return {"ok": True}
             raise ValueError("Unknown remote desktop action")
 

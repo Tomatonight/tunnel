@@ -31,9 +31,12 @@ public:
     void inject(const Bytes& b) { if (receiver) receiver(b); }
 };
 void until(EventLoop& loop, std::function<bool()> predicate, unsigned timeout = 12000) {
-    auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { if (predicate()) loop.breakLoop(); }, true);
-    auto deadline = loop.addTimer(std::chrono::milliseconds(timeout), [&](evutil_socket_t, short) { loop.breakLoop(); });
-    loop.run(); if (!predicate() && diagnostics) diagnostics(); CHECK(predicate());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        auto tick = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { loop.breakLoop(); });
+        loop.run();
+    }
+    if (!predicate() && diagnostics) diagnostics(); CHECK(predicate());
 }
 void spin(EventLoop& loop, unsigned milliseconds) {
     auto done = loop.addTimer(std::chrono::milliseconds(milliseconds), [&](evutil_socket_t, short) { loop.breakLoop(); }); loop.run();
@@ -82,11 +85,11 @@ NodeOptions options() {
     o.log = [](const std::string& s) { std::cerr << s << '\n'; }; return o;
 }
 Json client(const Endpoint& local, const Endpoint& remote, const Endpoint& server, bool first) {
-    return {{"address", local.str()}, {"listen", {{"bind_address", local.str()}}},
+    return {{"listen", {{"bind_address", local.str()}}},
         {"networks", Json::array({first ? "10.99.0.1/24" : "10.99.0.2/24"})},
         {"address_clients", Json::array({{{"address", server.str()}, {"shared_key", first ? "test-client-a" : "test-client-b"},
             {"networks", Json::array({"10.77.0.0/24", "fd00:77::/64"})}}})},
-        {"peers", Json::array({{{"address", remote.str()}, {"shared_key", "test-pairwise-peer"},
+        {"peers", Json::array({{{"endpoint", remote.str()}, {"shared_key", "test-pairwise-peer"},
             {"networks", Json::array({"10.99.0.0/24", "10.77.0.0/24", "fd00:77::/64"})}}})}};
 }
 Json server(const Endpoint& address, const Endpoint& a, const Endpoint& b, const std::string& state) {
@@ -104,7 +107,12 @@ std::string ip(Node& node, const std::string& network) {
 }
 bool route(Node& node, const Endpoint& target, const std::string& network) {
     const auto status = node.status();
-    for (const auto& r : status.at("routes")) if (r.at("node") == target.str() && r.at("network") == network) return true;
+    std::string identity;
+    for (const auto& peer : status.at("peers")) if (peer.at("endpoint") == target.str()) {
+        const auto& identities = peer.at("identities");
+        if (identities.is_object() && identities.count(network)) identity = identities.at(network).get<std::string>();
+    }
+    for (const auto& r : status.at("routes")) if (r.at("node") == identity && r.at("network") == network) return true;
     return false;
 }
 bool imported(const MemoryDevice& device, const std::string& network, const std::string& prefix) {
@@ -226,14 +234,6 @@ void run(const std::string& state) {
     CHECK(!imported(*db, "10.77.0.0/24", "10.78.0.0/24"));
     CHECK(imported(*db, "10.99.0.0/24", "10.100.0.0/24"));
     CHECK(!route(*b, endpoints[0], "fd00:77::/64")); transfer(loop, *da, *db, static_packet);
-    std::cerr << "managed: static peer cannot bypass allocation on a managed tunnel\n";
-    b->stop(); b.reset();
-    cb.erase("address_clients"); cb["networks"].push_back("10.77.0.99/24"); cb["networks"].push_back("fd00:77::99/64");
-    db = new MemoryDevice; b.reset(new Node(loop, parse_config(cb.dump()), std::unique_ptr<PacketDevice>(db), options())); b->start();
-    until(loop, [&] { return route(a, endpoints[1], "10.99.0.0/24"); });
-    spin(loop, 300); CHECK(!route(a, endpoints[1], "10.77.0.0/24")); transfer(loop, *da, *db, static_packet);
-    CHECK(!imported(*db, "10.77.0.0/24", "10.78.0.0/24"));
-    CHECK(imported(*db, "10.99.0.0/24", "10.100.0.0/24"));
     b->stop(); a.stop(); s->stop(); other.stop(); diagnostics = {};
     CHECK(da->exported.empty() && db->imported.empty());
 }

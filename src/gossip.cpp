@@ -111,7 +111,9 @@ bool Gossip::announce(const Endpoint& peer, const PathAnnouncement& message) {
     const auto local = local_networks_.find(message.network);
     const auto identity = peer_nodes_.find(peer);
     if (!available_.count(peer) || allowed == allowed_.end() || !allowed->second.count(message.network) ||
-        local == local_networks_.end() || !message.network.usable_host(message.tunnel_ip) || message.destination == local->second ||
+        local == local_networks_.end() || message.network.address.family != message.destination.family ||
+        !message.network.usable_host(message.destination) ||
+        !message.network.usable_host(message.tunnel_ip) || message.destination == local->second ||
         message.path.empty() || message.path.size() > 64 ||
         message.path.back() != message.destination) return false;
     if (identity == peer_nodes_.end()) return false;
@@ -127,7 +129,8 @@ bool Gossip::announce(const Endpoint& peer, const PathAnnouncement& message) {
     }
     std::set<NodeId> visited;
     for (const auto& node : message.path)
-        if (!node.unicast() || !visited.insert(node).second) return false;
+        if (node.family != message.network.address.family || !message.network.usable_host(node) ||
+            node == local->second || !visited.insert(node).second) return false;
     for (const auto& record : records_) {
         const auto& old = record.announcement;
         if (!(old.network == message.network)) continue;

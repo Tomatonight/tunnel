@@ -1,5 +1,6 @@
 #include "device.h"
 #include "kernel_device.h"
+#include "linux_capability.h"
 #include "subnet_platform.h"
 #include <array>
 #include <cerrno>
@@ -61,6 +62,7 @@ void validate_name(const std::string& name, std::size_t maximum) {
 #ifndef __ANDROID__
 void run_program(const std::vector<std::string>& args) {
     std::vector<char*> argv; for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str())); argv.push_back(nullptr);
+    tunnel_linux::prepare_net_admin_child();
     const auto child = fork();
     if (child < 0) throw std::runtime_error("cannot launch interface configuration tool");
     if (!child) { execvp(argv[0], argv.data()); _exit(127); }
@@ -177,7 +179,26 @@ public:
                 if (!requested.empty()) throw std::runtime_error("host-owned TUN supports subnet access only; publishing is unsupported");
             } else platform_->set_exports(requested);
             exports_ = requested;
-        } catch (...) { failed_ = true; platform_.reset(); detach(); throw; }
+        } catch (...) {
+            // A subnet/NAT failure is usually a recoverable platform
+            // configuration error. Keep the TUN alive and restore the last
+            // working export set so the overlay can continue without the
+            // advertised subnet. Only retire the device when rollback itself
+            // fails and the platform state can no longer be trusted.
+            try {
+                if (!inherited_ && platform_) {
+                    // Clear first because a failed platform update may have
+                    // created NAT/forwarding state while its logical export
+                    // vector still contains the previous set; restoring the
+                    // same vector alone could be treated as a no-op.
+                    platform_->set_exports({});
+                    platform_->set_exports(exports_);
+                }
+            } catch (...) {
+                failed_ = true; platform_.reset(); detach();
+            }
+            throw;
+        }
     }
     bool send(const Bytes& packet) override {
         if (fd_ < 0 || failed_ || packet.empty() || packet.size() > 65535 || queue_.size() >= 256) return false;
@@ -388,7 +409,23 @@ public:
                 if (!active) throw std::invalid_argument("subnet export requires an active local tunnel");
             }
             platform_->set_exports(requested); exports_ = requested;
-        } catch (...) { failed_ = true; cleanup(); throw; }
+        } catch (...) {
+            // WinNAT setup can fail because another NAT instance exists or
+            // because the physical egress route is unavailable. Restore the
+            // previous export set and keep the virtual adapter usable; the
+            // caller will surface the specific export error in status/logs.
+            try {
+                if (platform_) {
+                    // Force cleanup of partially-created WinNAT state before
+                    // restoring the previous logical export set.
+                    platform_->set_exports({});
+                    platform_->set_exports(exports_);
+                }
+            } catch (...) {
+                failed_ = true; cleanup();
+            }
+            throw;
+        }
     }
     bool send(const Bytes& packet) override {
         if (!session_ || failed_ || packet.empty() || packet.size() > 65535) return false;

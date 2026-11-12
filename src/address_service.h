@@ -21,7 +21,7 @@ public:
         unsigned reconnect_ms = 1000;
         unsigned proof_lifetime_ms = 60000;
         // Only a live, explicitly requested configuration reload may migrate a
-        // lease database from this previous advertised address. Normal startup
+        // lease database from this previous assigned address. Normal startup
         // leaves it empty and still rejects a database owned by another server.
         Endpoint previous_server;
         UdpTransport::Protector protect;

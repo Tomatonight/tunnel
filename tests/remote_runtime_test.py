@@ -1,4 +1,4 @@
-"""Real TLS, persistent identities and access policy; synthetic desktop only.
+"""Real TLS, PSK authentication and membership checks; synthetic desktop only.
 
 No input is sent to the developer's actual desktop. Real TUN/X11 verification
 lives in remote_network_integration.py.
@@ -17,11 +17,12 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
-from remote_desktop.runtime import Runtime
+from remote_desktop.runtime import FRAME_INTERVAL, Runtime
 from remote_desktop.security import Identity, DeviceStore, canonical, receive, send, MAX_FRAME
 from remote_desktop.host import authenticate
 
 NETWORK = "127.44.0.0/24"
+REMOTE_PSK = "desktop-remote-test-secret"
 
 
 def wait_for(predicate, seconds=8):
@@ -92,6 +93,19 @@ class Desktop:
         return {"keyboard": True, "pointer": True}
 
 
+class FrameRateTests(unittest.TestCase):
+    """Keep the capture and bridge polling cadence at the requested 60 FPS."""
+
+    def test_runtime_capture_interval_is_sixty_fps(self):
+        self.assertAlmostEqual(FRAME_INTERVAL, 1.0 / 60.0, places=6)
+
+    def test_frontend_does_not_poll_at_legacy_five_fps_interval(self):
+        source = (Path(__file__).resolve().parents[1] / "gui" / "assets" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("document.hidden ? 500 : 200", source)
+        self.assertIn("1000 / 60", source)
+        self.assertIn("freshFrame ? 0", source)
+
+
 class DesktopTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tunnel-desktop-test-")
@@ -107,7 +121,7 @@ class DesktopTests(unittest.TestCase):
             value = Desktop()
             self.backends.append(value)
             return value
-        self.config = {"enabled": True, "networks": [NETWORK], "access": "all_tunnel_nodes", "unattended": True, "port": self.port}
+        self.config = {"enabled": True, "networks": [NETWORK], "shared_key": REMOTE_PSK, "port": self.port}
         self.server = Runtime(self.server_core, self.root / "server", self.config, backend)
         self.client = Runtime(self.client_core, self.root / "client", {})
         wait_for(lambda: self.server.request("remote_state")["listeners"])
@@ -117,12 +131,14 @@ class DesktopTests(unittest.TestCase):
         self.server.close()
         self.temp.cleanup()
 
-    def connect(self, trusted=True, permission="control"):
-        if trusted:
-            self.client.store.put("hosts", self.server.identity.info())
-        self.client.request("remote_connect", {"address": self.server_core.ip, "tunnel": NETWORK,
-                                              "port": self.port, "permission": permission})
-        return wait_for(lambda: self.viewer() if self.viewer()["status"] != "connecting" else None)
+    def connect(self, permission="control", shared_key=REMOTE_PSK, client=None):
+        client = client or self.client
+        client.request("remote_connect", {"address": self.server_core.ip, "tunnel": NETWORK,
+                                           "port": self.port, "permission": permission,
+                                           "shared_key": shared_key})
+        result = wait_for(lambda: client.request("remote_state")["viewer"]
+                          if client.request("remote_state")["viewer"]["status"] != "connecting" else None)
+        return result
 
     def viewer(self):
         return self.client.request("remote_state")["viewer"]
@@ -130,39 +146,24 @@ class DesktopTests(unittest.TestCase):
     def frame(self):
         return self.client.request("remote_frame", {"session_id": self.viewer()["session_id"]})
 
-    def test_tls_pin_all_nodes_frame_input_and_disconnect_release(self):
-        result = self.connect(trusted=False)
-        self.assertEqual(result["status"], "trust_required")
-        self.assertFalse(self.backends)
-        self.client.request("remote_trust", {"fingerprint": result["identity"]["fingerprint"]})
-        self.assertEqual(self.connect()["status"], "connected")
+    def test_psk_connects_without_approval_frame_input_and_disconnect_release(self):
+        result = self.connect()
+        self.assertEqual(result["status"], "connected")
+        self.assertFalse(self.server.request("remote_state")["pending"])
         frame = wait_for(lambda: self.frame() if self.frame().get("jpeg") else None)
         self.assertEqual(Image.open(io.BytesIO(base64.b64decode(frame["jpeg"]))).size, (64, 32))
-        self.client.request("remote_input", {"session_id": self.viewer()["session_id"], "event": {"type": "key", "key": "KeyA", "down": True}})
-        wait_for(lambda: self.backends[0].events)
+        self.client.request("remote_input", {"session_id": self.viewer()["session_id"], "events": [
+            {"type": "key", "key": "KeyA", "down": True},
+            {"type": "mouse_move", "x": 0.25, "y": 0.5},
+        ]})
+        wait_for(lambda: len(self.backends[0].events) >= 2)
+        self.assertEqual(self.backends[0].events[:2], [
+            {"type": "key", "key": "KeyA", "down": True},
+            {"type": "mouse_move", "x": 0.25, "y": 0.5},
+        ])
         self.client.request("remote_disconnect", {})
         wait_for(lambda: self.backends[0].closed)
         self.assertGreater(self.backends[0].releases, 0)
-
-    def test_authorized_mode_approval_view_only_and_revoke(self):
-        self.server.configure(dict(self.config, access="authorized_devices"))
-        wait_for(lambda: self.server.request("remote_state")["listeners"])
-        self.assertEqual(self.connect()["status"], "pending")
-        pending = self.server.request("remote_state")["pending"][0]
-        self.server.request("remote_authorize", {"request_id": pending["request_id"], "permission": "view", "remember": True})
-        wait_for(lambda: self.viewer()["status"] == "connected")
-        self.assertEqual(self.viewer()["permission"], "view")
-        with self.assertRaises(ValueError):
-            self.client.request("remote_input", {"session_id": self.viewer()["session_id"], "event": {"type": "key", "key": "KeyA", "down": True}})
-        self.server.request("remote_revoke", {"fingerprint": self.client.identity.fingerprint})
-        wait_for(lambda: self.viewer()["status"] == "error")
-        self.assertFalse(self.server.store.list("devices"))
-
-    def test_mode_switch_disconnects_unlisted_controller(self):
-        self.assertEqual(self.connect()["status"], "connected")
-        self.server.configure(dict(self.config, access="authorized_devices"))
-        wait_for(lambda: self.viewer()["status"] == "error")
-        wait_for(lambda: not self.server.request("remote_state")["sessions"])
 
     def test_network_membership_revocation_closes_active_session(self):
         self.assertEqual(self.connect()["status"], "connected")
@@ -170,14 +171,25 @@ class DesktopTests(unittest.TestCase):
         wait_for(lambda: self.viewer()["status"] == "error")
         wait_for(lambda: not self.server.request("remote_state")["sessions"])
 
-    def test_unattended_false_requires_confirmation_even_for_saved_device(self):
-        self.server.store.put("devices", dict(self.client.identity.info(), permission="control"))
-        self.server.configure(dict(self.config, unattended=False, access="authorized_devices"))
-        wait_for(lambda: self.server.request("remote_state")["listeners"])
-        self.assertEqual(self.connect()["status"], "pending")
-        pending = self.server.request("remote_state")["pending"][0]
-        self.server.request("remote_terminate", {"session_id": pending["request_id"]})
-        wait_for(lambda: self.viewer()["status"] == "error")
+    def test_wrong_or_missing_psk_is_rejected_without_pending_or_session(self):
+        result = self.connect(shared_key="wrong-secret")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("shared key", result["error"].lower())
+        self.assertFalse(self.server.request("remote_state")["pending"])
+        self.assertFalse(self.server.request("remote_state")["sessions"])
+        self.client.request("remote_disconnect", {})
+        with self.assertRaisesRegex(ValueError, "shared key"):
+            self.connect(shared_key="")
+        self.assertFalse(self.server.request("remote_state")["pending"])
+        self.assertFalse(self.server.request("remote_state")["sessions"])
+
+    def test_enabled_remote_desktop_requires_nonempty_psk(self):
+        with self.assertRaisesRegex(ValueError, "shared_key"):
+            self.server.configure({"enabled": True, "networks": [NETWORK], "port": self.port})
+        with self.assertRaises(ValueError):
+            self.server.configure(dict(self.config, access="all_tunnel_nodes"))
+        with self.assertRaises(ValueError):
+            self.server.configure(dict(self.config, approval_required=False))
 
     def test_persistent_identity_and_corrupt_database_fail_closed(self):
         again = Identity(self.root / "server")
@@ -189,6 +201,13 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             DeviceStore(self.root / "server")
 
+    def test_clearing_device_name_restores_hostname_identity(self):
+        original = socket.gethostname()
+        self.server.configure(dict(self.config, device_name="custom-desktop"))
+        self.assertEqual(self.server.identity.info()["name"], "custom-desktop")
+        self.server.configure(dict(self.config, device_name=""))
+        self.assertEqual(self.server.identity.info()["name"], original)
+
     def test_cleanup_failure_does_not_keep_busy_session(self):
         self.assertEqual(self.connect()["status"], "connected")
         self.backends[0].fail_close = True
@@ -197,33 +216,9 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue(self.backends[0].closed)
         self.assertEqual(self.connect()["status"], "connected")
 
-    def test_revoke_pending_approved_device_invalidates_grant(self):
-        self.server.configure(dict(self.config, access="authorized_devices"))
-        wait_for(lambda: self.server.request("remote_state")["listeners"])
-        self.assertEqual(self.connect()["status"], "pending")
-        self.server.request("remote_revoke", {"fingerprint": self.client.identity.fingerprint})
-        wait_for(lambda: self.viewer()["status"] == "error")
-        self.assertFalse(self.backends)
-
     def test_invalid_current_member_cannot_start_screen_capture(self):
         original = self.server_core.call
         self.server_core.call = lambda method, **args: {"valid": False} if method == "remote_verify" else original(method, **args)
-        self.assertEqual(self.connect()["status"], "error")
-        self.assertFalse(self.backends)
-
-    def test_all_nodes_ignores_device_list_deletion_by_design(self):
-        self.assertEqual(self.connect()["status"], "connected")
-        self.server.request("remote_revoke", {"fingerprint": self.client.identity.fingerprint})
-        time.sleep(.25)
-        self.assertEqual(self.viewer()["status"], "connected")
-
-    def test_policy_change_between_grant_and_session_registration(self):
-        original = self.server._approval
-        def racing_approval(*args):
-            grant = original(*args)
-            self.server.configure(dict(self.config, access="authorized_devices"))
-            return grant
-        self.server._approval = racing_approval
         self.assertEqual(self.connect()["status"], "error")
         self.assertFalse(self.backends)
 
@@ -246,8 +241,8 @@ class DesktopTests(unittest.TestCase):
         other_core = Membership(3, self.registry)
         other = Runtime(other_core, self.root / "other", {})
         try:
-            other.store.put("hosts", self.server.identity.info())
-            other.request("remote_connect", {"address": self.server_core.ip, "tunnel": NETWORK, "port": self.port})
+            other.request("remote_connect", {"address": self.server_core.ip, "tunnel": NETWORK,
+                                              "port": self.port, "shared_key": REMOTE_PSK})
             wait_for(lambda: other.request("remote_state")["viewer"]["status"] == "error")
             self.assertIn("busy", other.request("remote_state")["viewer"]["error"])
             self.assertEqual(self.viewer()["status"], "connected")

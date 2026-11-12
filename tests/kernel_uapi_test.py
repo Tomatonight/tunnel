@@ -8,7 +8,10 @@ loaded; closing each private control fd removes only that test instance.
 import argparse
 import ctypes as C
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # The ABI test is Linux-only; keep discovery portable.
+    fcntl = None
 import glob
 import ipaddress
 import json
@@ -61,7 +64,7 @@ class Net(Packed):
 
 
 class Peer(Packed):
-    _fields_ = [('endpoint', Endpoint), ('keys', Keys), ('tcp', C.c_uint8),
+    _fields_ = [('endpoint', Endpoint), ('source', Endpoint), ('keys', Keys), ('tcp', C.c_uint8),
                ('ready', C.c_uint8), ('networks', C.c_uint8 * 16)]
 
 
@@ -120,7 +123,7 @@ def ioctl(fd, command, value):
 
 def state(nets=(), peers=(), routes=(), ends=(), prefixes=()):
     groups = (nets, peers, routes, ends, prefixes)
-    return bytes(Header(1, *(len(group) for group in groups))) + b''.join(bytes(item) for group in groups for item in group)
+    return bytes(Header(3, *(len(group) for group in groups))) + b''.join(bytes(item) for group in groups for item in group)
 
 
 def publish(fd, data, length=None, reserved=0):
@@ -193,7 +196,7 @@ def exercise(report):
         return fd
 
     def create(fd, name, port=47291, lease=60000):
-        config = Create(1, 1280, 1500, lease, endpoint('127.0.0.1', port), endpoint('127.0.0.1', port), name.encode(), 0)
+        config = Create(3, 1280, 1500, lease, endpoint('127.0.0.1', port), endpoint('127.0.0.1', port), name.encode(), 0)
         return ioctl(fd, CREATE, config)
 
     def stats(fd):
@@ -214,14 +217,14 @@ def exercise(report):
         fd = new_fd()
         expect_error(lambda: publish(fd, state()))
         for mtu, outer in ((0xfffffff0, 1500), (0xffffffff, 65535), (67, 1500), (1280, 1000), (1280, 65536)):
-            bad = Create(1, mtu, outer, 60000, endpoint('127.0.0.1', 47291), endpoint('127.0.0.1', 47291), b'tkuapi0', 0)
+            bad = Create(3, mtu, outer, 60000, endpoint('127.0.0.1', 47291), endpoint('127.0.0.1', 47291), b'tkuapi0', 0)
             expect_error(lambda: ioctl(fd, CREATE, bad))
         mark('create_rejects_mtu_overflow_and_invalid_budgets')
         create(fd, 'tkuapi0')
         assert run('ip', 'link', 'show', 'dev', 'tkuapi0', check=False).returncode == 0
         expect_error(lambda: create(fd, 'tkuapi0'), (errno.EALREADY,))
         for counts in ((129, 0, 0, 0, 0), (0, 257, 0, 0, 0), (0, 0, 4097, 0, 0), (0, 0, 0, 257, 0), (0, 0, 0, 0, 4097), (1, 0, 0, 0, 0)):
-            expect_error(lambda: publish(fd, bytes(Header(1, *counts))))
+            expect_error(lambda: publish(fd, bytes(Header(3, *counts))))
         expect_error(lambda: publish(fd, bytes(Header(2, 0, 0, 0, 0, 0))))
         expect_error(lambda: publish(fd, state(), reserved=1))
         expect_error(lambda: publish(fd, state(), length=1024 * 1024 + 1))
@@ -237,7 +240,7 @@ def exercise(report):
         expect_error(lambda: publish(fd, state(nets=[net, Net(network('10.98.0.0/16'), ip('10.98.0.1'))])))
         mark('snapshot_rejects_invalid_addresses_prefixes_and_overlap')
         keys = Keys((C.c_uint8 * 16)(*range(16)), (C.c_uint8 * 32)(*range(32)), (C.c_uint8 * 32)(*range(32, 64)))
-        peer = Peer(endpoint('127.0.0.2', 47292), keys, 1, 1, (C.c_uint8 * 16)(1))
+        peer = Peer(endpoint('127.0.0.2', 47292), endpoint('127.0.0.1', 47291), keys, 1, 1, (C.c_uint8 * 16)(1))
         good = state(nets=[net], peers=[peer])
         publish(fd, good)
         expect_error(lambda: publish(fd, state(nets=[net], peers=[peer, peer])))
@@ -320,6 +323,9 @@ def main():
     parser.add_argument('--work', default='/tmp/tunnel-kernel-uapi-tests')
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if fcntl is None or os.name != 'posix' or platform.system() != 'Linux':
+        print('SKIP: kernel_uapi_test requires Linux fcntl/ioctl support')
+        return 0
     if platform.machine().lower() not in ('x86_64', 'amd64', 'aarch64', 'arm64', 'i686', 'i386', 'armv7l'):
         raise RuntimeError('ioctl encoding is tested only on Linux asm-generic ioctl architectures')
     work = Path(args.work).resolve(); work.mkdir(parents=True, exist_ok=True)

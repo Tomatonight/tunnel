@@ -54,7 +54,7 @@ void egress_probe_tests() {
 class LegacyDevice : public PacketDevice {
     void start(Receiver) override {}
     bool send(const Bytes&) override { return false; }
-    std::string name() const override { return "legacy-test"; }
+    std::string name() const override { return "address-test"; }
 };
 #ifndef _WIN32
 struct Pair {
@@ -101,9 +101,9 @@ void descriptor_tests() {
     rejects([&] { device->set_networks({a}); });
 
     Pair inherited; const int inherited_fd = inherited.device; config.networks = {a};
-    auto legacy = open_tun(loop, config, "", inherited.take());
-    legacy->set_networks({a}); CHECK(legacy->healthy());
-    rejects([&] { legacy->set_networks({b}); }); CHECK(!legacy->healthy() && closed(inherited_fd));
+    auto inherited_device = open_tun(loop, config, "", inherited.take());
+    inherited_device->set_networks({a}); CHECK(inherited_device->healthy());
+    rejects([&] { inherited_device->set_networks({b}); }); CHECK(!inherited_device->healthy() && closed(inherited_fd));
 
     Pair invalid; const int invalid_fd = invalid.device; config.networks.clear();
     auto wrong = open_tun(loop, config, "", -1, [&](const std::vector<NetworkConfig>&) { return -1; });

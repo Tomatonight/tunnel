@@ -7,6 +7,7 @@
 namespace {
 using Json = wire::Json;
 unsigned checks = 0;
+std::vector<Endpoint> known_endpoints;
 #define CHECK(x) do { ++checks; if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (0)
 
 void rejected(const Json& value) {
@@ -15,24 +16,26 @@ void rejected(const Json& value) {
     CHECK(failed);
 }
 void config_tests() {
-    const Json basic{{"address", "127.0.0.1:27001"}, {"networks", {"10.88.0.1/24"}}};
+    const Json basic{{"listen", {{"bind_address", "127.0.0.1:27001"}}}, {"networks", {"10.88.0.1/24"}}};
     auto value = basic;
     auto parsed = parse_config(value.dump());
     CHECK(!parsed.remote_desktop.enabled && !parsed.remote_desktop.configured);
     CHECK(!Json::parse(serialize_config(parsed)).count("remote_desktop"));
-    value["remote_desktop"] = {{"enabled", true}};
+    value["remote_desktop"] = {{"enabled", true}, {"shared_key", "remote-test-key"}};
     parsed = parse_config(value.dump());
     CHECK(parsed.remote_desktop.enabled && parsed.remote_desktop.configured);
-    CHECK(parsed.remote_desktop.access == "authorized_devices" && !parsed.remote_desktop.unattended && parsed.remote_desktop.port == 47831);
+    CHECK(parsed.remote_desktop.shared_key == "remote-test-key" && parsed.remote_desktop.port == 47831);
     CHECK(parsed.remote_desktop.networks.size() == 1 && parsed.remote_desktop.networks[0].str() == "10.88.0.0/24");
     auto normalized = Json::parse(serialize_config(parsed));
     CHECK(normalized["remote_desktop"]["networks"] == Json({"10.88.0.0/24"}));
-    value["remote_desktop"] = {{"enabled", true}, {"access", "all_tunnel_nodes"}, {"unattended", true},
+    value["remote_desktop"] = {{"enabled", true}, {"shared_key", "remote-test-key"},
         {"port", 47900}, {"device_name", "Desktop \xe6\xb5\x8b\xe8\xaf\x95"}};
     const auto text = serialize_config(parse_config(value.dump()));
     CHECK(serialize_config(parse_config(text)) == text);
     parsed = parse_config(text);
-    CHECK(parsed.remote_desktop.unattended && parsed.remote_desktop.port == 47900);
+    CHECK(parsed.remote_desktop.port == 47900);
+    CHECK(parsed.remote_desktop.shared_key == "remote-test-key");
+    CHECK(Json::parse(text)["remote_desktop"]["shared_key"] == "remote-test-key");
     CHECK(parsed.remote_desktop.device_name == value["remote_desktop"]["device_name"]);
     value["networks"].push_back("fd00:88::1/64");
     rejected(value);
@@ -40,10 +43,11 @@ void config_tests() {
     CHECK(parse_config(value.dump()).remote_desktop.networks.size() == 1);
     CHECK(Json::parse(serialize_config(parse_config(value.dump())))["remote_desktop"]["networks"].size() == 1);
     const auto valid = value;
-    for (const auto& field : {"enabled", "unattended"}) { value = valid; value["remote_desktop"][field] = 1; rejected(value); }
-    for (const auto& access : {"all", "anyone", "", "authorized_device"}) {
-        value = valid; value["remote_desktop"]["access"] = access; rejected(value);
+    for (const auto& field : {"enabled"}) { value = valid; value["remote_desktop"][field] = 1; rejected(value); }
+    for (const auto& key : {Json(1), Json::array(), Json::object(), Json(std::string(4097, 'x'))}) {
+        value = valid; value["remote_desktop"]["shared_key"] = key; rejected(value);
     }
+    value = valid; value["remote_desktop"]["shared_key"] = ""; rejected(value);
     for (const Json& port : {Json(0), Json(-1), Json(65536), Json(1.5), Json("47831"), Json(true)}) {
         value = valid; value["remote_desktop"]["port"] = port; rejected(value);
     }
@@ -56,23 +60,23 @@ void config_tests() {
     }
     value = valid; value["remote_desktop"]["unknown"] = true; rejected(value);
     value = valid; value["remote_desktop"] = true; rejected(value);
+    value = valid; value["remote_desktop"].erase("shared_key"); rejected(value);
     value = valid; value["remote_desktop"]["enabled"] = false; value["remote_desktop"].erase("networks");
     CHECK(!parse_config(value.dump()).remote_desktop.enabled);
     CHECK(Json::parse(serialize_config(parse_config(value.dump())))["remote_desktop"]["networks"].empty());
     value = valid; value["remote_desktop"]["enabled"] = false; value["remote_desktop"]["networks"] = {"10.89.0.0/24"}; rejected(value);
-    const Json legacy{{"listen", {{"enabled", true}, {"address", "127.0.0.1:27001"},
+    const Json obsolete{{"listen", {{"enabled", true}, {"address", "127.0.0.1:27001"},
         {"networks", Json::array({{{"tunnel", "10.88.0.0/24"}, {"tunnel_ip", "10.88.0.1"}}})}}},
-        {"peers", Json::array()}, {"remote_desktop", {{"enabled", true}, {"access", "all_tunnel_nodes"}}}};
-    CHECK(parse_config(legacy.dump()).remote_desktop.enabled);
-    CHECK(Json::parse(serialize_config(parse_config(legacy.dump())))["remote_desktop"]["access"] == "all_tunnel_nodes");
+        {"peers", Json::array()}, {"remote_desktop", {{"enabled", true}, {"shared_key", "remote-test-key"}}}};
+    rejected(obsolete);
     const Json server{{"address_server", {{"address", "127.0.0.1:27002"}, {"shared_key", "service-key"}, {"networks", {"10.88.0.0/24"}}}},
-        {"remote_desktop", {{"enabled", true}}}};
+        {"remote_desktop", {{"enabled", true}, {"shared_key", "remote-test-key"}}}};
     rejected(server);
     value = server; value["remote_desktop"]["enabled"] = false;
     CHECK(!parse_config(serialize_config(parse_config(value.dump()))).remote_desktop.enabled);
     value = basic; value.erase("networks");
     value["address_clients"] = Json::array({{{"address", "127.0.0.1:27002"}, {"shared_key", "service-key"}, {"networks", {"10.88.0.0/24"}}}});
-    value["remote_desktop"] = {{"enabled", true}};
+    value["remote_desktop"] = {{"enabled", true}, {"shared_key", "remote-test-key"}};
     CHECK(parse_config(value.dump()).remote_desktop.networks[0].str() == "10.88.0.0/24");
     CHECK(serialize_config(parse_config(serialize_config(parse_config(value.dump())))) == serialize_config(parse_config(value.dump())));
 }
@@ -83,9 +87,12 @@ public:
     std::string name() const override { return "remote-membership-test"; }
 };
 void until(EventLoop& loop, const std::function<bool()>& condition) {
-    auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { if (condition()) loop.breakLoop(); }, true);
-    auto deadline = loop.addTimer(std::chrono::milliseconds(10000), [&](evutil_socket_t, short) { loop.breakLoop(); });
-    loop.run(); CHECK(condition());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!condition() && std::chrono::steady_clock::now() < deadline) {
+        auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { loop.breakLoop(); });
+        loop.run();
+    }
+    CHECK(condition());
 }
 std::vector<Endpoint> ports(EventLoop& loop, unsigned count) {
     std::vector<std::unique_ptr<UdpTransport>> udp;
@@ -101,14 +108,16 @@ std::vector<Endpoint> ports(EventLoop& loop, unsigned count) {
         } catch (const std::exception&) {}
     }
     if (result.size() != count) throw std::runtime_error("cannot reserve remote test ports");
+    known_endpoints = result;
     return result;
 }
 Configure config(unsigned i, const std::vector<Endpoint>& endpoints) {
-    Json value{{"address", endpoints[i].str()}, {"networks", {"10.88.0." + std::to_string(i + 1) + "/24", "fd00:88::" + std::to_string(i + 1) + "/64"}},
-        {"listen", {{"bind_address", endpoints[i].str()}}}, {"peers", Json::array()}};
+    Json value{{"listen", {{"bind_address", endpoints[i].str()}}},
+        {"networks", {"10.88.0." + std::to_string(i + 1) + "/24", "fd00:88::" + std::to_string(i + 1) + "/64"}},
+        {"peers", Json::array()}};
     for (unsigned peer = 0; peer < 3; ++peer) if ((i == 1 || peer == 1) && i != peer)
-        value["peers"].push_back({{"address", endpoints[peer].str()}, {"shared_key", "test-link"}, {"networks", {"10.88.0.0/24", "fd00:88::/64"}}});
-    if (i == 2) value["remote_desktop"] = {{"enabled", true}, {"networks", {"10.88.0.0/24"}}, {"access", "all_tunnel_nodes"}, {"unattended", true}};
+        value["peers"].push_back({{"endpoint", endpoints[peer].str()}, {"shared_key", "test-link"}, {"networks", {"10.88.0.0/24", "fd00:88::/64"}}});
+    if (i == 2) value["remote_desktop"] = {{"enabled", true}, {"networks", {"10.88.0.0/24"}}, {"shared_key", "remote-test-key"}};
     return parse_config(value.dump());
 }
 Json rpc(Node& node, Json request) {
@@ -121,11 +130,15 @@ Json signed_proof(Node& node, const std::string& network = "10.88.0.0/24") {
     auto proof = reply.at("result"); proof["method"] = "remote_verify"; proof["payload"] = "0001020304aaff"; return proof;
 }
 bool verify(Node& node, const Json& proof) {
-    const auto reply = rpc(node, proof); CHECK(reply.at("ok") == true); return reply.at("result").at("valid").get<bool>();
+    const auto reply = rpc(node, proof); if (reply.at("ok") != true) return false; return reply.at("result").at("valid").get<bool>();
 }
 bool reachable(Node& node, const Endpoint& remote) {
     const auto status = node.status();
-    for (const auto& route : status.at("routes")) if (route.at("node") == remote.str()) return true;
+    std::string identity;
+    for (std::size_t i = 0; i < known_endpoints.size(); ++i) if (known_endpoints[i] == remote) {
+        identity = "10.88.0." + std::to_string(i + 1); break;
+    }
+    for (const auto& route : status.at("routes")) if (route.at("node") == identity) return true;
     return false;
 }
 void runtime_tests() {
@@ -203,9 +216,9 @@ void runtime_tests() {
     nodes[1]->stop(); until(loop, [&] { return !reachable(*nodes[2], endpoints[0]); });
     CHECK(!verify(*nodes[2], proof));
     for (auto& node : nodes) node->stop();
-    Json managed{{"address", endpoints[3].str()}, {"listen", {{"bind_address", endpoints[3].str()}}},
+    Json managed{{"listen", {{"bind_address", endpoints[3].str()}}},
         {"address_clients", Json::array({{{"address", endpoints[0].str()}, {"shared_key", "allocator-key"}, {"networks", {"10.88.0.0/24"}}}})},
-        {"remote_desktop", {{"enabled", true}}}};
+        {"remote_desktop", {{"enabled", true}, {"shared_key", "remote-test-key"}}}};
     Node pending(loop, parse_config(managed.dump()), std::unique_ptr<PacketDevice>(new MemoryDevice), options); pending.start();
     CHECK(rpc(pending, {{"method", "remote_info"}}).at("result").at("networks").empty());
     CHECK(rpc(pending, {{"method", "remote_sign"}, {"network", "10.88.0.0/24"}, {"payload", "aa"}}).at("error") == "inactive_network");

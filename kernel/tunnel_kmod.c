@@ -518,7 +518,7 @@ static void tk_deliver(struct tk *t, const u8 *data, u32 size)
 	netif_rx(skb);
 }
 
-static bool tk_udp_send(struct tk *t, const struct tnlk_endpoint *remote, const u8 *data, u32 size)
+static bool tk_udp_send(struct tk *t, const struct tnlk_endpoint *remote, const struct tnlk_endpoint *source, const u8 *data, u32 size)
 {
 	struct sk_buff *skb;
 	struct sock *sk = t->udp->sk;
@@ -528,10 +528,26 @@ static bool tk_udp_send(struct tk *t, const struct tnlk_endpoint *remote, const 
 		flow.flowi4_proto = IPPROTO_UDP;
 		flow.fl4_sport = htons(t->config.bind.port); flow.fl4_dport = htons(remote->port);
 		memcpy(&flow.daddr, remote->ip.bytes, 4);
-		if (t->config.bind.ip.family == 4) memcpy(&flow.saddr, t->config.bind.ip.bytes, 4);
+		if (source && source->ip.family == 4 && tk_unicast(&source->ip))
+			memcpy(&flow.saddr, source->ip.bytes, 4);
+		else if (t->config.bind.ip.family == 4 && tk_unicast(&t->config.bind.ip))
+			memcpy(&flow.saddr, t->config.bind.ip.bytes, 4);
+		const bool forced_source = flow.saddr != 0;
 		route = ip_route_output_key(t->net, &flow);
+		if (IS_ERR(route) && forced_source) {
+			flow.saddr = 0;
+			route = ip_route_output_key(t->net, &flow);
+		}
 		if (IS_ERR(route)) return false;
-		if (route->dst.dev == t->dev || size + 28 > dst_mtu(&route->dst)) { ip_rt_put(route); return false; }
+		if (route->dst.dev == t->dev || size + 28 > dst_mtu(&route->dst)) {
+			if (!forced_source) { ip_rt_put(route); return false; }
+			ip_rt_put(route); flow.saddr = 0;
+			route = ip_route_output_key(t->net, &flow);
+			if (IS_ERR(route) || route->dst.dev == t->dev || size + 28 > dst_mtu(&route->dst)) {
+				if (!IS_ERR(route)) ip_rt_put(route);
+				return false;
+			}
+		}
 		skb = alloc_skb(LL_MAX_HEADER + 28 + size, GFP_ATOMIC);
 		if (!skb) { ip_rt_put(route); return false; }
 		skb_reserve(skb, LL_MAX_HEADER + 28); memcpy(skb_put(skb, size), data, size);
@@ -550,10 +566,27 @@ static bool tk_udp_send(struct tk *t, const struct tnlk_endpoint *remote, const 
 		struct dst_entry *dst;
 		flow.flowi6_proto = IPPROTO_UDP; flow.fl6_sport = htons(t->config.bind.port); flow.fl6_dport = htons(remote->port);
 		memcpy(&flow.daddr, remote->ip.bytes, 16);
-		memcpy(&flow.saddr, t->config.bind.ip.bytes, 16);
+		bool forced_source = false;
+		if (source && source->ip.family == 6 && tk_unicast(&source->ip)) {
+			memcpy(&flow.saddr, source->ip.bytes, 16); forced_source = true;
+		} else if (t->config.bind.ip.family == 6 && tk_unicast(&t->config.bind.ip)) {
+			memcpy(&flow.saddr, t->config.bind.ip.bytes, 16); forced_source = true;
+		}
 		dst = ipv6_stub->ipv6_dst_lookup_flow(t->net, sk, &flow, NULL);
+		if (IS_ERR(dst) && forced_source) {
+			memset(&flow.saddr, 0, sizeof(flow.saddr));
+			dst = ipv6_stub->ipv6_dst_lookup_flow(t->net, sk, &flow, NULL);
+		}
 		if (IS_ERR(dst)) return false;
-		if (dst->dev == t->dev || size + 48 > dst_mtu(dst)) { dst_release(dst); return false; }
+		if (dst->dev == t->dev || size + 48 > dst_mtu(dst)) {
+			if (!forced_source) { dst_release(dst); return false; }
+			dst_release(dst); memset(&flow.saddr, 0, sizeof(flow.saddr));
+			dst = ipv6_stub->ipv6_dst_lookup_flow(t->net, sk, &flow, NULL);
+			if (IS_ERR(dst) || dst->dev == t->dev || size + 48 > dst_mtu(dst)) {
+				if (!IS_ERR(dst)) dst_release(dst);
+				return false;
+			}
+		}
 		skb = alloc_skb(LL_MAX_HEADER + 48 + size, GFP_ATOMIC);
 		if (!skb) { dst_release(dst); return false; }
 		skb_reserve(skb, LL_MAX_HEADER + 48); memcpy(skb_put(skb, size), data, size);
@@ -590,7 +623,7 @@ static bool tk_send(struct tk *t, u32 peer_index, const u8 *plain, u32 size)
 		kfree_sensitive(record); return false;
 	}
 	sent = peer->tcp ? tk_event(t, TNLK_EVENT_TCP, &peer->endpoint, NULL, 0, record, length) :
-		tk_udp_send(t, &peer->endpoint, record, length);
+		tk_udp_send(t, &peer->endpoint, &peer->source, record, length);
 	if (sent) t->stats.counters[peer->tcp ? TNLK_TCP_SENT : TNLK_UDP_SENT]++;
 	else tk_drop(t, TNLK_SEND_DROP);
 	kfree_sensitive(record); return sent;
@@ -908,7 +941,8 @@ static int tk_validate_state(struct tk *t, struct tk_state *s)
 	}
 	for (i = 0; i < s->header->peers; ++i) {
 		struct tnlk_peer *p = &s->peers[i];
-		if (!tk_endpoint_valid(&p->endpoint) || tk_endpoint_equal(&p->endpoint, &t->config.local) ||
+		if (!tk_endpoint_valid(&p->endpoint) || !tk_endpoint_valid(&p->source) ||
+		    p->source.ip.family != p->endpoint.ip.family || tk_endpoint_equal(&p->endpoint, &t->config.local) ||
 		    !tk_keys_valid(&p->keys) || p->tcp > 1 || p->ready > 1 ||
 		    (!p->tcp && p->endpoint.ip.family == 6 && t->config.bind.ip.family != 6)) return -EINVAL;
 		for (j = s->header->networks; j < TNLK_MAX_NETWORKS; ++j)

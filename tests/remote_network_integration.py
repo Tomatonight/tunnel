@@ -214,8 +214,8 @@ def integration(binary, work):
     spaces = {role: prefix + suffix for role, suffix in (("host", "h"), ("client", "c"))}
     made, runners, passed, cleanup_errors = [], {}, [], []
     result = {"ok": False, "namespaces": spaces, "passed": passed}
-    policy = {"enabled": True, "networks": [NETWORK], "access": "all_tunnel_nodes",
-              "unattended": True, "port": 47831, "device_name": "isolated-host"}
+    policy = {"enabled": True, "networks": [NETWORK], "shared_key": "isolated-desktop-remote-psk",
+              "port": 47831, "device_name": "isolated-host"}
     def mark(label):
         passed.append(label)
         print("PASS:", label, flush=True)
@@ -224,7 +224,7 @@ def integration(binary, work):
     def viewer():
         return state("client").get("viewer") or {}
     def connect(permission="control"):
-        return runners["client"].call("remote_connect", address="10.254.72.1", tunnel=NETWORK, permission=permission)["session_id"]
+        return runners["client"].call("remote_connect", address="10.254.72.1", tunnel=NETWORK, permission=permission, shared_key=policy["shared_key"])["session_id"]
     def connected():
         value = viewer()
         if value.get("status") == "error":
@@ -233,8 +233,9 @@ def integration(binary, work):
     def disconnect(session):
         runners["client"].call("remote_disconnect", session_id=session)
         wait(lambda: not state("host")["sessions"], "host session cleanup")
-    def configure(access):
-        policy["access"] = access
+    def configure(shared_key=None):
+        if shared_key is not None:
+            policy["shared_key"] = shared_key
         runners["host"].call("remote_configure", config=dict(policy))
         wait(lambda: bool(state("host")["listeners"]), "desktop listener after policy change")
     def released():
@@ -271,8 +272,8 @@ def integration(binary, work):
             run("ip", "-n", spaces[role], "link", "set", device, "name", "eth0")
             run("ip", "-n", spaces[role], "address", "add", f"192.0.2.{last}/30", "dev", "eth0")
             run("ip", "-n", spaces[role], "link", "set", "eth0", "up")
-            document = {"device_backend": "tun", "address": f"192.0.2.{last}:44000", "networks": [f"10.254.72.{last}/24"],
-                "peers": [{"address": f"192.0.2.{3-last}:44000", "shared_key": "isolated-desktop-integration-psk"}],
+            document = {"device_backend": "tun", "listen": {"bind_address": f"192.0.2.{last}:44000"}, "networks": [f"10.254.72.{last}/24"],
+                "peers": [{"endpoint": f"192.0.2.{3-last}:44000", "shared_key": "isolated-desktop-integration-psk"}],
                 "remote_desktop": dict(policy) if role == "host" else {"enabled": False, "device_name": "isolated-client"}}
             config = work / (role + ".json")
             config.write_text(json.dumps(document, indent=2), encoding="utf-8")
@@ -287,68 +288,34 @@ def integration(binary, work):
         assert runners["client"].call("probe_public")["errno"] != 0
         mark("desktop listens on virtual IP only; two real encrypted TUN peers established")
 
-        connect()
-        first = wait(lambda: viewer() if viewer().get("status") == "trust_required" else None, "first-use host trust")
-        identity = state("host")["identity"]
-        assert first["identity"]["fingerprint"] == identity["fingerprint"]
-        runners["client"].call("remote_trust", fingerprint=identity["fingerprint"])
         session = connect()
-        wait(connected, "unattended all-member connection")
-        assert not state("host")["devices"] and not state("host")["pending"]
+        wait(connected, "PSK-authenticated desktop connection")
+        assert not state("host")["pending"]
         frame = wait(lambda: (lambda f: f if f.get("jpeg") else None)(runners["client"].call("remote_frame", session_id=session)), "actual JPEG frame")
         with Image.open(io.BytesIO(base64.b64decode(frame["jpeg"], validate=True))) as image:
             assert image.size == (800, 600)
             assert sum(abs(a - b) for a, b in zip(image.getpixel((600, 100)), (34, 68, 102))) < 8
-        mark("TLS desktop handshake, persistent host trust, all-member unattended access and actual screenshot")
+        mark("TLS desktop handshake, PSK authentication and actual screenshot")
         hold(session)
         disconnect(session)
         wait(released, "disconnect releases remote input")
         mark("mouse and keyboard cross encrypted TUN/TLS; disconnect releases all held input")
 
-        configure("authorized_devices")
-        session = connect()
-        pending = wait(lambda: state("host")["pending"], "first controller approval")[0]
-        runners["host"].call("remote_authorize", request_id=pending["request_id"], permission="view", remember=True)
-        assert wait(connected, "view-only authorization")["permission"] == "view"
-        try:
-            runners["client"].call("remote_input", session_id=session, event={"type": "key", "key": "KeyA", "down": True})
-        except ValueError as error:
-            assert "view-only" in str(error)
-        else:
-            raise AssertionError("view-only controller injected input")
-        disconnect(session)
-        session = connect()
-        assert wait(connected, "remembered view-only reconnect")["permission"] == "view"
+        # A wrong PSK is rejected without creating a pending approval request.
+        bad = runners["client"].call("remote_connect", address="10.254.72.1", tunnel=NETWORK,
+            permission="control", shared_key="wrong-remote-key")["session_id"]
+        wait(lambda: viewer().get("status") == "error", "wrong PSK rejection")
         assert not state("host")["pending"]
-        controller = state("client")["identity"]["fingerprint"]
-        runners["host"].call("remote_revoke", fingerprint=controller)
-        wait(lambda: viewer().get("status") != "connected", "revocation closes viewer")
-        wait(lambda: not state("host")["sessions"], "revocation closes host session")
-        mark("attended device pairing, remembered view-only grant, input denial and immediate revocation")
-
-        configure("all_tunnel_nodes")
+        runners["client"].call("remote_disconnect", session_id=bad)
+        configure("rotated-isolated-desktop-psk")
         session = connect()
-        wait(connected, "all-member reconnect")
+        wait(connected, "rotated PSK reconnect")
         hold(session)
-        configure("authorized_devices")
-        wait(lambda: viewer().get("status") != "connected", "policy narrowing disconnects unlisted viewer")
-        wait(released, "policy narrowing releases input")
-        wait(lambda: not state("host")["sessions"], "policy change session cleanup")
-        mark("all-member to device-list policy change revokes active control and releases held input")
-
-        session = connect()
-        pending = wait(lambda: state("host")["pending"], "control pairing")[0]
-        runners["host"].call("remote_authorize", request_id=pending["request_id"], permission="control", remember=True)
-        wait(connected, "control grant")
-        disconnect(session)
-        runners["host"].call("restart")
-        wait_peer()
-        assert state("host")["identity"]["fingerprint"] == identity["fingerprint"]
-        wait(lambda: bool(state("host")["listeners"]), "listener after restart")
-        session = connect()
-        assert wait(connected, "unattended reconnect after host restart")["permission"] == "control"
-        assert not state("host")["pending"]
-        mark("daemon restart preserves device identity and controller grants for unattended reconnect")
+        configure("new-policy-key")
+        wait(lambda: viewer().get("status") != "connected", "PSK rotation disconnects active viewer")
+        wait(released, "PSK rotation releases input")
+        wait(lambda: not state("host")["sessions"], "PSK rotation session cleanup")
+        mark("wrong PSK rejection and key rotation revoke active control")
 
         hold(session)
         run("ip", "-n", spaces["host"], "link", "set", "eth0", "down")

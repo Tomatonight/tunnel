@@ -53,8 +53,7 @@ def main():
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', 0))
             port = reservation.getsockname()[1]
-        config = {'device_backend': 'tun', 'address': f'127.0.0.1:{port}', 'networks': [first + '/30'],
-            'listen': {'bind_address': f'127.0.0.1:{port}'}, 'peers': []}
+        config = {'device_backend': 'tun', 'listen': {'bind_address': f'127.0.0.1:{port}'}, 'networks': [first + '/30'], 'peers': []}
         path = folder / 'config.json'
         path.write_text(json.dumps(config))
         core = CoreBridge(binary, path, folder / 'status.json', folder / 'core.log')

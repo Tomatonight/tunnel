@@ -33,42 +33,55 @@ def main():
         key = folder / 'key.txt'
         key.write_text(secret, encoding='utf-8')
 
-        def cli(*arguments, ok=True):
-            result = subprocess.run([*command, '--config-dir', str(profile), *arguments], capture_output=True, text=True,
+        def cli(*arguments, ok=True, directory=profile):
+            result = subprocess.run([*command, '--config-dir', str(directory), *arguments], capture_output=True, text=True,
                 encoding='utf-8', timeout=60 if executable else 30)
             assert secret not in result.stdout + result.stderr, 'CLI exposed the peer PSK'
             assert (result.returncode == 0) == ok, (arguments, result.stdout, result.stderr)
             return json.loads(result.stdout) if ok else result.stderr
 
-        cli('init', '--address', '192.0.2.1:65535', '--network', '10.91.0.1/24')
+        cli('init', '--bind-address', '192.0.2.1:65535', '--network', '10.91.0.1/24')
         cli('peer', 'add', '192.0.2.2:65535', '--key-file', str(key), '--transport', 'tcp')
         peers = cli('config', 'show')['peers']
-        assert peers[0]['transport'] == 'tcp' and peers[0]['shared_key'] == '<hidden>'
-        checks.append('peer_add_tcp_persists_transport_without_exposing_psk')
+        assert 'transport' not in peers[0] and peers[0]['shared_key'] == '<hidden>'
+        checks.append('peer_add_tcp_uses_canonical_default_without_exposing_psk')
+
+        duplicate = cli('peer', 'add', '192.0.2.2', '--key-file', str(key), ok=False)
+        assert 'already exists' in duplicate
+        cli('peer', 'remove', '192.0.2.2')
+        assert not cli('config', 'show').get('peers', [])
+        cli('peer', 'add', '192.0.2.2', '--key-file', str(key), '--transport', 'tcp')
+        assert cli('config', 'show')['peers'][0]['endpoint'] == '192.0.2.2:65535'
+        checks.append('peer_commands_normalize_default_port_for_duplicate_and_remove')
 
         cli('peer', 'add', '192.0.2.3:65535', '--key-file', str(key))
         cli('peer', 'add', '192.0.2.4:65535', '--key-file', str(key), '--transport', 'udp')
         peers = cli('config', 'show')['peers']
-        assert 'transport' not in peers[1] and 'transport' not in peers[2]
-        assert peers[0]['transport'] == 'tcp'
-        checks.append('default_and_explicit_udp_omitted_without_changing_tcp_peer')
+        assert 'transport' not in peers[0] and 'transport' not in peers[1]
+        assert peers[2]['transport'] == 'udp'
+        checks.append('default_tcp_and_explicit_udp_are_canonicalized')
 
         before = (profile / 'configure.json').read_bytes()
         error = cli('peer', 'add', '192.0.2.5:65535', '--key-file', str(key), '--transport', 'quic', ok=False)
         assert 'invalid choice' in error and (profile / 'configure.json').read_bytes() == before
         checks.append('unknown_transport_rejected_before_configuration_changes')
 
-        cli('config', 'set', '/peers/1/transport', 'tcp', '--string')
-        assert cli('config', 'show')['peers'][1]['transport'] == 'tcp'
-        checks.append('existing_peer_can_switch_to_tcp')
         cli('config', 'set', '/peers/1/transport', 'udp', '--string')
+        assert cli('config', 'show')['peers'][1]['transport'] == 'udp'
+        checks.append('existing_peer_can_switch_to_udp')
+        cli('config', 'set', '/peers/1/transport', 'tcp', '--string')
         assert 'transport' not in cli('config', 'show')['peers'][1]
-        checks.append('switching_back_to_udp_restores_minimal_configuration')
+        checks.append('switching_back_to_tcp_restores_minimal_configuration')
 
         before = (profile / 'configure.json').read_bytes()
         cli('config', 'set', '/peers/0/transport', 'quic', '--string', ok=False)
         assert (profile / 'configure.json').read_bytes() == before
         checks.append('native_validation_rejects_unknown_transport_without_overwriting_file')
+
+        outbound = folder / 'outbound-only'
+        cli('init', '--no-listen', '--network', '10.92.0.1/24', directory=outbound)
+        assert cli('config', 'show', directory=outbound)['listen'] == {'enabled': False}
+        checks.append('no_listen_init_omits_local_bind_address')
     print(json.dumps({'passed': len(checks), 'checks': checks}, indent=2))
 
 

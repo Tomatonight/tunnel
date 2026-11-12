@@ -215,9 +215,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             for expr in entry.get('rule', {}).get('expr', [])), rules
         mark('outer_udp_blocked_only_inside_node_a_namespace')
         for node in 'ABC':
-            configurations[node] = {'device_backend': 'tun', 'address': endpoints[node], 'networks': [address4[node] + '/24', address6[node] + '/64'],
-                'peers': [{'address': endpoints[peer], 'shared_key': 'tcp-netns-test-key',
-                    'networks': ['10.97.0.0/24', 'fd00:97::/64']} for peer in graph[node]]}
+            configurations[node] = {'device_backend': 'tun', 'listen': {'bind_address': endpoints[node]}, 'networks': [address4[node] + '/24', address6[node] + '/64'],
+                'peers': [{'endpoint': endpoints[peer], 'shared_key': 'tcp-netns-test-key',
+                    'networks': ['10.97.0.0/24', 'fd00:97::/64'], 'transport': 'udp'} for peer in graph[node]]}
             if node == 'A':
                 configurations[node]['peers'][0]['transport'] = 'tcp'
             save(node)

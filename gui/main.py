@@ -6,9 +6,26 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
+
+
+def prepare_linux_accessibility_environment():
+    """Avoid a root AT-SPI socket leaking into the desktop WebView."""
+    if not sys.platform.startswith("linux"):
+        return
+    stale_bus = os.environ.get("AT_SPI_BUS_ADDRESS", "")
+    if os.geteuid() == 0 or "/root/" in stale_bus:
+        os.environ["NO_AT_BRIDGE"] = "1"
+        os.environ.pop("AT_SPI_BUS_ADDRESS", None)
+        os.environ.pop("AT_SPI_BUS", None)
+
+
+# Set this before importing the controller or any optional GUI dependency.
+prepare_linux_accessibility_environment()
 
 from controller import Controller, MAX_CONFIG
 
@@ -25,19 +42,21 @@ def bundled_html(token):
     html = html.replace('<meta charset="utf-8">', '<meta charset="utf-8">' +
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ' +
         'script-src \'unsafe-inline\' \'unsafe-eval\'; style-src \'unsafe-inline\'; ' +
-        'img-src data:; connect-src \'none\'; object-src \'none\'; base-uri \'none\'; ' +
+        'img-src data:; connect-src ws://127.0.0.1:* ws://localhost:* wss://127.0.0.1:* wss://localhost:*; object-src \'none\'; base-uri \'none\'; ' +
         'form-action \'none\'; frame-src \'none\';">')
     css = (assets / "app.css").read_text(encoding="utf-8")
     script = (assets / "app.js").read_text(encoding="utf-8")
+    novnc = (assets / "novnc.js").read_text(encoding="utf-8")
     # No local web server or management port. Only this initial page gets the token.
     html = html.replace('<link rel="stylesheet" href="app.css">', '<style>' + css + '</style>')
     html = html.replace('<link rel="stylesheet" href="remote.css">', '<style>' + (assets / "remote.css").read_text(encoding="utf-8") + '</style>')
     html = html.replace('<script src="app.js" defer></script>',
+                        '<script id="tunnel-novnc">' + novnc + '</script>' +
                         '<script>window.__TUNNEL_UI_TOKEN__=' + json.dumps(token) + ';</script>' +
                         '<script defer>' + script + '</script>')
     # Inline scripts must run after the DOM exists (defer has no effect on inline JS).
     if '<script defer>' in html:
-        begin = html.index('<script>window.__TUNNEL_UI_TOKEN__=')
+        begin = html.index('<script id="tunnel-novnc">')
         end = html.index('</script>', html.index('<script defer>', begin)) + len('</script>')
         scripts = html[begin:end]
         html = html[:begin] + html[end:]
@@ -81,9 +100,13 @@ def copy_text(text):
                 kernel.GlobalFree(handle)
             user.CloseClipboard()
     else:
+        # Prefer the clipboard helper that matches the active display.  A
+        # machine may have wl-copy installed while running an X11 session;
+        # invoking it there fails because WAYLAND_DISPLAY is unavailable.
         command = (["pbcopy"] if sys.platform == "darwin" else
-                   ["wl-copy"] if shutil.which("wl-copy") else
-                   ["xclip", "-selection", "clipboard"] if shutil.which("xclip") else None)
+                   ["wl-copy"] if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy") else
+                   ["xclip", "-selection", "clipboard"] if shutil.which("xclip") else
+                   ["xsel", "--clipboard", "--input"] if shutil.which("xsel") else None)
         if command is None:
             raise ValueError("系统缺少剪贴板工具，可直接选择日志文字复制。")
         subprocess.run(command, input=text.encode("utf-8"), check=True, timeout=5)
@@ -93,6 +116,28 @@ class Bridge:
     def __init__(self, controller, token):
         self._controller = controller
         self._token = token
+        self._window = None
+        self._fullscreen = False
+
+    def bind_window(self, window):
+        """Attach the native window after pywebview creates it.
+
+        Some Linux WebKit builds do not expose the browser Fullscreen API. The
+        small native fallback keeps the remote desktop usable on those builds
+        without adding another service or IPC endpoint.
+        """
+        self._window = window
+
+    def _set_fullscreen(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("全屏状态无效。")
+        window = self._window
+        if window is None:
+            raise ValueError("窗口尚未就绪。")
+        if self._fullscreen != enabled:
+            window.toggle_fullscreen()
+            self._fullscreen = enabled
+        return {"enabled": self._fullscreen}
 
     def request(self, message):
         try:
@@ -105,6 +150,9 @@ class Bridge:
             if envelope.get("action") == "copy_text":
                 copy_text(envelope.get("payload", {}).get("text"))
                 return json.dumps({"ok": True, "data": {"message": "已复制"}})
+            if envelope.get("action") == "window_fullscreen":
+                return json.dumps({"ok": True, "data": self._set_fullscreen(
+                    envelope.get("payload", {}).get("enabled"))}, ensure_ascii=False)
             return self._controller.request(message)
         except Exception as error:
             return json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)
@@ -116,21 +164,73 @@ def main():
         return daemon_main(sys.argv[sys.argv.index("--remote-daemon") + 1:])
     parser = argparse.ArgumentParser(description="Tunnel desktop UI")
     parser.add_argument("--binary", type=Path, help="Path to the native tunnel executable")
-    parser.add_argument("--config-dir", type=Path, help="Private configuration directory")
+    parser.add_argument("--config-dir", type=Path, help="Configuration directory (default: the application/project directory)")
+    parser.add_argument("--basic-mode", action="store_true", help="Use the direct tunnel-only host")
     parser.add_argument("--check-ui", type=Path, metavar="REPORT", help="Check the WebView/bridge/core without connecting, write JSON and exit")
     args = parser.parse_args()
+    if args.basic_mode:
+        os.environ["TUNNEL_BASIC_MODE"] = "1"
+    prepare_linux_accessibility_environment()
     frozen = getattr(sys, "frozen", False)
     base = Path(sys.executable).parent if frozen else Path(__file__).resolve().parent.parent
     native = "tunnel.exe" if os.name == "nt" else "tunnel"
     default_binary = base / native if frozen else base / "build" / native
     example = resources() / "default.json" if frozen else base / "config" / "default.json"
-    controller = Controller(args.binary or default_binary, args.config_dir, example)
-    token = secrets.token_hex(32)
-    import webview
-    window = webview.create_window("Tunnel", html=bundled_html(token), js_api=Bridge(controller, token),
-                                   width=1180, height=820, min_size=(760, 580), background_color="#101820",
-                                   text_select=True, hidden=bool(args.check_ui))
-    window.events.closing += controller.close
+    # Keep the child host tied to the lifetime of this process.  Previously a
+    # failure while importing pywebview or creating the native window happened
+    # before the old ``try/finally`` block, leaving the tunnel core behind.
+    # The same guard also handles SIGTERM/SIGHUP and makes the closing event
+    # idempotent, so a window close followed by the finalizer cannot race two
+    # stop requests.
+    controller = None
+    window = None
+    close_lock = threading.Lock()
+    closed = False
+    shutdown_requested = False
+    previous_handlers = {}
+
+    def close_controller():
+        nonlocal closed
+        with close_lock:
+            if closed or controller is None:
+                return True
+            # A GUI close callback can run while the host is still writing its
+            # final status.  Give the host one bounded retry rather than
+            # leaving a daemon behind when the first stop observes that race.
+            for attempt in range(2):
+                try:
+                    result = controller.close()
+                except Exception:
+                    result = False
+                if result is not False:
+                    closed = True
+                    return result
+                if attempt == 0:
+                    time.sleep(0.15)
+            return False
+
+    def request_shutdown(_signum, _frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+        current = window
+        if current is not None:
+            try:
+                # pywebview marshals destroy() to its GUI backend.  Do not call
+                # controller.close from the signal handler itself; the final
+                # block below owns cleanup and is safe even during startup.
+                current.destroy()
+            except Exception:
+                pass
+
+    if os.name != "nt":
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, request_shutdown)
+            except (OSError, RuntimeError, ValueError):
+                # Embedders may invoke main() away from the interpreter's main
+                # thread.  Cleanup in finally still works in that case.
+                pass
     result = {}
 
     def check_ui():
@@ -152,12 +252,15 @@ def main():
                     const config = await request('load_config');
                     await request('validate_config', {text: config.text});
                     if (!document.getElementById('connection-button')) throw new Error('UI DOM missing');
-                    if (!document.getElementById('remote-screen') || !document.getElementById('remote-access')) throw new Error('Remote desktop UI missing');
+                    if (!document.getElementById('remote-screen') || !document.getElementById('remote-shared-key') || !document.getElementById('remote-target-shared-key')) throw new Error('Remote desktop UI missing');
+                    if (!window.TunnelNoVNC || typeof window.TunnelNoVNC.RFB !== 'function') throw new Error('noVNC client missing');
                     if (getComputedStyle(document.querySelector('.remote-content')).paddingLeft !== '24px') throw new Error('Remote stylesheet missing');
                     const documentConfig = JSON.parse(config.text); documentConfig.remote_desktop = {enabled: false};
                     const normalized = await request('normalize_config', {text: JSON.stringify(documentConfig)});
                     if (JSON.parse(normalized.text).remote_desktop.enabled !== false) throw new Error('Remote config normalization failed');
-                    return {ok: true, platform: state.platform, checks: ['webview', 'bridge', 'config_load', 'core_validation', 'remote_desktop_dom', 'remote_css', 'remote_config_normalization']};
+                    const checks = ['webview', 'bridge', 'config_load', 'core_validation', 'remote_desktop_dom', 'novnc_bundle', 'remote_css', 'remote_config_normalization'];
+                    if (state.basic_mode === true) checks.splice(2, 0, 'basic_host');
+                    return {ok: true, platform: state.platform, checks};
                 } catch (error) { return {ok: false, error: String(error)}; }
             })()""", callback=completed)
             if not received.wait(25):
@@ -167,11 +270,29 @@ def main():
         finally:
             args.check_ui.parent.mkdir(parents=True, exist_ok=True)
             args.check_ui.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            window.destroy()
+            if window is not None:
+                window.destroy()
     try:
+        controller = Controller(args.binary or default_binary, args.config_dir or base, example,
+                                gui_owned=not bool(args.check_ui))
+        token = secrets.token_hex(32)
+        import webview
+        bridge = Bridge(controller, token)
+        window = webview.create_window("Tunnel", html=bundled_html(token), js_api=bridge,
+                                       width=1180, height=820, min_size=(760, 580), background_color="#101820",
+                                       text_select=True, hidden=bool(args.check_ui))
+        bridge.bind_window(window)
+        window.events.closing += close_controller
+        if shutdown_requested:
+            window.destroy()
         webview.start(check_ui if args.check_ui else None, http_server=False, private_mode=True)
     finally:
-        controller.close()
+        close_controller()
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, RuntimeError, ValueError):
+                pass
     return 0 if not args.check_ui or result.get("ok") else 1
 
 

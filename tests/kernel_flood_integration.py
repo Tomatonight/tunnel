@@ -94,9 +94,9 @@ def main():
             ns(node, 'ip', 'link', 'set', right, 'name', 'eth0')
             ns(node, 'ip', '-6', 'address', 'add', f'fd00:192::{index}/64', 'dev', 'eth0', 'nodad')
             ns(node, 'ip', 'link', 'set', 'eth0', 'up')
-            cfg = {'address': f'[fd00:192::{index}]:45299',
+            cfg = {'listen': {'bind_address': f'[fd00:192::{index}]:45299'},
                 'networks': [f'10.99.0.{index}/24', f'fd00:99::{index}/64'],
-                'peers': [{'address': f'[fd00:192::{peer + 1}]:45299', 'shared_key': 'kernel-flood-test-key',
+                'peers': [{'endpoint': f'[fd00:192::{peer + 1}]:45299', 'shared_key': 'kernel-flood-test-key',
                     'networks': ['10.99.0.0/24', 'fd00:99::/64']}
                     for peer in range(3) if peer + 1 != index]}
             cfg['device_backend'] = 'kernel' if node in 'AB' else 'tun'

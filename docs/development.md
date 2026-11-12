@@ -17,8 +17,8 @@ Linux 默认选择自定义内核设备；Windows/macOS/Android 默认 TUN。Lin
 - 可选公网地址分配服务、多 IPv4/IPv6 地址池、单一共享 PSK（兼容逐节点授权）、持久绑定与离线回收。
 - TUN 动态增删地址、签名分配凭据和按网段启停；服务失联保留其他网段的 peer 与会话。
 - 内网前缀通告/撤回、单主出口与备用出口、可选系统 SNAT、导入系统路由和请求回包检查。
-- 独立远程桌面后台、长期设备身份、名单/全部同网节点两种模式、预授权无人值守和实时撤销。
-- Windows/Linux X11/macOS 采集输入后端，共享界面的配对、JPEG画面、键鼠、只读权限及后台重连。
+- 独立远程桌面后台、长期设备身份、远控预共享密钥和实时撤销。
+- Windows/Linux X11/macOS 采集输入后端，共享界面的 PSK 直连、JPEG画面、键鼠、只读权限及后台重连。
 
 Linux/WSL 和 Windows 已完成真实 TUN 互通测试。macOS 后端及 Android 工程尚未在目标平台编译/实机验证。
 不包含 NAT 穿透、默认路由接管、动态 PMTU、隧道分片重组、MSS 改写、TAP 或组播成员订阅。
@@ -26,9 +26,10 @@ Linux/WSL 和 Windows 已完成真实 TUN 互通测试。macOS 后端及 Android
 SNAT 可选；关闭时内网仍需正确的回程路径。平台能力边界和访问范围见下文及设计design.md。
 
 远程桌面运行在已登录用户的图形会话；Windows屏幕采集和Linux X11端到端键鼠已有实际验证。
-macOS后端已编写但未实机测试；Wayland、登录/安全桌面及Android远控不在当前支持范围。
+GUI 启动器支持 Linux Wayland，但 Wayland 屏幕采集/输入、登录/安全桌面及 Android 远控不在当前支持范围。macOS后端已编写但未实机测试。
 通过GUI或remote_desktop.daemon启动屏幕服务；直接运行C++核心只创建隧道，不创建屏幕组件。
-配对、全员模式、长期身份和后台运行说明见 remote_desktop/README.md；示例见 examples/desktop-host.json、desktop-client.json。
+远程桌面使用被控端配置的非空预共享密钥认证，不再支持批准、设备配对或无人值守模式。
+长期身份和后台运行说明见 remote_desktop/README.md；示例见 examples/desktop-host.json、desktop-client.json。
 
 Linux 可选内核设备
 
@@ -50,7 +51,7 @@ Linux 继承外部 TUN fd 时须同时传入 --device-backend tun，例如 --dev
 使用与正在运行的内核匹配的开发头文件和构建目录，执行项目脚本：
     bash build.sh
     bash run-gui.sh
-build.sh 仅保留模块及构建信息，临时编译文件自动清理；--headers 可指定另一套配置完整的目标内核头文件。run-gui.sh 缺少模块产物时会先调用 build.sh，再以系统权限加载模块。
+build.sh 负责构建核心和模块，临时编译文件自动清理；可通过 `TUNNEL_KERNEL_HEADERS=/path/to/kernel/build bash build.sh` 指定另一套配置完整的目标头文件。运行 GUI 前先执行 build.sh；run-gui.sh 只负责检查环境、设置核心能力并启动 GUI。
 modprobe 会加载所需的 UDP tunnel 等依赖。详细 ABI、容量和生命周期说明见 kernel/README.md。
 模块不是跨版本通用二进制；换内核后重新构建。Secure Boot/模块签名遵循宿主系统设置。
 
@@ -84,24 +85,24 @@ UDP 数据通过内核 net_device 发送、接收、加解密和转发；TCP 数
 
 TCP数据封装
 
-在对应peer对象加入"transport":"tcp"；省略或"udp"保持默认UDP数据封装。
+省略 `transport` 默认使用 TCP 数据封装；需要 UDP 时在对应 peer 对象加入 `"transport":"udp"`。
 两端都需要支持TCP封装；任一端选择TCP即通过已认证Hello协商使用TCP，不自动回退UDP。
 复用同一个address上的TLS连接，不增加数据端口。UDP受阻时可使用TCP；TCP模式不以UDP探测决定存活。
 TCP控制及所选数据通道仍每5秒保活，任一20秒没有合法活动/探测回应即撤回邻接。
-界面的peer卡片可选数据封装，状态显示协商结果；CLI可用peer add <地址> --transport tcp，
-或config set /peers/0/transport tcp --string。运行时修改只重连受影响邻接。
+界面的peer卡片可选数据封装，状态显示协商结果；CLI可用peer add <地址> --transport udp，
+或config set /peers/0/transport udp --string。运行时修改只重连受影响邻接。
 单播端到端加密、广播组播RPF、ECMP与网络权限不变；TCP/UDP混合中转沿用当前MTU限制。
 TCP批量输出限流为有界整包丢弃，保留控制消息空间。内层TCP叠加TCP可能增加队头阻塞及重传开销。
-配对示例：examples/tcp-node-a.json和examples/tcp-node-b.json，先替换公布地址与共享密钥。
+配对示例：examples/tcp-node-a.json和examples/tcp-node-b.json，先替换绑定地址与共享密钥。
 
 图形界面
 
-Windows 可运行 build/gui/TunnelUI/TunnelUI.exe，保留同目录的 _internal、核心及所有 DLL。
-首次载入示例配置；连接前应填写本机公布地址、虚拟 IP/前缀、对端地址和双方一致的 PSK。
+Windows 可运行 build/gui/TunnelUI-live/TunnelUI.exe，保留同目录的 _internal、核心及所有 DLL。
+首次载入示例配置；连接前应填写本机绑定地址、虚拟 IP/前缀、对端地址和双方一致的 PSK。
 配置默认使用表单；本机虚拟地址只写一次，多网络通过勾选限制对端权限，PSK 支持生成/显示/复制。
 入站、绑定、MTU 和 JSON 编辑放在高级设置；JSON 修改须先应用到表单。
 界面还包含配置导入/校验/保存、连接/断开、邻居状态、ECMP 路径、计数和日志筛选/复制。
-桌面开启远控且无人值守时关窗保留后台，重新打开相同配置目录可接回；其他情况关窗停止核心。
+桌面关闭窗口时停止远控后台和核心。
 显式断开始终停止后台和核心。Android 关闭 Activity 后 VPN 继续运行，使用断开按钮停止。
 用户态核心仍为单线程；TUN 后端的 UDP socket 属于用户态，kernel 后端的唯一 UDP socket 属于内核。
 内核数据处理可发生在不同 CPU 上，会话状态由实例锁保护；界面和日志读取属于独立宿主线程/进程。
@@ -150,7 +151,7 @@ Windows 真正运行还需管理员权限以及位于 tunnel.exe 同目录的官
 --generate-key 使用 OpenSSL 生成 32 字节随机 PSK，输出为 64 位十六进制文本。
 peer 双方使用同一把 peer 密钥；共享分配模式下服务及其客户端使用同一把服务密钥。
 --export-client 从服务配置导出接入配置（含 PSK），不启动服务或修改租约。
-共享模式可填写任意合法节点公布地址；旧 clients 模式只能导出已授权节点。
+共享模式可填写任意合法节点绑定地址；逐节点授权模式只能导出已授权节点。
 Linux 创建接口需要 root/CAP_NET_ADMIN 和 iproute2；Windows 需要管理员权限。
 Linux/Windows 的接口名必须尚未存在；默认自动选名，不接管已有网卡。
 macOS 自动创建可用 utun，不接受 --tun-name；需要能配置系统接口及路由的权限。
@@ -167,31 +168,29 @@ config_apply通过私有候选文件path传递完整配置（最多1 MiB），�
 状态 JSON 每 250 毫秒更新，含 peers、routes、end_sessions 和丢包/转发计数，不输出 PSK 或私钥。
 监控文件写入失败会记录并在下次更新重试，不中断网络转发。
 
-config/default.json 使用演示公网地址和占位 PSK，实际互通须改成两端真实可达的固定公布地址，
+config/default.json 使用演示公网地址和占位 PSK，实际互通须改成两端真实可达的固定绑定地址，
 并在双方 peers 中相互配置一致的 shared_key，以及本机各自的虚拟地址和共同网络。
-顶层 address 是本机身份；peers[].address 是对端地址；顶层 networks 是本机虚拟 IP/前缀。
+`listen.bind_address` 是本机唯一的传输地址；`peers[].endpoint` 是对端地址；顶层 `networks` 是本机虚拟 IP/前缀。
 例如 "networks": ["10.1.0.2/24"] 同时表示本机地址 10.1.0.2 和网段 10.1.0.0/24。
 单网络时 peer 可省略 networks；多网络必须显式选择已有子网，如 "networks": ["10.1.0.0/24"]。
 增加第二个网络不会自动扩大已有 peer 权限；空 peer 网络列表、未知子网或带主机位的引用报错。
-peers 可省略为 []；listen 可省略，默认开启入站并使用全部本机网络作为监听上限。
-listen.bind_address 可省略，默认同地址族通配地址及公布端口；TCP 和 UDP 都必须能到达。
-公布地址与绑定地址分开支持静态端口映射，但不动态学习 NAT 后地址或端口。
-关闭 listen.enabled 仍可主动拨号；入站仅接受配置过的 peer，且网络须同时获 peers 与 listen.networks 授权。
+peers 可省略为 []；完全省略 listen 表示只主动连接其他节点（outbound-only）。显式写出 listen 时，enabled 省略才默认开启入站，此时必须提供 bind_address。关闭 listen.enabled 后 bind_address 和 shared_key 会被忽略并从规范化配置移除，核心自动使用通配绑定和实际出站端点。
+listen.bind_address 同时用于绑定和对端连接；TCP 和 UDP 都必须能到达。
+关闭 listen.enabled 仍可主动拨号；没有 listen.shared_key 时，入站仅接受配置过的 peer，且网络须同时获 peers 与 listen.networks 授权。配置 listen.shared_key 后，持钥节点可免登记接入，入站网络仍受 listen.networks 限制。
 listen.networks 是被动接收连接的额外限制，不影响主动连接；[] 表示不允许任何监听网络。
-旧配置继续可读；导入时统一转换并保留原有权限，读取不改磁盘，保存或连接时写入新格式。
-不允许混用新顶层 address/networks 和旧 listen.address/重复的网络对象。
+配置只接受当前 schema；顶层 endpoint/address、peer address 和 listen.address 都会被拒绝。
 每个进程只选择 IPv4 或 IPv6 外层；虚拟网络可同时包含 IPv4 和 IPv6。
 
 tun_mtu 默认 1280，transport_mtu 默认 1500，后者由部署者保证覆盖所有可能路径。
 单播封装增加 166 字节，再加 IPv4/UDP 28 字节或 IPv6/UDP 48 字节。
 因此外层 MTU 1500 时 TUN 最大分别为 1306 / 1286；有内层 IPv6 时 TUN MTU 至少 1280。
 超长包丢弃并计数。不会自动探测或修改 MTU。
-配置最多 1 MiB、16 层 JSON、256 个 peer、合计 64 个不同虚拟网络；旧 thread_num 只接受 1。
+配置最多 1 MiB、16 层 JSON、256 个 peer、合计 64 个不同虚拟网络；线程数由核心固定管理。
 
 内网路由分发
 
 发布者示例 examples/subnet-gateway.json；访问端示例 examples/subnet-client.json。
-将示例公布地址、peer PSK 和网段改为实际值；发布者必须能经物理接口访问所发布的内网。
+将示例绑定地址、peer PSK 和网段改为实际值；发布者必须能经物理接口访问所发布的内网。
 发布者顶层添加：
     "advertise_routes": [
       { "tunnel": "10.1.0.0/16", "prefix": "10.2.0.0/16", "snat": true }
@@ -229,8 +228,8 @@ Linux/macOS 分别使用路由 src/-ifa 指定来源。macOS/Android 本轮仍�
 可选 IP 分配
 
 服务示例：examples/address-server.json；客户端示例：examples/address-client.json。
-先把示例的公布地址改成真实可达地址，生成一把随机 PSK，填入 server 的 shared_key 和各客户端对应 shared_key。
-服务端示例只需公布地址、shared_key 和地址池，不用逐个登记客户端。
+先把示例的绑定地址改成真实可达地址，生成一把随机 PSK，填入 server 的 shared_key 和各客户端对应 shared_key。
+服务端示例只需绑定地址、shared_key 和地址池，不用逐个登记客户端。
     ./build-wsl/tunnel examples/address-server.json --check
     ./build-wsl/tunnel examples/address-server.json --status-file server-status.json
     ./build-wsl/tunnel examples/address-server.json --export-client 192.0.2.1:65535
@@ -239,13 +238,13 @@ Linux/macOS 分别使用路由 src/-ifa 指定来源。macOS/Android 本轮仍�
 本机静态网络不能与内嵌服务的地址池重叠；需要加入自己的池时，也通过 address_clients 向自己申请。
 address_server.networks 是独立子网地址池；shared_key 模式下所有认证通过的节点可申请其中任意池。
 address_clients.networks 决定本次申请哪些池，不会自动申请服务端后来新增的池。
-旧 clients 模式仍可配置每节点身份、独立 PSK 和允许申请的子网，保留逐节点撤销与网络授权。
-shared_key 和 clients 必须二选一；旧配置导入、校验和保存保持原模式，不会自动扩大授权。
-address_clients 配置服务地址、对应 PSK 与申请的网段；本机静态 networks 可省略或保留其他不重叠网段。
+clients 模式可配置每节点身份、独立 PSK 和允许申请的子网，保留逐节点撤销与网络授权。
+shared_key 和 clients 必须二选一，保存不会自动扩大授权。
+address_clients 配置服务地址、对应 PSK 与申请的网段；本机静态 networks 可省略或保留其他不重叠网段。地址分配客户端还必须配置具体单播 `listen.bind_address`，因为该地址用于分配服务的稳定节点身份。
 peer 授权列表可引用静态及受管网段；未取得有效分配时不会给该网段配置占位 IP 或发布路径。
 服务分配权限和原有 peer 通信权限分开管理；导入接入配置后仍需配置要连接的 peer。
 共享接入密钥只能证明属于持钥组，不能阻止成员冒充其他节点或服务端；适用于互信节点。
-不能只撤销一个成员而继续使用同一共享密钥。更强身份管理可选择旧逐节点模式，或后续采用证书/注册机制。
+不能只撤销一个成员而继续使用同一共享密钥。更强身份管理可选择逐节点授权模式，或后续采用证书/注册机制。
 每个受管网段的两端必须使用同一服务，并验证对方的有效分配凭据；不能与手动模式混接该网段。
 
 reclaim_after 为确认离线后的回收等待秒数，默认86400；回收还须等待最后签发的60秒凭据失效加5秒保护期。
@@ -274,7 +273,7 @@ device.cpp：平台设备创建、地址/MTU 配置和 IP 包读写。
 subnet_platform.cpp：导入路由、各平台内核 NAT、转发设置与正常退出恢复。
 return_flows.cpp：内网请求和允许回包对应关系，不进行 NAT 地址/端口转换。
 gui/：共享页面、桌面宿主和 Windows 打包脚本；见 gui/README.md。
-remote_desktop/：独立后台、OpenSSL TLS协议、持久设备授权、核心成员证明桥与原生采集/输入后端。
+remote_desktop/：独立后台、OpenSSL TLS协议、远控预共享密钥、核心成员证明桥与原生采集/输入后端。
 android/：VpnService、WebView 界面宿主、JNI 与 Gradle 工程；见 android/README.md。
 
 默认运行参数
@@ -321,9 +320,9 @@ runtime 和 managed_node 覆盖端到端数据及受管资格生命周期。
     python tests/remote_bridge_test.py
     python tests/remote_platform_test.py
     python tests/remote_stdio_test.py --binary build/tunnel.exe
-CTest新增remote_control，覆盖可信成员签验、新旧配置、RPC边界、撤回与换钥。
+CTest新增remote_control，覆盖可信成员签验、当前配置 schema、RPC边界、撤回与换钥。
 CTest的tcp_data覆盖TCP二进制帧、UDP不可达、混合中转、保活失效、按peer热切换、错误PSK及有界队列；
-tcp_legacy用真实TLS模拟旧版Hello，验证默认UDP兼容、TCP不支持时拒绝，以及未协商二进制帧拒绝。
+同时验证未经协商的二进制帧会被拒绝。
 TCP真实设备测试：
     sudo python3 tests/tcp_network_integration.py --binary build-wsl-reload/tunnel --work build-wsl-reload/tcp-network-tests
     python tests/windows_wsl_integration.py --transport tcp --windows-binary build-reload/tunnel.exe --linux-binary build-wsl-reload/tunnel --work build/windows-wsl-tcp-tests
@@ -332,7 +331,7 @@ TCP真实设备测试：
 runtime测试使用真实TLS和合成桌面，不操作当前用户键鼠；race测试用受控线程屏障验证撤权/关闭竞态。
 Linux实际TUN、Xvfb桌面与键鼠整链路（root，iproute2/Xvfb/libXtst及Python依赖）：
     sudo python tests/remote_network_integration.py --binary build-wsl/tunnel
-脚本创建独立命名空间和独立X11桌面，验证截图像素、键鼠、配对、名单/全员模式、只读、撤销、重启及断网释放。
+脚本创建独立命名空间和独立X11桌面，验证截图像素、键鼠、PSK 直连与错误密钥拒绝、只读、撤销、重启及断网释放。
 原始结果在build-wsl/remote-network-tests/results.json；退出清理专属进程、命名空间和接口。
 
 脚本创建独立网络命名空间、veth 和四个进程；只修改测试命名空间中的路由、防火墙与 TUN。
@@ -347,7 +346,7 @@ Linux实际TUN、Xvfb桌面与键鼠整链路（root，iproute2/Xvfb/libXtst及P
 独立命名空间中启动分配服务与三个节点，验证双栈地址生效、部分池耗尽、受管多跳、服务重启保址、
 仅阻断一个节点的服务连接后20秒撤销、其他网络保持、自动恢复间接路径，以及凭据到期后回收再分配。
 结果和日志：build-wsl/address-network-tests/；脚本退出清理测试进程、设备和命名空间。
-默认使用共享密钥且不登记 clients；--auth-mode per-node 用于旧逐节点模式回归。
+默认使用共享密钥且不登记 clients；--auth-mode per-node 用于逐节点授权回归。
 节点同时提供分配服务并向自身申请地址（root）：
     sudo python3 tests/embedded_allocation_test.py --binary build-wsl/tunnel
 报告：build-wsl/embedded-allocation-result.json；检查单事件循环、真实双栈地址与持久绑定。

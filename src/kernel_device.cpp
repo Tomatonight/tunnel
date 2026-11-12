@@ -1,4 +1,5 @@
 #include "kernel_device.h"
+#include "linux_capability.h"
 #include "subnet_platform.h"
 #include <algorithm>
 #include <cstring>
@@ -177,6 +178,7 @@ void uninstall_kernel_module(bool& loaded_by_process) {
 void run_ip(const std::vector<std::string>& arguments) {
     std::vector<char*> argv; for (const auto& a : arguments) argv.push_back(const_cast<char*>(a.c_str()));
     argv.push_back(nullptr);
+    tunnel_linux::prepare_net_admin_child();
     const auto pid = fork();
     if (pid < 0) throw std::runtime_error("cannot start iproute2");
     if (!pid) { execvp(argv[0], argv.data()); _exit(127); }
@@ -218,7 +220,16 @@ public:
         try {
             tnlk_create create{}; create.abi = TNLK_ABI; create.mtu = config.tun_mtu;
             create.transport_mtu = config.transport_mtu; create.lease_ms = 20000;
-            create.local = native_endpoint(config.listen.address); create.bind = native_endpoint(config.listen.bind_address);
+            // The kernel ABI keeps a concrete local identity separate from
+            // the socket bind address. Outbound-only/wildcard configurations
+            // have no advertised physical address, so use a loopback identity
+            // while letting the UDP socket bind to the requested wildcard.
+            auto local = config.listen.bind_address;
+            if (!local.ip.unicast()) {
+                local.ip.bytes.fill(0);
+                local.ip.bytes[local.ip.family == 4 ? 3 : 15] = 1;
+            }
+            create.local = native_endpoint(local); create.bind = native_endpoint(config.listen.bind_address);
             std::memcpy(create.name, name.c_str(), name.size());
             checked(TNLK_CREATE, &create, "create");
             name_.assign(create.name, strnlen(create.name, sizeof(create.name)));
@@ -290,7 +301,7 @@ public:
         for (const auto& n : state.networks) { tnlk_net v{}; v.network = native_network(n.tunnel); v.local_ip = native_ip(n.tunnel_ip); const auto index = nets.size(); nets[n.tunnel] = index; append(bytes, v); }
         for (const auto& p : state.peers) {
             if (!p.crypto) throw std::runtime_error("kernel peer has no traffic keys");
-            tnlk_peer v{}; v.endpoint = native_endpoint(p.endpoint); native_keys(v.keys, *p.crypto); v.tcp = p.tcp; v.ready = p.ready;
+            tnlk_peer v{}; v.endpoint = native_endpoint(p.endpoint); v.source = native_endpoint(p.source); native_keys(v.keys, *p.crypto); v.tcp = p.tcp; v.ready = p.ready;
             for (const auto& n : p.networks) { const auto i = nets.at(n); v.networks[i / 8] |= 1U << (i % 8); }
             const auto index = peers.size(); peers[p.endpoint] = index; append(bytes, v); OPENSSL_cleanse(&v.keys, sizeof(v.keys));
         }

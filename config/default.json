@@ -1,9 +1,12 @@
 {
-  "endpoint": "100.0.0.1:65535",
+  "listen": {
+    "enabled": true,
+    "bind_address": "100.0.0.1"
+  },
   "networks": ["10.1.0.2/24"],
   "peers": [
     {
-      "endpoint": "100.0.0.2:65535",
+      "endpoint": "100.0.0.2",
       "shared_key": "use-a-random-high-entropy-secret"
     }
   ]

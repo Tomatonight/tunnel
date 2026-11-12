@@ -12,9 +12,12 @@ public:
     TcpStream(const TcpStream&) = delete;
     TcpStream& operator=(const TcpStream&) = delete;
     void connect(const Endpoint&);
+    Endpoint local_address() const;
+    Endpoint peer_address() const;
     bool send(const Bytes&);
     std::size_t pending_bytes() const;
-    void close();
+    void close(const std::string& reason = {});
+    const std::string& close_reason() const { return close_reason_; }
 private:
     static void read_callback(bufferevent*, void*);
     static void event_callback(bufferevent*, short, void*);
@@ -22,7 +25,9 @@ private:
     Receive receive_;
     Notify connected_, closed_;
     UdpTransport::Protector protect_;
+    Endpoint peer_address_;
     bool closed_flag_ = false;
+    std::string close_reason_;
 };
 class TcpListener {
 public:

@@ -10,6 +10,7 @@ namespace {
 using Json = wire::Json;
 unsigned checks = 0;
 std::function<void()> diagnostics;
+std::vector<Endpoint> known_endpoints;
 #define CHECK(x) do { ++checks; if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (0)
 struct Record {
     Configure config;
@@ -56,9 +57,12 @@ NodeOptions options(const std::shared_ptr<Factory>& factory) {
     return result;
 }
 void until(EventLoop& loop, const std::function<bool()>& condition, unsigned timeout = 12000) {
-    auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { if (condition()) loop.breakLoop(); }, true);
-    auto deadline = loop.addTimer(std::chrono::milliseconds(timeout), [&](evutil_socket_t, short) { loop.breakLoop(); });
-    loop.run(); if (!condition() && diagnostics) diagnostics(); CHECK(condition());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+    while (!condition() && std::chrono::steady_clock::now() < deadline) {
+        auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { loop.breakLoop(); });
+        loop.run();
+    }
+    if (!condition() && diagnostics) diagnostics(); CHECK(condition());
 }
 std::vector<Endpoint> ports(EventLoop& loop, unsigned count) {
     std::vector<std::unique_ptr<UdpTransport>> udp;
@@ -74,17 +78,26 @@ std::vector<Endpoint> ports(EventLoop& loop, unsigned count) {
         } catch (const std::exception&) {}
     }
     if (result.size() != count) throw std::runtime_error("cannot reserve reload test ports");
+    known_endpoints = result;
     return result;
 }
 Configure config(unsigned index, const std::vector<Endpoint>& endpoints, const std::vector<unsigned>& peers) {
-    Json value{{"address", endpoints[index].str()}, {"listen", {{"bind_address", endpoints[index].str()}}},
+    Json value{{"listen", {{"bind_address", endpoints[index].str()}}},
         {"networks", {"10.91.0." + std::to_string(index + 1) + "/24", "10.92.0." + std::to_string(index + 1) + "/24"}}, {"peers", Json::array()}};
-    for (const auto peer : peers) value["peers"].push_back({{"address", endpoints[peer].str()}, {"shared_key", "reload-test-key"}, {"networks", {"10.91.0.0/24", "10.92.0.0/24"}}});
+    for (const auto peer : peers) value["peers"].push_back({{"endpoint", endpoints[peer].str()}, {"shared_key", "reload-test-key"}, {"networks", {"10.91.0.0/24", "10.92.0.0/24"}}});
     return parse_config(value.dump());
 }
 Json route(Node& node, const Endpoint& endpoint, const std::string& network = "10.91.0.0/24") {
     const auto state = node.status();
-    for (const auto& entry : state.at("routes")) if (entry.at("node") == endpoint.str() && entry.at("network") == network) return entry;
+    std::string identity;
+    for (const auto& peer : state.at("peers")) if (peer.at("endpoint") == endpoint.str()) {
+        const auto& identities = peer.at("identities");
+        if (identities.is_object() && identities.count(network)) identity = identities.at(network).get<std::string>();
+    }
+    if (identity.empty()) for (std::size_t i = 0; i < known_endpoints.size(); ++i) if (known_endpoints[i] == endpoint) {
+        identity = network == "10.92.0.0/24" ? "10.92.0." + std::to_string(i + 1) : "10.91.0." + std::to_string(i + 1); break;
+    }
+    for (const auto& entry : state.at("routes")) if (entry.at("node") == identity && entry.at("network") == network) return entry;
     return nullptr;
 }
 bool settled(Node& node) {
@@ -95,7 +108,13 @@ bool settled(Node& node) {
 }
 std::string session(Node& node, const Endpoint& remote) {
     const auto state = node.status();
-    for (const auto& entry : state.at("end_sessions")) if (entry.at("node") == remote.str() && entry.at("network") == "10.91.0.0/24" && entry.at("ready") == true)
+    std::string identity;
+    for (const auto& peer : state.at("peers")) if (peer.at("endpoint") == remote.str()) {
+        const auto& identities = peer.at("identities");
+        if (identities.is_object() && identities.count("10.91.0.0/24")) identity = identities.at("10.91.0.0/24").get<std::string>();
+    }
+    if (identity.empty()) for (std::size_t i = 0; i < known_endpoints.size(); ++i) if (known_endpoints[i] == remote) { identity = "10.91.0." + std::to_string(i + 1); break; }
+    for (const auto& entry : state.at("end_sessions")) if (entry.at("node") == identity && entry.at("network") == "10.91.0.0/24" && entry.at("ready") == true)
         return entry.at("id").get<std::string>();
     return {};
 }
@@ -137,11 +156,12 @@ void peer_and_rebuild_tests() {
     auto result = a.apply_config(next);
     CHECK(result.at("ok") == true && result.at("mode") == "noop" && result.at("interrupted") == false);
     CHECK(a.public_key() == identity && factories[0]->calls == 1 && session(a, endpoints[2]) == c_session);
-    next = a.configuration(); next.remote_desktop.enabled = true; next.remote_desktop.unattended = true;
-    next.remote_desktop.networks.push_back(Network::parse("10.91.0.0/24")); next.remote_desktop.access = "all_tunnel_nodes";
+    next = a.configuration(); next.remote_desktop.enabled = true;
+    next.remote_desktop.shared_key = "reload-remote-key";
+    next.remote_desktop.networks.push_back(Network::parse("10.91.0.0/24"));
     result = a.apply_config(next);
     CHECK(result.at("ok") == true && result.at("mode") == "remote" && result.at("interrupted") == false);
-    CHECK(a.configuration().remote_desktop.access == "all_tunnel_nodes" && factories[0]->current() == initial_device);
+    CHECK(a.configuration().remote_desktop.shared_key == "reload-remote-key" && factories[0]->current() == initial_device);
     CHECK(counter(a, "peer_down") == initial_down && session(a, endpoints[1]) == b_session && session(a, endpoints[2]) == c_session);
     next = a.configuration(); PeerConfig added; added.address = endpoints[3]; added.shared_key = "reload-test-key"; added.networks = next.networks; next.peers.push_back(added);
     result = a.apply_config(next);
@@ -226,10 +246,10 @@ void peer_and_rebuild_tests() {
     until(loop, [&] { return settled(a) && settled(*nodes[3]) && !route(*nodes[3], endpoints[0]).is_null() && route(*nodes[3], endpoints[0]).at("ip") == "10.91.0.9"; });
     send(loop, factories[0], factories[3], 9, 4, 106);
     for (auto& node : nodes) node->stop();
-    next = a.configuration(); next.listen.address = next.listen.bind_address = endpoints[4];
+    next = a.configuration(); next.listen.bind_address = endpoints[4];
     result = a.apply_config(next);
     CHECK(result.at("ok") == true && result.at("mode") == "rebuild" && result.at("running") == false && result.at("interrupted") == false);
-    a.start(); CHECK(a.status().at("node") == endpoints[4].str() && a.public_key() == identity); a.stop();
+    a.start(); CHECK(a.status().at("endpoint") == endpoints[4].str() && a.public_key() == identity); a.stop();
     diagnostics = {}; nodes.clear(); for (const auto& factory : factories) CHECK(factory->live == 0 && factory->peak == 1);
 }
 void boundaries(const std::string& state_path) {

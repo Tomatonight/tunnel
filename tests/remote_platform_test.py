@@ -72,17 +72,32 @@ class BackendTest(unittest.TestCase):
     def test_jpeg_real_encoding_and_size(self):
         from PIL import Image
         result = self.backend.capture()
-        self.assertEqual((result["width"], result["height"]), (1600, 900))
+        self.assertEqual((result["width"], result["height"]), (1920, 1080))
         self.assertEqual((result["source_width"], result["source_height"]), (1920, 1080))
         with Image.open(io.BytesIO(result["jpeg"])) as image:
             self.assertEqual(image.format, "JPEG")
-            self.assertEqual(image.size, (1600, 900))
+            self.assertEqual(image.size, (1920, 1080))
             self.assertLess(sum(abs(a - b) for a, b in zip(image.getpixel((800, 450)), (153, 102, 51))), 8)
 
     def test_capture_does_not_upscale(self):
         self.capture.monitors[1].update(width=128, height=96)
         result = self.backend.capture()
         self.assertEqual((result["width"], result["height"]), (128, 96))
+
+    def test_capture_bounds_follow_remote_viewport(self):
+        self.backend.set_capture_bounds(800, 600)
+        result = self.backend.capture()
+        # The source is 16:9; the capture is letterboxed into the exact RFB
+        # viewport so a resize acknowledgement does not repeat forever.
+        self.assertEqual((result["width"], result["height"]), (800, 600))
+
+    def test_capture_bounds_do_not_clamp_to_smaller_source(self):
+        self.backend.set_capture_bounds(3000, 2000)
+        result = self.backend.capture()
+        # The framebuffer must acknowledge the browser's requested size even
+        # when the source display is smaller; the source itself is not scaled
+        # up and remains centered in the letterbox.
+        self.assertEqual((result["width"], result["height"]), (3000, 2000))
 
     def test_mouse_coordinates_respect_monitor_offset(self):
         self.backend.input({"type": "mouse_move", "x": 0, "y": 0})
@@ -221,7 +236,7 @@ def live_capture():
         with Image.open(io.BytesIO(result["jpeg"])) as image:
             image.load()
             assert image.width == result["width"] and image.height == result["height"]
-            assert image.width <= 1600 and image.height <= 900
+            assert image.width <= 1920 and image.height <= 1080
         print("LIVE CAPTURE PASS", {k: v for k, v in result.items() if k != "jpeg"}, "jpeg_bytes=", len(result["jpeg"]))
     finally:
         backend.close()

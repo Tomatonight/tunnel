@@ -26,14 +26,18 @@ public:
     ~UdpTransport();
     UdpTransport(const UdpTransport&) = delete;
     UdpTransport& operator=(const UdpTransport&) = delete;
-    bool send(const Endpoint& destination, Packet packet);
+    // When source.ip is unicast, force that local address for this datagram.
+    // This matters for a wildcard listener: a server must reply from the
+    // local address on which the client established the control connection,
+    // instead of letting the route lookup choose another interface.
+    bool send(const Endpoint& destination, Packet packet, const Endpoint& source = {});
     Endpoint local_address() const;
     const Counters& counters() const { return counters_; }
     std::size_t pending() const { return queue_.size(); }
 private:
     enum class SendResult { Sent, Blocked, Dropped };
-    struct Pending { Endpoint destination; Packet packet; };
-    SendResult send_one(const Endpoint&, const Packet&);
+    struct Pending { Endpoint destination; Endpoint source; Packet packet; };
+    SendResult send_one(const Endpoint&, const Endpoint&, const Packet&);
     void read_ready();
     void write_ready();
     evutil_socket_t socket_ = static_cast<evutil_socket_t>(EVUTIL_INVALID_SOCKET);

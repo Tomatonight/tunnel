@@ -16,7 +16,7 @@ class ManagerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / 'config.json'
-        self.old = {'address': '127.0.0.1:51001', 'networks': ['10.77.0.1/24'], 'peers': []}
+        self.old = {'listen': {'bind_address': '127.0.0.1:51001'}, 'networks': ['10.77.0.1/24'], 'peers': []}
         self.path.write_text(json.dumps(self.old))
         self.original = self.path.read_bytes()
         self.active = copy.deepcopy(self.old)
@@ -81,17 +81,17 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), self.original)
 
     def test_pointer_and_redaction_do_not_change_other_fields(self):
-        doc = {'peers': [{'address': '127.0.0.1:51200', 'shared_key': 'secret'}], 'a/b': {'~c': 1}}
+        doc = {'peers': [{'endpoint': '127.0.0.1:51200', 'shared_key': 'secret'}], 'a/b': {'~c': 1}}
         pointer(doc, '/a~1b/~0c', 2)
-        pointer(doc, '/peers/0/address', '127.0.0.1:51201')
+        pointer(doc, '/peers/0/endpoint', '127.0.0.1:51201')
         self.assertEqual(doc['a/b']['~c'], 2)
         self.assertEqual(redact(doc)['peers'][0]['shared_key'], '<hidden>')
         self.assertEqual(doc['peers'][0]['shared_key'], 'secret')
         with self.assertRaises(ValueError):
-            pointer(doc, '/peers/-1/address', 'bad')
+            pointer(doc, '/peers/-1/endpoint', 'bad')
 
     def test_new_network_keeps_existing_peer_permissions(self):
-        doc = dict(self.old, peers=[{'address': '127.0.0.1:51200', 'shared_key': 'secret'}])
+        doc = dict(self.old, peers=[{'endpoint': '127.0.0.1:51200', 'shared_key': 'secret'}])
         freeze_network_permissions(doc)
         doc['networks'].append('10.78.0.1/24')
         self.assertEqual(doc['peers'][0]['networks'], ['10.77.0.0/24'])

@@ -18,7 +18,7 @@ import time
 def main():
     root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--transport', choices=('udp', 'tcp'), default='udp')
+    parser.add_argument('--transport', choices=('udp', 'tcp'), default='tcp')
     parser.add_argument('--windows-binary', type=Path, default=root / 'build' / 'tunnel.exe')
     parser.add_argument('--linux-binary', help='WSL absolute path, or a Windows/repository path converted with wslpath')
     parser.add_argument('--work', type=Path, default=root / 'build' / 'windows-wsl-tests')
@@ -60,8 +60,8 @@ def main():
     for i in range(2):
         networks = [{'tunnel': str(ipv4_prefix), 'tunnel_ip': v4[i]}, {'tunnel': 'fd53:42:7ef0::/64', 'tunnel_ip': v6[i]}]
         config = {'device_backend': 'tun', 'tun_mtu': 1280, 'transport_mtu': 1500,
-            'listen': {'enabled': i == 1, 'address': f'{public[i]}:{port}', 'bind_address': f'{public[i]}:{port}', 'networks': networks},
-            'peers': [{'address': f'{public[1-i]}:{port}', 'shared_key': 'windows-linux-integration-only-key', 'networks': networks}]}
+            'listen': {'enabled': i == 1, 'bind_address': f'{public[i]}:{port}', 'networks': networks},
+            'peers': [{'endpoint': f'{public[1-i]}:{port}', 'shared_key': 'windows-linux-integration-only-key', 'networks': networks}]}
         if args.transport != 'udp':
             config['peers'][0]['transport'] = args.transport
         (work / f'{i}.json').write_text(json.dumps(config))

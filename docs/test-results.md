@@ -66,7 +66,7 @@ Linux 可选三层 net_device 后端
 
   Windows 最新核心编译通过，基础检查 592 项通过；Linux 最新构建及 CTest 11/11 通过。
   Linux 套件包含 core、config、runtime、address_service、managed_node、device_addresses、
-  subnet、remote_control、reload、tcp_data、tcp_legacy；总耗时约 60.5 秒。
+  subnet、remote_control、reload、tcp_data；总耗时约 60.5 秒。
   日志：build-wsl-reload/Testing/Temporary/LastTest.log。
   前端 78 项通过，页面错误 0；报告 build/gui-tests/kernel-frontend/results.json。
   本轮未重新打包 Windows GUI；源码 GUI/CLI 请显式选择 build-reload/tunnel.exe 或 build-wsl-reload/tunnel。
@@ -103,17 +103,17 @@ Build the module with python3 tools/build_kernel.py; usage is documented in [dev
 验证结果（2026-10-16）
 
 TCP数据封装（本轮）
-  新增peers[].transport="tcp"，默认UDP；任一端选择TCP且双方支持时使用TCP，旧版不支持时明确拒绝。
+  新增peers[].transport="udp"，默认TCP；任一端选择TCP且双方配置支持时使用TCP，未协商的传输模式会明确拒绝。
   数据使用现有认证TLS连接内的二进制帧，保持链路AEAD、单播端到端加密、ECMP和RPF。
   支持TCP/UDP混合中转，TCP模式不依赖UDP可达；运行时切换仅重连对应邻接。
 
-  Windows、WSL重新构建通过；原有9项CTest通过，新增tcp_data与tcp_legacy亦均通过。
-  tcp_data两端各1404项断言（含1200次突发注入检查）；tcp_legacy两端各23项。
-  验证二进制拆包/粘包及控制帧交错、大小限制、旧版Hello及UDP密钥上下文兼容、禁止未经协商的数据帧，
+  Windows、WSL重新构建通过；原有9项CTest通过，新增tcp_data亦通过。
+  tcp_data覆盖两端二进制帧、混合传输、热切换和1200次突发注入检查。
+  验证二进制拆包/粘包及控制帧交错、大小限制、UDP密钥上下文、禁止未经协商的数据帧，
   单侧TCP选择、UDP不可达、IPv4/IPv6外层、真实TCP代理黑洞超时撤回、内层双栈/广播组播、混合中转，
   Peer热切换、无关邻接/E2E保留、错误PSK拒绝，以及发送队列有界丢包后全部已接收帧送达。
   突发测试独立使用生产20秒失效窗口；Windows接受356包、丢弃844包，连接/E2E保持并可继续发送。
-  旧版模拟节点补充首次探测丢失重试；短时断链用例与生产5秒保活的数据/E2E用例分开，
+  首次探测丢失重试；短时断链用例与生产5秒保活的数据/E2E用例分开，
   避免把测试专用500毫秒E2E重试阈值在慢调度下的重复握手当作传输失败；生产保活仍为5秒/20秒。
   复现：ctest --test-dir <构建目录> -R tcp_ --output-on-failure。
   最新专项日志：build-reload/Testing/Temporary/LastTest.log、build-wsl-reload/Testing/Temporary/LastTest.log。
@@ -172,21 +172,21 @@ TCP数据封装（本轮）
 
 以下保留2026-10-15及之前的验证记录。
 
-远程桌面与访问授权（本轮）
-  已实现remote_desktop配置、独立后台、长期设备身份、仅授权设备/同虚拟网络全部成员两种策略，
-  配对与无人值守、只读/键鼠权限、即时撤销、后台接回、单屏JPEG与原生输入。
-  普通连接仍需当前有效网络成员证明；全员模式仅跳过逐台授权，不关闭认证或TLS。
+远程桌面与访问认证（历史记录）
+  以下旧版记录包含已移除的设备授权、批准和全员模式，仅供历史版本追溯；当前实现统一使用远控 PSK。
+  当前 remote_desktop 配置要求 enabled 时提供非空 shared_key，控制端提交相同密钥后直接建立会话，
+  仍校验有效网络成员证明和 TLS，不产生批准队列或远控设备名单。
   同时只允许一个控制端。策略收紧、名单撤销、断网和关闭均释放已按下的键/鼠标按钮。
 
-  Windows/WSL最终C++构建通过，CTest各8/8；新remote_control各124项。
+  Windows/WSL最终C++构建通过，CTest各8/8；旧版 remote_control 记录中的检查数为历史值。
   涵盖严格配置/规范化、真实三节点多跳IPv4/IPv6成员签验、篡改/跨网/错IP拒绝、撤回与换钥。
   真实stdin/stdout RPC：Windows15项、WSL16项通过，覆盖分片/批量/过长帧/中文ID/未知方法/STOP及无密钥日志。
   报告：build/remote-core-test-results.json；CTest详情见各构建目录Testing/Temporary/LastTest.log。
   修复测试中双向同时拨号的连接替换窗口：待双方路径和连接仲裁完成后再验证稳定状态，未放宽生产认证/超时。
 
-  Python真实TLS运行时测试：Windows16/16、WSL16/16。
-  涵盖首次固定设备公钥、全员免逐台批准、名单配对、仅查看的服务端输入拒绝、旧证明失效、成员撤回、
-  策略切换、设备撤销、重复控制端拒绝、持久身份/损坏库拒绝、backend清理异常及有界帧/IPC认证。
+  当前 Python 运行时 PSK 回归：Windows 本地 remote_runtime + remote_vnc 共 38/38。
+  覆盖无批准直连、错误/缺失密钥拒绝、仅查看的服务端输入拒绝、成员撤回、重复控制端拒绝、
+  持久身份/损坏库拒绝、backend 清理异常、RFB 网关握手及有界帧/IPC 认证；以下旧版记录仅供追溯。
   日志：build/remote-runtime-final.log、build-wsl/remote-runtime-final.log。
   竞态回归：Windows11/11、WSL11/11；已接收的poll在撤权后不再执行输入，过期批准不能恢复授权，
   重复批准不能提升权限，线程启动与关闭交错可清理，慢TLS握手/取消连接可结束，无poll也定期重验成员资格。
@@ -195,11 +195,11 @@ TCP数据封装（本轮）
   验证32 pending上限与恢复、核心EOF唤醒等待者，未发生读写锁互锁。
   报告：build/remote-bridge-tests.json、build-wsl/remote-bridge-tests.json。
 
-  平台后端：Windows16项通过并真实只读截图1920×1080→JPEG1600×900；没有向用户正在使用的桌面注入测试按键。
+  平台后端：Windows16项通过并真实只读截图1920×1080→JPEG1920×1080；没有向用户正在使用的桌面注入测试按键。
   Linux15项通过、1项Windows专用检查跳过；另在独立Xvfb实测截图颜色、指针、鼠标键、键盘与释放。
   真实整链路7/7：两个私有netns内运行真实TUN/core/daemon/TLS，被控端使用隔离Xvfb图形会话。
-  验证仅监听虚拟IP、真实JPEG像素和键鼠跨隧道、断线释放、名单批准与只读、记住授权与撤销、
-  全员→名单即时取消控制、后台重启保留身份和授权、物理链路失联后释放输入。
+  旧版整链路记录验证仅监听虚拟IP、真实JPEG像素和键鼠跨隧道、断线释放、批准/名单策略、
+  后台重启和物理链路失联；当前整链路应使用远控 PSK 配置。
   报告：build-wsl/remote-network-tests/results.json；remaining_test_namespaces=[]，cleanup_errors=[]。
 
   前端浏览器68/68，Windows宿主/live18/18；真实Windows窗口7/7，含新远控DOM/样式与桥接检查。
@@ -209,9 +209,9 @@ TCP数据封装（本轮）
   报告：build/gui-tests/remote-frontend/results.json、remote-host-final.log、remote-window.json、
   remote-window-live.json、remote-package-background.json、remote-package.json。
 
-  平台限制：本版只支持已登录桌面。Linux仅X11，Wayland明确拒绝；登录界面、UAC安全桌面、FileVault未实现。
+  平台限制：本版只支持已登录桌面。远程桌面屏幕采集/输入在 Linux 仍要求 X11；GUI 启动器可在 Wayland 下运行。登录界面、UAC安全桌面、FileVault未实现。
   macOS采集/输入源码已编写，未在Mac上安装、编译打包或实机验证；Android本版不提供远控端。
-  无自动安装开机系统服务；无人值守后台在当前用户图形会话中运行，重启后需重新启动或自行配置登录启动。
+  无自动安装开机系统服务；远控后台随GUI关闭，重启后需重新启动。
   单屏JPEG最多8fps，未声称硬件视频编码、高帧率、音频/剪贴板/文件传输或多屏支持。
   示例examples/desktop-host.json、desktop-client.json已通过核心配置校验；运行方式见remote_desktop/README.md。
 
@@ -260,7 +260,7 @@ A published prefix must use one physical egress; reconnect after the host egress
 
 共享接入密钥简化
   address_server 现可仅配置 address、shared_key 和 networks，无需手写 clients 名单。
-  任意持有对应服务密钥的节点可申请配置池；旧逐节点授权模式保持兼容，两种配置严格互斥。
+  任意持有对应服务密钥的节点可申请配置池；逐节点授权模式仍可使用，两种配置严格互斥。
   服务端仍自动保存租约，原有回收、断线撤销、peer 授权和数据加密流程保持适用。
 
   Windows、WSL 构建均通过，无编译告警；CTest 两端各6/6通过。
@@ -317,7 +317,7 @@ A published prefix must use one physical egress; reconnect after the host egress
   报告：build-wsl/address-network-tests/results.json。
   内嵌服务额外4项通过：同一节点/事件循环提供服务并向自身认证申请、真实双栈TUN、绑定落盘。
   报告：build-wsl/embedded-allocation-result.json。
-  既有真实四节点回归 14/14：新旧配置、双栈多网、ECMP/RPF、MTU、密文、TCP/UDP失效和重启换钥。
+  既有真实四节点回归 14/14：当前配置 schema、双栈多网、ECMP/RPF、MTU、密文、TCP/UDP失效和重启换钥。
   报告：build-wsl/address-regression-network-tests/results.json。
   所有真实网络测试使用独立命名空间，结束后已确认无残留。
 
@@ -347,21 +347,21 @@ A published prefix must use one physical egress; reconnect after the host egress
 
 简化配置与表单界面更新
   Windows 和 WSL 均重新构建通过，CTest 各 3/3；核心检查各 492 项（本次新增 116 项）。
-  覆盖新旧格式、默认值、IPv4/IPv6 主机 CIDR、重叠拒绝、多网显式授权、监听限制，
+  覆盖当前格式、默认值、IPv4/IPv6 主机 CIDR、重叠拒绝、多网显式授权、监听限制，
   以及序列化后再次解析，保持 PSK、绑定地址、禁用监听和空监听网络列表。
   原始日志：build/Testing/Temporary/LastTest.log、build-wsl/Testing/Temporary/LastTest.log。
-  桌面宿主 Windows、WSL 各 9/9：包括旧配置只读加载、显式保存转换、无效配置保留、
+  桌面宿主 Windows、WSL 各 9/9：包括当前配置加载、显式保存、无效配置保留、
   增网不扩大授权、OpenSSL 密钥生成，以及真实 TUN 启停、重连和关闭清理。
   共享前端浏览器回归 33/33，无 JS 页面异常；桌面与 390px 手机布局检查通过。
   覆盖表单编辑、生成/显示/复制密钥、网络授权、高级设置、JSON 显式应用和导入、
   未保存编辑保护、实时状态与日志，以及桌面和 Android 桥接契约。
   报告及截图：build/gui-tests/frontend/；浏览器截图使用测试夹具，不表示真实节点状态。
-  Windows WebView2 与 WSLg WebKit 实际窗口各 7/7，通过旧配置加载不改文件、表单修改
+  Windows WebView2 与 WSLg WebKit 实际窗口各 7/7，通过当前配置加载不改文件、表单修改
   虚拟 IP、保存新格式、按钮启动真实 TUN、实时状态显示与停止清理。
   报告：build/gui-tests/simple-config-window.json、build-wsl/gui-tests/simple-config-window.json。
   Windows 目录包已重新生成，成品 TunnelUI.exe 的窗口/桥接/配置加载/核心校验 4/4 通过，
   退出码 0。报告：build/gui-tests/simple-config-packaged-window.json。
-  四节点新旧格式混用测试 14/14：A/C 使用新格式，B/D 使用旧格式；双栈、多网、ECMP、
+  四节点当前格式测试 14/14：双栈、多网、ECMP、
   RPF、MTU、TCP/UDP 20 秒失效回撤、最后路径撤回及重启换钥均通过。
   报告：build-wsl/simple-config-network-tests/results.json。
   Android 同步接入核心配置规范化和 OpenSSL 密钥生成，通过 Java/XML/JNI/桥接静态检查。

@@ -3,6 +3,7 @@
 #include <openssl/x509.h>
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -10,6 +11,18 @@ void require_tls(bool ok, const char* what) {
     if (!ok) { ERR_clear_error(); throw std::runtime_error(std::string("TLS: ") + what); }
 }
 constexpr std::size_t tls_limit = 256 * 1024;
+std::string openssl_error_detail() {
+    std::ostringstream out;
+    bool first = true;
+    for (unsigned long code = ERR_get_error(); code != 0; code = ERR_get_error()) {
+        const char* reason = ERR_reason_error_string(code);
+        if (!first) out << "; ";
+        first = false;
+        out << "openssl error 0x" << std::hex << code << std::dec;
+        if (reason && *reason) out << " (" << reason << ")";
+    }
+    return out.str();
+}
 }
 void TlsChannel::initialize(bool client) {
     client_ = client;
@@ -102,6 +115,11 @@ int TlsChannel::verify_certificate(int, X509_STORE_CTX* store) {
     auto* self = static_cast<TlsChannel*>(SSL_get_app_data(ssl));
     if (!self || X509_STORE_CTX_get_error_depth(store) != 0) return 0;
     auto* cert = X509_STORE_CTX_get_current_cert(store);
+    // The certificate is intentionally self-signed and trusted by exact raw
+    // key below, but its validity interval still must be enforced explicitly
+    // because the custom callback overrides the default trust-store result.
+    if (!cert || X509_cmp_current_time(X509_get0_notBefore(cert)) >= 0 ||
+        X509_cmp_current_time(X509_get0_notAfter(cert)) <= 0) return 0;
     auto* key = X509_get0_pubkey(cert);
     PublicKey raw{}; std::size_t size = raw.size();
     // Trust is the exact Ed25519 key from authenticated routing, not a CA chain.
@@ -112,8 +130,13 @@ int TlsChannel::verify_certificate(int, X509_STORE_CTX* store) {
 void TlsChannel::check(int result) {
     if (result > 0) return;
     const auto error = SSL_get_error(ssl_, result);
-    if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
-        require_tls(false, error == SSL_ERROR_ZERO_RETURN ? "peer closed" : "authentication or record failure");
+    if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) return;
+    if (error == SSL_ERROR_ZERO_RETURN) throw std::runtime_error("TLS: peer closed");
+    std::ostringstream detail;
+    detail << "TLS operation failed (SSL error " << error << ")";
+    const auto reason = openssl_error_detail();
+    if (!reason.empty()) detail << ": " << reason;
+    throw std::runtime_error(detail.str());
 }
 bool TlsChannel::ready() const { return SSL_is_init_finished(ssl_) != 0; }
 void TlsChannel::feed(const Bytes& bytes) {

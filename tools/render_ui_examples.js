@@ -44,10 +44,10 @@ function browserExecutable() {
 
 async function main() {
   const config = JSON.parse(fs.readFileSync(path.join(root, "examples", "ui-node-a.json"), "utf8"));
-  assert.equal(config.address, "192.0.2.10:65535");
+  assert.equal(config.listen.bind_address, "192.0.2.10:65535");
   assert.deepEqual(config.networks, ["10.1.0.1/24"]);
   assert.equal(config.peers.length, 1);
-  assert.equal(config.peers[0].address, "192.0.2.20:65535");
+  assert.equal(config.peers[0].endpoint, "192.0.2.20:65535");
   assert.equal(config.peers[0].shared_key, "replace-with-the-same-random-secret-on-both-nodes");
   let playwright;
   try { playwright = require(options.playwright ? path.resolve(options.playwright) : "playwright"); }
@@ -84,7 +84,7 @@ async function main() {
       window.__documentationCalls = [];
       const logs = [
         ["10:14:48", "info", "示例会话：以下状态和日志使用虚构数据，不连接真实节点。"],
-        ["10:14:48", "info", "已载入节点配置，本机公布地址 192.0.2.10:65535"],
+        ["10:14:48", "info", "已载入节点配置，本机绑定地址 192.0.2.10:65535"],
         ["10:14:48", "info", "虚拟网卡 Tunnel 已就绪，本机 IP 10.1.0.1/24，MTU 1280"],
         ["10:14:49", "info", "正在连接节点 192.0.2.20:65535"],
         ["10:14:49", "info", "TCP 控制通道认证通过：192.0.2.20:65535"],
@@ -100,9 +100,9 @@ async function main() {
         phase: "running", platform: "Windows",
         config_path: "examples/ui-node-a.json", error: "",
         status: {
-          running: true, node: config.address, device: "Tunnel", pending_connections: 0,
-          peers: [{ node: config.peers[0].address, state: 3, transport: "udp" }],
-          routes: [{ network: "10.1.0.0/24", node: config.peers[0].address, next_hops: [config.peers[0].address] }],
+          running: true, endpoint: config.listen.bind_address, device: "Tunnel", pending_connections: 0,
+          peers: [{ endpoint: config.peers[0].endpoint, state: 3, transport: "tcp" }],
+          routes: [{ network: "10.1.0.0/24", node: config.peers[0].endpoint, next_hops: [config.peers[0].endpoint] }],
           end_sessions: [{ ready: true }],
           counters: { unicast_forwarded: 12480, udp_data_sent: 13206, udp_data_received: 12844, e2e_established: 1 }
         },

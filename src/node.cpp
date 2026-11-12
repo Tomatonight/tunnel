@@ -49,7 +49,16 @@ std::string remote_string(const Json& value, const char* name, std::size_t maxim
 struct Node::Impl {
     struct Link {
         Endpoint remote;
+        // Endpoint used in the authenticated control identity.  For an
+        // outbound-only node this may be a wildcard/ephemeral endpoint while
+        // remote is replaced by the concrete endpoint advertised in hello.
+        Endpoint identity_remote;
         bool client = false, dead = false, hello_sent = false, hello_received = false;
+        bool wildcard = false;
+        PeerConfig wildcard_config;
+        // Last control-plane phase, used to make failed peer attempts
+        // diagnosable even when authentication never reaches `active`.
+        std::string stage = "tcp";
         std::unique_ptr<TlsChannel> tls;
         std::unique_ptr<TcpStream> tcp;
         std::unique_ptr<Peer> peer;
@@ -63,7 +72,7 @@ struct Node::Impl {
         std::map<Network, IpAddress> networks;
         std::map<RouteKey, std::string> advertised;
         std::uint64_t generation = 0, probe = 0;
-        Time created = Clock::now(), heartbeat{}, proof_checked{};
+        Time created = Clock::now(), hello_received_at{}, heartbeat{}, proof_checked{};
     };
     struct EndSession {
         PublicKey key{};
@@ -143,6 +152,35 @@ struct Node::Impl {
         for (const auto& p : config.peers) if (p.address == e) return &p;
         return nullptr;
     }
+    Endpoint identity_local() const {
+        auto result = config.listen.bind_address;
+        // Outbound-only nodes normally use the stable default source port so
+        // peer identities remain deterministic. If that port was occupied,
+        // start() may have selected an ephemeral UDP port; use the actual
+        // socket port for the TLS identity in that case.
+        if (!config.listen.enabled && udp && result.port == 65535) {
+            const auto actual = udp->local_address();
+            if (actual.port) result.port = actual.port;
+        }
+        // Endpoint::parse intentionally rejects port zero for user-facing
+        // addresses. Use a stable sentinel only inside the PSK identity when
+        // an outbound-only node has an ephemeral local socket.
+        if (!result.port) result.port = 1;
+        return result;
+    }
+    const PeerConfig* effective_peer(const Link& l) const {
+        if (const auto* configured = peer_config(l.remote)) return configured;
+        return l.wildcard ? &l.wildcard_config : nullptr;
+    }
+    void prepare_wildcard_peer(Link& l) {
+        if (l.client || config.listen.shared_key.empty()) return;
+        if (peer_config(l.remote)) return;
+        l.wildcard = true;
+        l.wildcard_config.address = l.remote;
+        l.wildcard_config.shared_key = config.listen.shared_key;
+        l.wildcard_config.networks = config.listen.networks;
+        l.wildcard_config.transport = "tcp";
+    }
     NodeId local_node(const Network& network) const {
         const auto active = tunnels.find(network);
         if (active != tunnels.end()) return active->second.config().tunnel_ip;
@@ -159,7 +197,7 @@ struct Node::Impl {
             for (const auto& item : active) {
                 const auto& l = *item.second;
                 if (l.dead || !l.crypto || !l.peer) continue;
-                KernelPeer p; p.endpoint = l.remote; p.crypto = l.crypto.get(); p.tcp = l.data_tcp;
+                KernelPeer p; p.endpoint = l.remote; p.source = advertised_endpoint(l); p.crypto = l.crypto.get(); p.tcp = l.data_tcp;
                 p.ready = l.peer->state() == PEER_STATE_ESTABLISHED;
                 for (const auto& n : l.networks) if (tunnels.count(n.first)) p.networks.push_back(n.first);
                 state.peers.push_back(std::move(p));
@@ -201,7 +239,7 @@ struct Node::Impl {
             // or an authorization set which the control plane has withdrawn.
             try { k->shutdown(); } catch (...) {}
             device_failed = true;
-            for (auto& l : links) fail(*l);
+            for (auto& l : links) fail(*l, "kernel data plane stopped");
             try { device->start({}); } catch (...) {}
         }
     }
@@ -220,7 +258,8 @@ struct Node::Impl {
             // is legal; never remove bytes from an accepted TLS stream frame.
             if (l.tcp->pending_bytes() + event.packet.size() + 64 > 512 * 1024) { ++counters["tcp_data_send_drop"]; return; }
             try { l.tls->write(wire::data_frame(event.packet)); flush(l); }
-            catch (...) { fail(l); }
+            catch (const std::exception& e) { fail(l, std::string("kernel data send failed: ") + e.what()); }
+            catch (...) { fail(l, "kernel data send failed: unknown error"); }
         } else if (event.kind == KernelEvent::ProbeAck) {
             if (found == active.end()) return;
             auto& l = *found->second;
@@ -238,7 +277,7 @@ struct Node::Impl {
                 const NodeId node = event.peer.ip;
                 end_sessions.erase({event.network, node});
                 if (tunnels.count(event.network)) ensure_end({event.network, node});
-            } else if (found != active.end()) fail(*found->second);
+            } else if (found != active.end()) fail(*found->second, "kernel requested session rekey");
         }
     }
     void log(const std::string& text) {
@@ -255,7 +294,7 @@ struct Node::Impl {
         return false;
     }
     bool protects_transport(const Network& prefix) const {
-        if (prefix.contains(config.listen.address.ip)) return true;
+        if (prefix.contains(config.listen.bind_address.ip)) return true;
         for (const auto& peer : config.peers) if (prefix.contains(peer.address.ip)) return true;
         for (const auto& client : config.address_clients) if (prefix.contains(client.address.ip)) return true;
         if (config.address_server.enabled && prefix.contains(config.address_server.address.ip)) return true;
@@ -340,7 +379,7 @@ struct Node::Impl {
             device_failed = true; active_exports.clear(); subnet_gateways.clear(); return_flows.clear();
             for (const auto& n : config.networks) { routes.set_local_prefixes(n.tunnel, {}); routes.set_local_address(n.tunnel, nullptr); }
             tunnels.clear(); grants.clear();
-            for (auto& link : links) fail(*link);
+            for (auto& link : links) fail(*link, "virtual interface unavailable");
             device->start({}); invalidate_end(); dirty = true;
         }
     }
@@ -348,11 +387,35 @@ struct Node::Impl {
         const auto bar = id.find('|'); if (bar == std::string::npos) return {};
         const auto initiator = Endpoint::parse(id.substr(0, bar));
         const auto responder = Endpoint::parse(id.substr(bar + 1));
+        const auto local = identity_local();
         Endpoint remote;
-        if (initiator == config.listen.address) remote = responder;
-        else if (responder == config.listen.address) remote = initiator;
+        if (initiator == local) remote = responder;
+        else if (responder == local ||
+                 (config.listen.bind_address.ip.unspecified() &&
+                  responder.ip.family == local.ip.family && responder.port == local.port)) remote = initiator;
         else return {};
         const auto* p = peer_config(remote); return p ? p->shared_key : std::string();
+    }
+    Endpoint advertised_endpoint(const Link& l) const {
+        Endpoint result = config.listen.bind_address;
+        if (!config.listen.enabled && udp && result.port == 65535) {
+            const auto actual = udp->local_address();
+            if (actual.port) result.port = actual.port;
+        }
+        if (!result.ip.unicast()) {
+            const auto tcp = l.tcp->local_address();
+            if (tcp.ip.unicast()) result.ip = tcp.ip;
+        }
+        // The endpoint carried in hello is also the UDP data destination.
+        // An outbound-only node binds an ephemeral UDP source port, so do not
+        // accidentally advertise the unrelated TCP control port.
+        if (!config.listen.enabled && udp) {
+            const auto actual = udp->local_address();
+            if (actual.port) result.port = actual.port;
+        } else if (!result.port) {
+            result.port = l.tcp->local_address().port;
+        }
+        return result;
     }
     void start() {
         if (started) return;
@@ -360,11 +423,33 @@ struct Node::Impl {
         if (!device && !config.networks.empty()) throw std::runtime_error("virtual interface unavailable; reload required");
         if (device) {
         sync_subnets(true);
-        if (device_failed) throw std::runtime_error("virtual interface unavailable during subnet configuration");
+        if (device_failed) {
+            const auto detail = export_error.empty() ? std::string() : ": " + export_error;
+            throw std::runtime_error("virtual interface unavailable during subnet configuration" + detail);
+        }
         if (auto* k = kernel()) k->on_event([this](KernelEvent event) { kernel_event(std::move(event)); });
-        else udp.reset(new UdpTransport(loop, config.listen.bind_address,
-            config.transport_mtu - protocol::outer_overhead(config.listen.address.ip.family),
-            [this](const Endpoint& from, Bytes packet) { receive_udp(from, packet); }, options.protect));
+        else {
+            try {
+                udp.reset(new UdpTransport(loop, config.listen.bind_address,
+                    config.transport_mtu - protocol::outer_overhead(config.listen.bind_address.ip.family),
+                    [this](const Endpoint& from, Bytes packet) { receive_udp(from, packet); }, options.protect));
+            } catch (const std::exception&) {
+                // An outbound-only node does not need a fixed local UDP port.
+                // Fall back to an ephemeral source port when the default is
+                // occupied by a stale process or another application. Keep
+                // the configured endpoint unchanged; identity_local() and
+                // advertised_endpoint() read the actual socket port.
+                if (config.listen.enabled || config.listen.bind_address.port != 65535)
+                    throw;
+                auto ephemeral = config.listen.bind_address;
+                ephemeral.port = 0;
+                udp.reset(new UdpTransport(loop, ephemeral,
+                    config.transport_mtu - protocol::outer_overhead(ephemeral.ip.family),
+                    [this](const Endpoint& from, Bytes packet) { receive_udp(from, packet); }, options.protect));
+                log("outbound-only UDP port 65535 is busy; using ephemeral source port " +
+                    std::to_string(udp->local_address().port));
+            }
+        }
         if (config.listen.enabled) listener.reset(new TcpListener(loop, config.listen.bind_address, [this](evutil_socket_t fd) {
             if (links.size() >= config.peers.size() * 2 + 16) { evutil_closesocket(fd); return; }
             make_link(false, Endpoint(), fd);
@@ -375,7 +460,13 @@ struct Node::Impl {
         if (address_service) address_service->start();
         timer = loop.addTimer(std::chrono::milliseconds(options.tick_ms), [this](evutil_socket_t, short) { tick(); }, true);
         if (!timer) throw std::runtime_error("node timer allocation failed");
-        tick(); log("started " + (device ? config.listen.address.str() + " device=" + device->name() : std::string("address server")));
+        tick();
+        if (device) {
+            // Report the actual UDP source selected by the OS for an
+            // outbound-only node instead of the wildcard/port-zero request.
+            const auto endpoint = udp ? udp->local_address() : config.listen.bind_address;
+            log("started " + endpoint.str() + " device=" + device->name());
+        } else log("started address server");
     }
     void stop() {
         // Also release partially started resources after a failed reload/start.
@@ -393,10 +484,11 @@ struct Node::Impl {
             try { device->set_routes({}); } catch (const std::exception& e) { log(std::string("subnet route cleanup: ") + e.what()); }
         }
     }
-    void replace_peers(Configure replacement, const std::set<Endpoint>& changed) {
+    void replace_peers(Configure replacement, const std::set<Endpoint>& changed, bool admission_changed = false) {
         // Cancel unidentified inbound handshakes too: they may already have
         // consumed a PSK that has just been revoked by this configuration.
-        for (auto& link : links) if (!link->remote.port || changed.count(link->remote)) fail(*link);
+        for (auto& link : links) if (!link->remote.port || changed.count(link->remote) || (admission_changed && link->wildcard))
+            fail(*link, "peer configuration changed");
         for (const auto& remote : changed) {
             routes.forget_peer(remote); retry.erase(remote); attempts.erase(remote);
         }
@@ -405,14 +497,26 @@ struct Node::Impl {
         invalidate_end(); dirty = true;
         if (started) tick();
     }
-    void fail(Link& l) {
+    void fail(Link& l, const std::string& reason = {}) {
         if (l.dead) return;
         l.dead = true;
         if (l.crypto) sessions.erase(l.crypto->id());
         auto it = active.find(l.remote);
+        std::string endpoint;
+        if (l.remote.port) endpoint = l.remote.str();
+        else if (l.identity_remote.port) endpoint = l.identity_remote.str();
+        else if (l.tcp) {
+            try { endpoint = l.tcp->peer_address().str(); } catch (...) {}
+        }
+        if (endpoint.empty()) endpoint = "unknown";
+        const auto phase = l.stage.empty() ? std::string("unknown") : l.stage;
         if (it != active.end() && it->second == &l) {
             active.erase(it); routes.set_available(l.remote, false); invalidate_end(); dirty = true;
-            ++counters["peer_down"]; log("peer down " + l.remote.str());
+            ++counters["peer_down"];
+            log("peer down " + endpoint + " stage=" + phase +
+                (reason.empty() ? std::string() : ": " + reason));
+        } else if (!reason.empty()) {
+            log("peer connection failed " + endpoint + " stage=" + phase + ": " + reason);
         }
         if (l.peer) l.peer->disconnect();
         if (l.tcp) l.tcp->close();
@@ -423,30 +527,51 @@ struct Node::Impl {
     }
     void make_link(bool client, Endpoint remote, evutil_socket_t fd = EVUTIL_INVALID_SOCKET) {
         std::unique_ptr<Link> link(new Link); auto* l = link.get();
-        l->client = client; l->remote = remote;
+        l->client = client; l->remote = remote; l->identity_remote = remote;
+        l->stage = client ? "tcp connect" : "tcp accept";
+        links.push_back(std::move(link));
         try {
-            const auto id = client ? config.listen.address.str() + "|" + remote.str() : std::string();
+            const auto id = client ? identity_local().str() + "|" + remote.str() : std::string();
             l->tls.reset(new TlsChannel(client, id, [this, client](const std::string& value) {
                 if (!client) {
                     const auto bar = value.find('|');
-                    if (bar == std::string::npos || value.substr(bar + 1) != config.listen.address.str()) return std::string();
+                    if (bar == std::string::npos) return std::string();
+                    const auto responder = Endpoint::parse(value.substr(bar + 1));
+                    const auto& bind = config.listen.bind_address;
+                    if (responder != bind &&
+                        !(bind.ip.unspecified() && responder.ip.family == bind.ip.family && responder.port == bind.port))
+                        return std::string();
                 }
-                return lookup_psk(value);
+                const auto configured = lookup_psk(value);
+                if (!configured.empty() || client || config.listen.shared_key.empty()) return configured;
+                return config.listen.shared_key;
             }));
-        } catch (...) { if (fd != static_cast<evutil_socket_t>(EVUTIL_INVALID_SOCKET)) evutil_closesocket(fd); throw; }
-        links.push_back(std::move(link));
+        } catch (const std::exception& error) {
+            if (fd != static_cast<evutil_socket_t>(EVUTIL_INVALID_SOCKET)) evutil_closesocket(fd);
+            l->stage = "TLS setup";
+            fail(*l, std::string("TLS setup failed: ") + error.what());
+            return;
+        } catch (...) {
+            if (fd != static_cast<evutil_socket_t>(EVUTIL_INVALID_SOCKET)) evutil_closesocket(fd);
+            l->stage = "TLS setup";
+            fail(*l, "TLS setup failed: unknown error");
+            return;
+        }
         try {
             l->tcp.reset(new TcpStream(loop, fd, options.protect,
                 [this, l](const Bytes& b) { process_tcp(*l, b); },
-                [this, l] { Dispatch dispatch(*this); try { l->tls->advance(); flush(*l); } catch (...) { fail(*l); } },
-                [this, l] { Dispatch dispatch(*this); fail(*l); }));
+                [this, l] { Dispatch dispatch(*this); l->stage = "TLS handshake"; try { l->tls->advance(); flush(*l); } catch (const std::exception& e) { fail(*l, std::string("TLS handshake failed: ") + e.what()); } catch (...) { fail(*l, "TLS handshake failed: unknown error"); } },
+                [this, l] { Dispatch dispatch(*this); const auto reason = l->tcp && !l->tcp->close_reason().empty() ? l->tcp->close_reason() : std::string("TCP connection closed"); fail(*l, reason); }));
             if (client) l->tcp->connect(remote);
-        } catch (...) { fail(*l); }
+        } catch (const std::exception& e) { fail(*l, std::string("TCP setup failed: ") + e.what()); }
+        catch (...) { fail(*l, "TCP setup failed: unknown error"); }
     }
-    void flush(Link& l) { if (!l.dead && !l.tcp->send(l.tls->drain())) fail(l); }
+    void flush(Link& l) { if (!l.dead && !l.tcp->send(l.tls->drain())) fail(l, "TCP send failed"); }
     void send(Link& l, const Json& message) {
         if (l.dead || !l.tls->ready()) return;
-        try { l.tls->write(wire::frame(message)); flush(l); } catch (...) { fail(l); }
+        try { l.tls->write(wire::frame(message)); flush(l); }
+        catch (const std::exception& e) { fail(l, std::string("control send failed: ") + e.what()); }
+        catch (...) { fail(l, "control send failed: unknown error"); }
     }
     bool locally_allowed(const Link& l, const NetworkConfig& n) const {
         if (l.client) return true;
@@ -455,7 +580,7 @@ struct Node::Impl {
     }
     Json network_offers(const Link& l) const {
         Json result = Json::array();
-        const auto* p = peer_config(l.remote);
+        const auto* p = effective_peer(l);
         if (p) for (const auto& n : p->networks) if (locally_allowed(l, n)) {
             Json value{{"network", n.tunnel.str()}};
             if (n.allocation_server.port) value["server"] = n.allocation_server.str();
@@ -465,7 +590,7 @@ struct Node::Impl {
     }
     Json local_membership(const Link& l) const {
         Json result = Json::array();
-        const auto* p = peer_config(l.remote);
+        const auto* p = effective_peer(l);
         if (p) for (const auto& n : p->networks) {
             const auto local = tunnels.find(n.tunnel);
             if (!locally_allowed(l, n) || local == tunnels.end()) continue;
@@ -530,7 +655,7 @@ struct Node::Impl {
             if (current == l.networks.end() || current->second != old.second)
                 routes.withdraw(l.remote, old.first, old.second);
         }
-        if (l.networks.empty()) { fail(l); return; }
+        if (l.networks.empty()) { fail(l, "remote membership has no authorized network"); return; }
         if (l.peer && l.peer->state() == PEER_STATE_ESTABLISHED) {
             for (const auto& n : l.networks) {
                 const auto old = previous.find(n.first);
@@ -579,7 +704,7 @@ struct Node::Impl {
                     device_failed = true; active_exports.clear(); subnet_gateways.clear(); return_flows.clear();
                     for (const auto& n : config.networks) { routes.set_local_prefixes(n.tunnel, {}); routes.set_local_address(n.tunnel, nullptr); }
                     tunnels.clear(); grants.clear();
-                    for (auto& l : links) fail(*l);
+                    for (auto& l : links) fail(*l, "virtual interface unavailable");
                     device->start({}); invalidate_end();
                     log("virtual interface unavailable; all overlay networks stopped; reconnect required");
                 }
@@ -619,17 +744,29 @@ struct Node::Impl {
         Dispatch dispatch(*this);
         if (l.dead) return;
         try {
+            if (!l.tls->ready()) l.stage = "TLS handshake";
             l.tls->feed(bytes);
             if (l.tls->ready() && !l.hello_sent) {
+                l.stage = "peer hello";
                 if (!l.client) {
-                    const auto id = l.tls->psk_identity(); l.remote = Endpoint::parse(id.substr(0, id.find('|')));
+                    const auto id = l.tls->psk_identity();
+                    l.identity_remote = Endpoint::parse(id.substr(0, id.find('|')));
+                    l.remote = l.identity_remote;
+                    const bool wildcard_remote = l.remote.ip.unspecified() && !config.listen.shared_key.empty();
+                    if ((!l.remote.ip.unicast() && !wildcard_remote) ||
+                        l.remote.ip.family != config.listen.bind_address.ip.family ||
+                        (l.remote.port == 0 && !wildcard_remote) || (!wildcard_remote && l.remote == config.listen.bind_address))
+                        throw std::invalid_argument("invalid authenticated peer endpoint");
+                    prepare_wildcard_peer(l);
                 }
-                const auto* p = peer_config(l.remote); if (!p) throw std::runtime_error("unknown authenticated peer");
+                const auto* p = effective_peer(l); if (!p) throw std::runtime_error("unknown authenticated peer");
                 l.hello_sent = true;
-                send(l, {{"type", "hello"}, {"version", 1}, {"endpoint", config.listen.address.str()}, {"key", wire::hex(key)},
+                send(l, {{"type", "hello"}, {"version", 1}, {"endpoint", advertised_endpoint(l).str()}, {"key", wire::hex(key)},
                     {"network_updates", true}, {"offers", network_offers(l)}, {"networks", local_membership(l)},
                     {"tcp_data", true}, {"transport", p->transport}});
             }
+            if (l.hello_received && (!l.peer || l.peer->state() != PEER_STATE_ESTABLISHED))
+                l.stage = "data probe";
             l.decoder.append(l.tls->read());
             Json message; Bytes packet;
             while (!l.dead && l.decoder.next(message, packet)) {
@@ -638,7 +775,7 @@ struct Node::Impl {
                     try {
                         if (!l.hello_received || !l.data_tcp || !l.crypto)
                             throw std::invalid_argument("TCP data was not negotiated");
-                        if (packet.size() > config.transport_mtu - protocol::outer_overhead(config.listen.address.ip.family))
+                        if (packet.size() > config.transport_mtu - protocol::outer_overhead(config.listen.bind_address.ip.family))
                             throw std::length_error("TCP data packet exceeds transport limit");
                         receive_record(l, packet);
                         l.peer->authenticated_tcp_activity(l.generation, Clock::now());
@@ -648,15 +785,30 @@ struct Node::Impl {
             }
             flush(l);
         } catch (const std::exception& e) {
-            ++counters["control_rejected"]; log("control rejected from " + l.remote.str() + ": " + e.what()); fail(l);
+            ++counters["control_rejected"];
+            const auto phase = !l.tls->ready() ? "TLS handshake" :
+                (!l.hello_received ? "peer hello" : "control/data frame");
+            fail(l, std::string(phase) + " rejected: " + e.what());
+        } catch (...) {
+            ++counters["control_rejected"];
+            const auto phase = !l.tls->ready() ? "TLS handshake" :
+                (!l.hello_received ? "peer hello" : "control/data frame");
+            fail(l, std::string(phase) + " rejected: unknown error");
         }
     }
     void hello(Link& l, const Json& j) {
-        if (l.hello_received || j.at("version") != 1 || !j.count("endpoint") ||
-            Endpoint::parse(j.at("endpoint").get<std::string>()) != l.remote)
+        l.stage = "peer hello validation";
+        if (l.hello_received || j.at("version") != 1 || !j.count("endpoint"))
             throw std::invalid_argument("invalid peer hello");
-        const auto* p = peer_config(l.remote); if (!p) throw std::invalid_argument("unknown peer");
-        const auto requested_transport = j.value("transport", std::string("udp"));
+        const auto advertised = Endpoint::parse(j.at("endpoint").get<std::string>());
+        if (!advertised.ip.unicast() || advertised.ip.family != config.listen.bind_address.ip.family || !advertised.port)
+            throw std::invalid_argument("invalid peer hello endpoint");
+        if (l.remote.ip.unspecified()) {
+            l.remote = advertised;
+            if (l.wildcard) l.wildcard_config.address = l.remote;
+        } else if (advertised != l.remote) throw std::invalid_argument("invalid peer hello endpoint");
+        const auto* p = effective_peer(l); if (!p) throw std::invalid_argument("unknown peer");
+        const auto requested_transport = j.value("transport", std::string("tcp"));
         if (requested_transport != "udp" && requested_transport != "tcp")
             throw std::invalid_argument("invalid peer data transport");
         const bool tcp_supported = j.value("tcp_data", false);
@@ -687,29 +839,36 @@ struct Node::Impl {
         remote_membership(l, nets);
         auto old = active.find(l.remote);
         if (old != active.end()) {
-            const bool preferred = l.client == (config.listen.address < l.remote);
-            const bool old_preferred = old->second->client == (config.listen.address < l.remote);
-            if (!preferred || old_preferred) { fail(l); return; }
-            fail(*old->second);
+            const bool preferred = l.client == (config.listen.bind_address < l.remote);
+            const bool old_preferred = old->second->client == (config.listen.bind_address < l.remote);
+            if (!preferred || old_preferred) { fail(l, "duplicate peer connection; existing connection is preferred"); return; }
+            fail(*old->second, "duplicate peer connection; replacing with preferred connection");
         }
-        std::string context = endpoints(config.listen.address, l.remote);
+        // The data-plane endpoint advertised in hello is the canonical
+        // session identity. A wildcard bind has no usable address in the PSK
+        // identity, so deriving keys from that sentinel would disagree with
+        // the concrete endpoint seen by the other side.
+        const auto local_identity = advertised_endpoint(l);
+        const auto remote_identity = l.identity_remote.ip.unicast() ? l.identity_remote : l.remote;
+        std::string context = endpoints(local_identity, remote_identity);
         for (const auto& n : l.permitted) {
             context += "|" + n.first.str();
             if (n.second.port) context += "|allocator:" + n.second.str();
         }
-        context += config.listen.address < l.remote ? "|" + wire::hex(key) + "|" + wire::hex(l.key) :
+        context += local_identity < remote_identity ? "|" + wire::hex(key) + "|" + wire::hex(l.key) :
                                                      "|" + wire::hex(l.key) + "|" + wire::hex(key);
         // Keep the old UDP exporter context for compatibility. Bind TCP data
         // keys to the negotiated mode so records cannot cross transports.
         if (l.data_tcp) context += "|transport:tcp:v1";
         l.crypto = l.tls->session(CryptoScope::Link, context);
         l.peer.reset(new Peer(*p)); l.generation = l.peer->begin_connection();
-        l.peer->tcp_authenticated(l.generation, Clock::now()); l.hello_received = true;
+        l.peer->tcp_authenticated(l.generation, Clock::now()); l.hello_received = true; l.hello_received_at = Clock::now();
         active[l.remote] = &l; sessions[l.crypto->id()] = &l;
         refresh_membership(l);
         if (l.dead) return;
-        if (l.networks.empty()) { fail(l); return; }
+        if (l.networks.empty()) { fail(l, "no authorized network after membership validation"); return; }
         dirty = true;
+        l.stage = "data probe";
         heartbeat(l);
     }
     void established(Link& l) {
@@ -718,8 +877,9 @@ struct Node::Impl {
             if (l.permitted.at(n.first).port) routes.confirm_allocated_address(n.first, n.second, n.second);
             PathAnnouncement a; a.network = n.first; a.destination = n.second; a.tunnel_ip = n.second;
             a.public_key = l.key; a.path.push_back(n.second);
-            if (!routes.announce(l.remote, a)) { fail(l); return; }
+            if (!routes.announce(l.remote, a)) { fail(l, "route announcement rejected"); return; }
         }
+        l.stage = "established";
         invalidate_end(); attempts[l.remote] = 0; dirty = true; ++counters["peer_up"];
         send(l, {{"type", "sync"}}); log("peer established " + l.remote.str() + " transport=" + (l.data_tcp ? "tcp" : "udp"));
     }
@@ -749,11 +909,21 @@ struct Node::Impl {
                 l.tls->write(wire::data_frame(l.crypto->seal(plain))); flush(l);
                 if (!l.dead) ++counters["tcp_data_sent"];
             } else if (udp) {
-                if (!udp->send(l.remote, l.crypto->seal(plain))) ++counters["udp_send_drop"];
+                // A wildcard UDP socket would otherwise let the route lookup
+                // choose a source address. Pin replies to the local address
+                // on which this peer's TCP control connection was accepted
+                // (or from which it was established), so the UDP data plane
+                // follows the same interface and address as authentication.
+                // A concrete UDP bind already fixes the source address. Use
+                // packet-info only for wildcard binds, where the peer's TCP
+                // control connection identifies the correct local interface.
+                const auto source = config.listen.bind_address.ip.unicast() ? Endpoint{} : advertised_endpoint(l);
+                if (!udp->send(l.remote, l.crypto->seal(plain), source)) ++counters["udp_send_drop"];
                 else ++counters["udp_data_sent"];
             }
         }
-        catch (...) { fail(l); }
+        catch (const std::exception& e) { fail(l, std::string("data send failed: ") + e.what()); }
+        catch (...) { fail(l, "data send failed: unknown error"); }
     }
     void message_received(Link& l, const Json& j) {
         const auto type = j.at("type").get<std::string>();
@@ -855,7 +1025,8 @@ struct Node::Impl {
     }
     void progress_end(const RouteKey& target, EndSession& s) {
         if (s.tls->ready() && !s.crypto) {
-            const auto context = target.first.str() + "|" + local_node(target.first).str() + "|" + target.second.str() + "|" + s.id;
+            const auto local = local_node(target.first);
+            const auto context = target.first.str() + "|" + (local < target.second ? local.str() + "|" + target.second.str() : target.second.str() + "|" + local.str()) + "|" + s.id;
             s.crypto = s.tls->session(CryptoScope::EndToEnd, context);
         }
         if (s.crypto && !s.sent_ready) { s.tls->write(Bytes{1}); s.sent_ready = true; }
@@ -886,8 +1057,22 @@ struct Node::Impl {
             routes.next_hops(target.first, target.second).empty()) return nullptr;
         auto& s = end_sessions[target]; s.key = remote;
         s.client = local_node(target.first) < target.second;
-        if (s.client) begin_end(target, s);
-        else { route_end(end_message(target, "request")); s.requested = Clock::now(); }
+        try {
+            if (s.client) begin_end(target, s);
+            else { route_end(end_message(target, "request")); s.requested = Clock::now(); }
+        } catch (const std::exception& error) {
+            ++counters["e2e_rejected"];
+            log("tunnel connection failed network=" + target.first.str() + " peer=" + target.second.str() +
+                " stage=begin: " + error.what());
+            end_sessions.erase(target);
+            return nullptr;
+        } catch (...) {
+            ++counters["e2e_rejected"];
+            log("tunnel connection failed network=" + target.first.str() + " peer=" + target.second.str() +
+                " stage=begin: unknown error");
+            end_sessions.erase(target);
+            return nullptr;
+        }
         return &s;
     }
     void receive_end(Link& incoming, Json j) {
@@ -943,7 +1128,17 @@ struct Node::Impl {
             it->second.tls->feed(bytes); progress_end(target, it->second);
             it->second.progress = Clock::now();
         }
-        catch (...) { ++counters["e2e_rejected"]; end_sessions.erase(target); }
+        catch (const std::exception& error) {
+            ++counters["e2e_rejected"];
+            log("tunnel authentication failed network=" + target.first.str() + " peer=" + target.second.str() +
+                " op=" + op + ": " + error.what());
+            end_sessions.erase(target);
+        } catch (...) {
+            ++counters["e2e_rejected"];
+            log("tunnel authentication failed network=" + target.first.str() + " peer=" + target.second.str() +
+                " op=" + op + ": unknown error");
+            end_sessions.erase(target);
+        }
     }
     bool imported_gateway(const Network& network, const IpAddress& ip, NodeId* peer) const {
         for (const auto& item : subnet_gateways) if (item.first.first == network && item.first.second.usable_host(ip)) {
@@ -985,7 +1180,17 @@ struct Node::Impl {
         try {
             const auto encrypted = s.crypto->seal(packet, protocol::end_to_end_aad(header));
             send_data(*next, protocol::encode(header, encrypted)); ++counters["unicast_sent"];
-        } catch (...) { ++counters["e2e_send_drop"]; s.created = Time{}; }
+        } catch (const std::exception& error) {
+            ++counters["e2e_send_drop"];
+            log("tunnel data send failed network=" + target.first.str() + " peer=" + target.second.str() +
+                ": " + error.what());
+            s.created = Time{};
+        } catch (...) {
+            ++counters["e2e_send_drop"];
+            log("tunnel data send failed network=" + target.first.str() + " peer=" + target.second.str() +
+                ": unknown error");
+            s.created = Time{};
+        }
     }
     void flood(const protocol::ForwardHeader& header, const Bytes& packet, Link* excluded) {
         const auto encoded = protocol::encode(header, packet);
@@ -1107,7 +1312,15 @@ struct Node::Impl {
         SessionId id;
         if (!CryptoSession::peek_session_id(packet, &id)) { ++counters["udp_rejected"]; return; }
         const auto it = sessions.find(id);
-        if (it == sessions.end() || it->second->dead || it->second->remote != from || it->second->data_tcp) {
+        // A wildcard UDP socket can legitimately emit replies from another
+        // local address when the host has multiple interfaces. The record is
+        // still authenticated by the per-link AEAD session below; accepting
+        // the same remote port here avoids rejecting a valid reply solely
+        // because the kernel selected a different local source address.
+        const bool endpoint_match = it != sessions.end() &&
+            (it->second->remote == from ||
+             (config.listen.bind_address.ip.unspecified() && it->second->remote.port == from.port));
+        if (it == sessions.end() || it->second->dead || !endpoint_match || it->second->data_tcp) {
             ++counters["udp_rejected"]; return;
         }
         auto& l = *it->second;
@@ -1123,16 +1336,24 @@ struct Node::Impl {
             catch (const std::exception& error) {
                 kernel_error = error.what(); device_failed = true;
                 try { k->shutdown(); } catch (...) {}
-                for (auto& l : links) fail(*l);
+                for (auto& l : links) fail(*l, std::string("kernel renewal failed: ") + error.what());
             }
         }
         const auto now = Clock::now();
         for (auto& l : links) if (!l->dead) {
             if (!l->hello_received && elapsed(now, l->created) >= options.handshake_timeout_ms) {
-                ++counters["handshake_timeout"]; fail(*l);
+                ++counters["handshake_timeout"];
+                fail(*l, "authentication timeout (stage=" + l->stage + ")");
+            } else if (l->hello_received && l->peer && l->peer->state() != PEER_STATE_ESTABLISHED &&
+                       elapsed(now, l->hello_received_at) >= options.handshake_timeout_ms) {
+                ++counters["probe_timeout"];
+                fail(*l, "data probe timeout (peer hello accepted, no authenticated probe reply)");
             } else if (l->peer && l->peer->expired(now, std::chrono::milliseconds(options.failure_timeout_ms))) {
-                ++counters["peer_timeout"]; log("peer activity timeout " + l->remote.str()); fail(*l);
-            } else if (elapsed(now, l->created) >= options.session_lifetime_ms) fail(*l);
+                ++counters["peer_timeout"];
+                fail(*l, "peer activity timeout");
+            } else if (elapsed(now, l->created) >= options.session_lifetime_ms) {
+                fail(*l, "session lifetime expired");
+            }
             else if (l->hello_received && elapsed(now, l->heartbeat) >= options.heartbeat_ms) heartbeat(*l);
             if (!l->dead && l->hello_received && l->network_updates && elapsed(now, l->proof_checked) >= 1000)
                 refresh_membership(*l);
@@ -1160,7 +1381,19 @@ struct Node::Impl {
                     route_end(end_message(it->first, "request")); s.requested = now;
                 }
                 if (s.client && !s.confirmed && elapsed(now, s.progress) >= std::max(500u, options.heartbeat_ms)) {
-                    begin_end(it->first, s); ++counters["e2e_handshake_retried"];
+                    try {
+                        begin_end(it->first, s); ++counters["e2e_handshake_retried"];
+                    } catch (const std::exception& error) {
+                        ++counters["e2e_rejected"];
+                        log("tunnel authentication retry failed network=" + it->first.first.str() +
+                            " peer=" + it->first.second.str() + ": " + error.what());
+                        it = end_sessions.erase(it); continue;
+                    } catch (...) {
+                        ++counters["e2e_rejected"];
+                        log("tunnel authentication retry failed network=" + it->first.first.str() +
+                            " peer=" + it->first.second.str() + ": unknown error");
+                        it = end_sessions.erase(it); continue;
+                    }
                 }
                 ++it;
             }
@@ -1197,10 +1430,11 @@ struct Node::Impl {
             if (method == "remote_info") {
                 const auto& remote = config.remote_desktop;
                 Json selected = Json::array(); for (const auto& n : remote.networks) selected.push_back(n.str());
-                result = {{"endpoint", config.listen.address.port ? config.listen.address.str() : std::string()},
+                result = {{"endpoint", config.listen.bind_address.port && config.listen.bind_address.ip.unicast() ? config.listen.bind_address.str() : std::string()},
                     {"public_key", wire::hex(key)}, {"networks", Json::array()},
-                    {"remote_desktop", {{"enabled", remote.enabled}, {"networks", selected}, {"access", remote.access},
-                        {"unattended", remote.unattended}, {"port", remote.port}, {"device_name", remote.device_name}}}};
+                    {"remote_desktop", {{"enabled", remote.enabled}, {"networks", selected},
+                        {"port", remote.port}, {"device_name", remote.device_name},
+                        {"shared_key_configured", !remote.shared_key.empty()}}}};
                 if (started && !device_failed) for (const auto& entry : tunnels)
                     result["networks"].push_back({{"network", entry.first.str()}, {"tunnel_ip", entry.second.config().tunnel_ip.str()}});
             } else {
@@ -1253,10 +1487,21 @@ struct Node::Impl {
     }
     Json status() const {
         unsigned pending_connections = 0;
-        for (const auto& l : links) if (!l->dead && !l->hello_received) ++pending_connections;
-        Json result{{"endpoint", config.listen.address.port ? config.listen.address.str() : std::string()},
+        Json pending = Json::array();
+        const auto now = Clock::now();
+        for (const auto& l : links) if (!l->dead && !l->hello_received) {
+            ++pending_connections;
+            std::string endpoint;
+            if (l->remote.port) endpoint = l->remote.str();
+            else if (l->identity_remote.port) endpoint = l->identity_remote.str();
+            else if (l->tcp) try { endpoint = l->tcp->peer_address().str(); } catch (...) {}
+            pending.push_back({{"endpoint", endpoint}, {"stage", l->stage},
+                {"age_ms", elapsed(now, l->created)}});
+        }
+        Json result{{"endpoint", config.listen.bind_address.port && config.listen.bind_address.ip.unicast() ? config.listen.bind_address.str() : std::string()},
                     {"network_identities", Json::array()}, {"public_key", wire::hex(key)}, {"device", device ? device->name() : std::string()},
                     {"pending_connections", pending_connections},
+                    {"pending", pending},
                     {"running", started}, {"counters", counters}, {"peers", Json::array()}, {"routes", Json::array()},
                     {"end_sessions", Json::array()}, {"networks", Json::array()}, {"address_errors", Json::object()}};
         result["device_backend"] = config.device_backend;
@@ -1298,6 +1543,18 @@ struct Node::Impl {
             result["peers"].push_back({{"endpoint", p.address.str()}, {"state", it == active.end() ? 0 : int(it->second->peer->state())},
                 {"networks", networks}, {"identities", identities}, {"configured_transport", p.transport},
                 {"transport", it == active.end() ? p.transport : (it->second->data_tcp ? "tcp" : "udp")}});
+        }
+        for (const auto& item : active) {
+            const auto* link = item.second;
+            if (!link->wildcard || peer_config(item.first)) continue;
+            Json networks = Json::array();
+            Json identities = Json::object();
+            for (const auto& n : link->networks) {
+                networks.push_back(n.first.str()); identities[n.first.str()] = n.second.str();
+            }
+            result["peers"].push_back({{"endpoint", item.first.str()}, {"state", link->peer ? int(link->peer->state()) : 0},
+                {"networks", networks}, {"identities", identities}, {"configured_transport", "tcp"},
+                {"transport", link->data_tcp ? "tcp" : "udp"}, {"dynamic", true}});
         }
         std::set<RouteKey> seen;
         for (const auto& a : routes.snapshot()) seen.insert({a.network, a.destination});
@@ -1357,6 +1614,15 @@ wire::Json Node::apply_config(const Configure& requested) {
         result["ok"] = true; result["mode"] = "remote"; return result;
     }
     previous_base.erase("peers"); next_base.erase("peers");
+    const auto listen_admission_key = [](const Json& doc) {
+        if (!doc.is_object() || !doc.count("listen") || !doc.at("listen").is_object()) return std::string();
+        return doc.at("listen").value("shared_key", std::string());
+    };
+    const bool listen_admission_changed = listen_admission_key(previous_json) != listen_admission_key(next_json);
+    auto remove_listen_admission_key = [](Json& doc) {
+        if (doc.is_object() && doc.count("listen") && doc.at("listen").is_object()) doc["listen"].erase("shared_key");
+    };
+    remove_listen_admission_key(previous_base); remove_listen_admission_key(next_base);
     if (previous_base == next_base && !restore_device) {
         result["mode"] = "peers";
         std::map<std::string, Json> before, after;
@@ -1370,11 +1636,11 @@ wire::Json Node::apply_config(const Configure& requested) {
         const auto previous = impl_->config;
         const bool was_running = impl_->started;
         try {
-            impl_->replace_peers(std::move(replacement), changed);
+            impl_->replace_peers(std::move(replacement), changed, listen_admission_changed);
             result["ok"] = true;
         } catch (const std::exception& error) {
             result["error"] = std::string("peer reload failed: ") + error.what();
-            try { impl_->replace_peers(previous, changed); result["rolled_back"] = true; }
+            try { impl_->replace_peers(previous, changed, listen_admission_changed); result["rolled_back"] = true; }
             catch (const std::exception& rollback) {
                 result["rollback_error"] = rollback.what(); impl_->stop(); reload_resume_ = was_running;
             }

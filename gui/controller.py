@@ -3,10 +3,12 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import platform
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,31 +21,22 @@ UNSPECIFIED_REVISION = object()
 # Source runs start in gui/, while frozen builds collect this package normally.
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from remote_desktop.host import BackgroundHost
-
-
-def config_directory():
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    elif platform.system() == "Darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "Tunnel"
+try:
+    from simple_host import SimpleCoreHost
+except ImportError:  # Package import from the repository root.
+    from gui.simple_host import SimpleCoreHost
 
 
 class Controller:
-    def __init__(self, binary, directory=None, example=None):
+    def __init__(self, binary, directory=None, example=None, *, gui_owned=False):
         self.binary = Path(binary).resolve()
-        self.directory = Path(directory or config_directory()).resolve()
+        self.directory = Path(directory or Path(__file__).resolve().parents[1]).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.directory / "configure.json"
         self.example = Path(example) if example else None
         self._state_lock = threading.RLock()
         self._operation = threading.Lock()
         self._process = None
-        self._run = None
-        self._monitor = None
         self._phase = "stopped"
         self._error = ""
         self._status = {}
@@ -52,15 +45,44 @@ class Controller:
         self._secrets = []
         self._last_status = None
         self._closed = False
-        self._requires_tun = True
-        self._background = BackgroundHost(self.binary, self.directory)
+        self._gui_owned = bool(gui_owned)
+        self._basic_mode = os.environ.get("TUNNEL_BASIC_MODE") == "1"
+        if self._basic_mode:
+            self._background = SimpleCoreHost(self.binary, self.directory / "background")
+            self._rustdesk = None
+        else:
+            # Keep the legacy remote-desktop host loadable for explicit
+            # compatibility mode, but do not import it in the normal GUI.
+            from remote_desktop.host import BackgroundHost
+            self._background = BackgroundHost(self.binary, self.directory, gui_owned=self._gui_owned)
+            from remote_desktop.rustdesk import RustDeskLauncher
+            self._rustdesk = RustDeskLauncher(self.directory)
         self._background_dir = self.directory / "background"
         self._background_dir.mkdir(exist_ok=True, mode=0o700)
         self._log_offset = 0
         self._log_partial = b""
-        self._detach_on_close = False
         self._last_background_error = ""
         self._remote_log_seen = set()
+        # The RustDesk host is started automatically when the saved Tunnel
+        # configuration enables local remote desktop.  Keep the flag here so
+        # status polling and reconnects do not launch duplicate clients.
+        self._rustdesk_host_started = False
+        # A stopped GUI must not replay diagnostics from a previous core
+        # process as if they belonged to the current connection attempt. The
+        # core bridge truncates this file when it starts; if a live host is
+        # discovered before that happens, the size check below will rewind and
+        # still capture the new process output.
+        if not self._background.is_running():
+            try:
+                self._log_offset = (self._background_dir / "remote-core.log").stat().st_size
+            except OSError:
+                pass
+        # A normal GUI owns the host process it starts or reattaches to.  The
+        # owner channel is separate from ordinary RPC so reconnects/status
+        # polls cannot accidentally keep a detached daemon alive.  CLI and
+        # check-ui callers leave the host detached by design.
+        if self._gui_owned and not self._basic_mode and self._background.is_running():
+            self._background.attach_owner()
         self._refresh_background()
         self._add_log("info", "界面已就绪，导入或编辑配置后连接。")
 
@@ -87,6 +109,10 @@ class Controller:
             raise ValueError("JSON 格式不正确，请检查括号、逗号和引号。") from None
         if not isinstance(document, dict):
             raise ValueError("配置的最外层必须是 JSON 对象。")
+        if self._basic_mode:
+            remote = document.get("remote_desktop")
+            if isinstance(remote, dict) and remote.get("enabled") is True:
+                raise ValueError("基础模式未启用远程桌面，请关闭 remote_desktop.enabled。")
         secrets = []
         def collect(value):
             if isinstance(value, dict):
@@ -210,8 +236,9 @@ class Controller:
                     raise
             finally:
                 temporary.unlink(missing_ok=True)
-            self._requires_tun = bool(json.loads(text).get("address"))
             self._refresh_background()
+            if running:
+                self._sync_rustdesk_host(text)
             message = "配置已保存并应用"
             if not running:
                 message = "配置已保存；连接时生效"
@@ -265,8 +292,16 @@ class Controller:
             if source.stat().st_size > MAX_CONFIG:
                 raise ValueError("配置文件超过 1 MiB。")
             raw = source.read_bytes()
-            text = raw.decode("utf-8-sig")
             revision = hashlib.sha256(raw).hexdigest() if source == self.path else None
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError as error:
+                # Keep the invalid file visible in the editor so the user can
+                # repair it instead of losing the only copy behind a load
+                # error. Replacement characters are intentionally not saved
+                # until the user explicitly applies or saves the repaired text.
+                text = raw.decode("utf-8-sig", errors="replace")
+                return {"text": text, "error": "配置文件不是有效的 UTF-8：%s" % error, "revision": revision}
             try:
                 return {"text": self._normalize(self._text({"text": text})), "revision": revision}
             except (ValueError, OSError, subprocess.SubprocessError) as error:
@@ -275,7 +310,10 @@ class Controller:
         return {"text": "", "revision": None}
 
     def _read_background_logs(self):
-        path = self.directory / "remote-core.log"
+        # BackgroundHost and SimpleCoreHost both keep core output in the
+        # private background directory. Reading a similarly named file in the
+        # project root replays diagnostics from an older launcher/core.
+        path = self._background_dir / "remote-core.log"
         try:
             if path.stat().st_size < self._log_offset:
                 self._log_offset = 0
@@ -325,9 +363,8 @@ class Controller:
             snapshot = Path(info.get("config_path") or self._background_dir / "configure.json")
             try:
                 if snapshot.stat().st_size <= MAX_CONFIG:
-                    document = json.loads(self._text({"text": snapshot.read_text(encoding="utf-8")}))
-                    remote = document.get("remote_desktop", {})
-                    self._detach_on_close = remote.get("enabled") is True and remote.get("unattended") is True
+                    # Validate the private snapshot while refreshing status.
+                    self._text({"text": snapshot.read_text(encoding="utf-8")})
             except (OSError, ValueError):
                 pass
 
@@ -347,10 +384,69 @@ class Controller:
         self._log_offset = 0
         self._log_partial = b""
         self._background.start(snapshot, status_path)
-        self._requires_tun = bool(json.loads(text).get("address"))
         self._refresh_background()
-        self._add_log("info", "正在建立隧道；保活 5 秒，通道失效阈值 20 秒。" if self._requires_tun else "正在启动地址分配服务；绑定记录保存在配置目录中。")
+        self._sync_rustdesk_host(text)
+        has_listener = bool(json.loads(text).get("listen"))
+        self._add_log("info", "正在启动隧道核心，等待虚拟网卡和节点连接。" if has_listener else "正在启动地址分配服务，地址绑定记录保存在配置目录中。")
         return {"message": "已请求连接", "revision": self._saved_revision()}
+
+    def _start_rustdesk_host(self, text):
+        """Start RustDesk's password-only host path for the saved config.
+
+        RustDesk's default is password-plus-click approval.  The Tunnel
+        remote key is the permanent RustDesk password, so an enabled local
+        remote section must configure and start RustDesk automatically after
+        the Tunnel is up.  Failure is logged but does not tear down the
+        network connection; the user can still use Tunnel without desktop
+        sharing.
+        """
+        if self._rustdesk is None or self._rustdesk_host_started:
+            return
+        try:
+            document = json.loads(text)
+        except (TypeError, ValueError):
+            return
+        remote = document.get("remote_desktop")
+        if not isinstance(remote, dict) or remote.get("enabled") is not True:
+            return
+        password = remote.get("shared_key")
+        if not isinstance(password, str) or not password.strip():
+            return
+        try:
+            self._rustdesk.host(password)
+            self._rustdesk_host_started = True
+            self._add_log("info", "RustDesk 被控端已自动启动，使用 Tunnel 预共享密钥认证。")
+        except Exception as error:
+            # Linux package services are root-owned.  The root launch helper
+            # has already applied the password before this desktop-user GUI
+            # starts; a non-interactive sudo attempt can therefore fail even
+            # though the service is ready.  Keep this informational instead
+            # of making a healthy Tunnel look broken.
+            if os.name != "nt" and os.geteuid() != 0:
+                self._add_log("info", "RustDesk 被控端由启动脚本配置；如需更新密钥，请以 root 运行 run-gui.sh。")
+            else:
+                self._add_log("error", "RustDesk 被控端启动失败：" + str(error))
+
+    def _stop_rustdesk_host(self):
+        if self._rustdesk is None:
+            return
+        try:
+            self._rustdesk.stop()
+        finally:
+            self._rustdesk_host_started = False
+
+    def _sync_rustdesk_host(self, text):
+        """Make the RustDesk host follow the Tunnel remote_desktop setting."""
+        try:
+            document = json.loads(text)
+        except (TypeError, ValueError):
+            return
+        remote = document.get("remote_desktop")
+        enabled = isinstance(remote, dict) and remote.get("enabled") is True
+        if enabled:
+            self._start_rustdesk_host(text)
+        elif self._rustdesk_host_started:
+            self._stop_rustdesk_host()
 
     def _stop(self):
         with self._configuration_lock():
@@ -359,6 +455,7 @@ class Controller:
     def _stop_locked(self):
         self._phase = "stopping"
         try:
+            self._stop_rustdesk_host()
             self._background.stop()
         except Exception as error:
             self._error = "后台服务尚未完成停止，请重试断开：" + str(error)
@@ -366,7 +463,6 @@ class Controller:
         self._refresh_background()
         self._phase = "stopped"
         self._error = ""
-        self._detach_on_close = False
         return {"message": "已断开"}
 
     def state(self):
@@ -388,9 +484,12 @@ class Controller:
                 if key not in self._remote_log_seen:
                     self._add_log("info", "远程桌面：" + key[1])
             self._remote_log_seen = current
+            rustdesk = self._rustdesk.status() if self._rustdesk is not None else {"available": False, "running": False}
             return {"phase": self._phase, "error": self._error, "status": self._status,
                     "logs": list(self._logs), "config_path": str(self.path), "platform": platform.system(),
                     "remote_desktop": remote,
+                    "rustdesk": rustdesk,
+                    "basic_mode": self._basic_mode,
                     "status_stale": self._last_status is not None and time.monotonic() - self._last_status > 3}
 
     def request(self, message):
@@ -432,8 +531,48 @@ class Controller:
                             data = self._validate(text)
                     elif action == "stop":
                         data = self._stop()
-                    elif action in ("remote_connect", "remote_disconnect", "remote_trust", "remote_authorize", "remote_reject", "remote_revoke", "remote_terminate"):
+                    elif action in ("remote_connect", "remote_vnc_connect", "remote_disconnect", "remote_terminate"):
                         data = self._background.request(action, payload)
+                    elif action == "rustdesk_status":
+                        data = self._rustdesk.status() if self._rustdesk is not None else {"available": False, "running": False}
+                    elif action == "rustdesk_connect":
+                        if self._rustdesk is None:
+                            raise ValueError("基础模式未启用 RustDesk。")
+                        if self._phase != "running":
+                            raise ValueError("请先连接 Tunnel，再启动 RustDesk 连接。")
+                        target = payload.get("target")
+                        network = payload.get("network")
+                        try:
+                            target_ip = ipaddress.ip_address(str(target).strip())
+                            tunnel_network = ipaddress.ip_network(str(network).strip(), strict=False)
+                        except ValueError:
+                            raise ValueError("请选择有效的虚拟网络，并填写对端虚拟 IP。") from None
+                        if target_ip.version != tunnel_network.version or target_ip not in tunnel_network:
+                            raise ValueError("对端虚拟 IP 不属于所选 Tunnel 网络。")
+                        port = payload.get("port", 21118)
+                        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                            raise ValueError("RustDesk 直连端口无效。")
+                        try:
+                            with socket.create_connection((str(target_ip), port), timeout=2):
+                                pass
+                        except OSError:
+                            raise ValueError(
+                                f"无法连接 {target_ip}:{port}。请确认对端 Tunnel 已连接，并在对端 RustDesk 开启直连 IP。"
+                            ) from None
+                        data = self._rustdesk.connect(payload.get("target"), payload.get("password"))
+                        self._add_log("info", "RustDesk 已启动连接：" + str(data.get("target", "")))
+                    elif action == "rustdesk_host":
+                        if self._rustdesk is None:
+                            raise ValueError("基础模式未启用 RustDesk。")
+                        if self._phase != "running":
+                            raise ValueError("请先连接 Tunnel，再启动 RustDesk 被控端。")
+                        data = self._rustdesk.host(payload.get("password"))
+                        self._add_log("info", "RustDesk 被控端已启动")
+                    elif action == "rustdesk_stop":
+                        if self._rustdesk is None:
+                            data = {"stopped": []}
+                        else:
+                            data = self._rustdesk.stop(payload.get("pid"))
                     else:
                         raise ValueError("不支持的操作。")
             return json.dumps({"ok": True, "data": data}, ensure_ascii=False)
@@ -444,10 +583,9 @@ class Controller:
         with self._operation:
             self._closed = True
             try:
+                if self._rustdesk is not None:
+                    self._rustdesk.close()
                 self._refresh_background()
-                if self._detach_on_close and self._background.is_running():
-                    self._background.request("remote_disconnect", {})
-                    return True
                 self._stop()
                 return True
             except ValueError:

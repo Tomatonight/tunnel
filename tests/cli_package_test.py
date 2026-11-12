@@ -14,7 +14,7 @@ from remote_desktop.host import BackgroundHost
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--executable', type=Path, default=ROOT / 'build/gui/TunnelUI/TunnelCtl.exe')
+    parser.add_argument('--executable', type=Path, default=ROOT / 'build/gui/TunnelUI-live/TunnelCtl.exe')
     args = parser.parse_args()
     executable = args.executable.resolve(strict=True)
     binary = executable.parent / 'tunnel.exe'

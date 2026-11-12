@@ -9,6 +9,8 @@ import threading
 
 
 class CoreBridge:
+    CONFIG_TIMEOUT = 30
+
     def __init__(self, binary, config_path, status_path, log_path, extra_args=()):
         self.pending = {}
         self.lock = threading.RLock()
@@ -18,11 +20,16 @@ class CoreBridge:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.log_path.write_text("", encoding="utf-8")
-        self.process = subprocess.Popen([str(binary), str(config_path), "--stdio-control",
-            "--status-file", str(status_path), *extra_args], cwd=str(Path(binary).parent),
+        command = [str(binary), str(config_path), "--stdio-control",
+                   "--status-file", str(status_path), *extra_args]
+        options = ({"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+                   if os.name == "nt" else {"start_new_session": True})
+        self.process = subprocess.Popen(command, cwd=str(Path(binary).parent),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
-            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+            **options)
+        self._closed = False
+        self._close_lock = threading.Lock()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
@@ -39,7 +46,8 @@ class CoreBridge:
                     except (ValueError, queue.Full):
                         pass
                 else:
-                    self.logs.append(line.rstrip())
+                    message = line.rstrip()
+                    self.logs.append(message)
                     log.write(line)
                     log.flush()
             with self.lock:
@@ -62,7 +70,15 @@ class CoreBridge:
         target = queue.Queue(maxsize=1)
         with self.lock:
             if self.process.poll() is not None:
-                raise RuntimeError("Tunnel core is not running")
+                # Preserve the native startup diagnostic.  Without this, a
+                # TUN permission failure is followed by the much less useful
+                # generic "core is not running" message from the next RPC.
+                detail = "Tunnel core is not running"
+                for line in reversed(self.logs):
+                    if line.strip():
+                        detail += ": " + line.strip()
+                        break
+                raise RuntimeError(detail)
             if len(self.pending) >= 32:
                 raise RuntimeError("Too many pending tunnel requests")
             self.serial += 1
@@ -82,7 +98,7 @@ class CoreBridge:
             # A configuration commit cannot be abandoned on a client timer:
             # the protocol thread could still commit it after we report failure.
             # EOF/process exit wakes all pending requests through the reader.
-            reply = target.get(timeout=None if method == "config_apply" else 5)
+            reply = target.get(timeout=self.CONFIG_TIMEOUT if method == "config_apply" else 5)
             if not reply.get("ok"):
                 raise ValueError(reply.get("error", "Core RPC failed"))
             return reply["result"]
@@ -93,21 +109,46 @@ class CoreBridge:
                 self.pending.pop(identifier, None)
 
     def close(self):
-        with self.write_lock:
-            if self.process.poll() is None:
-                try:
-                    self.process.stdin.write("STOP\n")
-                    self.process.stdin.flush()
-                except OSError:
-                    pass
-        try:
-            self.process.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            self.process.wait(timeout=5)
-        self.reader.join(timeout=2)
-        for stream in (self.process.stdin, self.process.stdout):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            with self.write_lock:
+                if self.process.poll() is None:
+                    try:
+                        self.process.stdin.write("STOP\n")
+                        self.process.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
             try:
-                stream.close()
-            except OSError:
-                pass
+                self.process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                # The core can spawn helpers for TUN setup.  Kill the whole
+                # process group so a failed shutdown cannot leave children
+                # behind after the GUI has exited.
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   check=False)
+                else:
+                    try:
+                        os.killpg(self.process.pid, 15)
+                    except (OSError, ProcessLookupError):
+                        self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if os.name != "nt":
+                        try:
+                            os.killpg(self.process.pid, 9)
+                        except (OSError, ProcessLookupError):
+                            self.process.kill()
+                    else:
+                        self.process.kill()
+                    self.process.wait(timeout=5)
+            self.reader.join(timeout=2)
+            for stream in (self.process.stdin, self.process.stdout):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass

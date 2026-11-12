@@ -101,7 +101,7 @@ def main():
             assert cli('config', 'show', '--running')['address_server']['reclaim_after'] == 180
             checks.append('reload_external_file_edits')
             offline = folder / 'offline'
-            cli('init', '--address', '127.0.0.1:57001', '--network', '10.77.0.1/24', directory=offline)
+            cli('init', '--bind-address', '127.0.0.1:57001', '--network', '10.77.0.1/24', directory=offline)
             key = folder / 'key.txt'
             key.write_text(secret)
             cli('peer', 'add', '127.0.0.1:57002', '--key-file', str(key), directory=offline)

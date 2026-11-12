@@ -1,6 +1,6 @@
 Tunnel 命令行配置与热加载
 
-Windows程序包：build/gui/TunnelUI/TunnelCtl.exe
+Windows程序包：build/gui/TunnelUI-live/TunnelCtl.exe
 该控制台程序与同目录TunnelUI.exe共用默认配置目录。它不打开GUI，提供配置编辑和后台管理。
 Windows源码入口：python -m tools.tunnel_cli --binary build-reload/tunnel.exe <命令>
 Linux/WSL：build-wsl/gui-venv/bin/python -m tools.tunnel_cli --binary build-wsl-reload/tunnel <命令>
@@ -12,21 +12,22 @@ Linux/WSL：build-wsl/gui-venv/bin/python -m tools.tunnel_cli --binary build-wsl
 
 创建和连接
 
-    python -m tools.tunnel_cli --binary build-reload/tunnel.exe init --address 192.0.2.10:65535 --network 10.1.0.1/24
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe init --bind-address 192.0.2.10:65535 --network 10.1.0.1/24
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe init --no-listen --network 10.1.0.1/24
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.20:65535
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe start
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe status
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe stop
 
-192.0.2.*为示例，必须替换成实际可达地址。peer add会提示输入PSK；也可用--key-file private-key.txt，从文件读取，避免将密钥写入命令历史。
+192.0.2.*为示例，必须替换成实际可达地址。主隧道默认使用65535端口，`--bind-address` 和 `peer add` 可以只填写 IP；需要接收入站连接时也可填写`0.0.0.0:端口`或`[::]:端口`绑定所有网卡。只主动连接其他节点时使用`init --no-listen`，此时不需要本机绑定地址；之后用`peer add`添加对端。peer add会提示输入PSK；也可用--key-file private-key.txt，从文件读取，避免将密钥写入命令历史。
 多网络时添加peer须重复指定--network 10.1.0.0/24，明确授权范围；对端配置相同peer PSK。
-peer add默认使用UDP数据封装；需要TCP时加--transport tcp，例如：
-    python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.30:65535 --transport tcp
-双方均支持TCP且任一端选择tcp时，数据与控制共用已认证的TLS连接；UDP受限时可使用，但丢包重传可能阻塞后续数据。
-选择tcp后对端不支持会报错，不会回退；UDP连接失败也不会自动切换TCP。status的peers[].transport显示实际协商封装。
+peer add默认使用TCP数据封装；需要UDP时加--transport udp，例如：
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer add 192.0.2.30:65535 --transport udp
+双方均支持TCP且任一端选择tcp时，数据与控制共用已认证的TLS连接；UDP可在明确需要时使用。
+选择tcp后对端不支持会报错，不会回退；TCP连接失败也不会自动切换UDP。status的peers[].transport显示实际协商封装。
 从现有完整配置启动：
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe start --config node.json
-停止控制台命令不会停止后台；使用stop显式停止。关闭GUI仍遵守原有的无人值守后台策略。
+停止控制台命令不会停止后台；使用stop显式停止。关闭GUI会停止其管理的后台和核心。
 
 运行时编辑
 
@@ -36,7 +37,7 @@ peer add默认使用UDP数据封装；需要TCP时加--transport tcp，例如：
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe config apply node.json
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /tun_mtu 1300
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /listen/enabled false
-    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /address 192.0.2.11:65535 --string
+    python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /listen/bind_address 192.0.2.11:65535 --string
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe config set /peers/0/transport tcp --string
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe config unset /tun_mtu
     python -m tools.tunnel_cli --binary build-reload/tunnel.exe peer remove 192.0.2.20:65535
@@ -50,7 +51,7 @@ On Linux/WSL the default backend is the kernel device; follow [development.md](d
 省略字段时 Linux 选择 kernel，Windows/macOS/Android 选择 tun；config unset 后核心归一化仍会写出该平台的有效值。
 显式 tun/kernel 在规范化和保存时都会保留；Linux 缺少模块时明确报错，不会自动回退到 TUN。
 
-config set使用JSON Pointer路径，VALUE默认为JSON；字符串可加--string，数组可用/peers/0/address之类路径。
+config set使用JSON Pointer路径，VALUE默认为JSON；字符串可加--string，数组可用/peers/0/endpoint之类路径。
 config show默认隐藏所有shared_key；明确加--show-secrets才输出完整密钥，避免分享其输出。
 config apply加载整份文件，config reload重新加载当前profile/configure.json。编辑命令都会校验、保存，并在后台运行时即时应用；未启动时仅保存。
 network add保留现有peer及监听的网络授权，不自动扩大已有peer权限。移除网络前应先调整引用它的peer、监听、发布和远控配置；有悬空引用时校验拒绝保存。
@@ -73,13 +74,13 @@ Windows程序包和此前手工测试使用的旧核心未替换；旧后台仍�
 - noop：配置未变化，不打断连接。
 - remote：仅远控策略变化；网络连接保留，旧远控授权会话按策略关闭。
 - peers：新增/删除peer，或修改其PSK/网段授权/数据封装，只重建受影响邻接；未修改邻接与有效端到端会话保留。
-- rebuild：设备后端device_backend、公布/监听地址、网络/IP、MTU、地址分配服务、发布网段/SNAT等变更，在相同核心进程内重建网络资源，保留身份密钥，但连接会重新建立。
+- rebuild：设备后端device_backend、绑定地址/监听选项、网络/IP、MTU、地址分配服务、发布网段/SNAT等变更，在相同核心进程内重建网络资源，保留身份密钥，但连接会重新建立。
 
 同一运行中地址分配服务修改公布端点且继续使用同一state_file时，会更新租约文件的服务端点并保留原绑定。
 客户端仍需修改对应服务地址后重连。普通启动不会自动接管另一个服务端点的状态文件。
 
 成功应用表示本机配置和资源已接受，邻接仍需正常认证；不会承诺对端立即可达。
-校验失败不改变运行状态。资源创建失败会尝试恢复旧配置；若旧资源也无法恢复，会明确报错并显示不可用，可再次应用配置或停止后重启。
+校验失败不改变运行状态。资源创建失败会尝试恢复当前运行配置；若资源无法恢复，会明确报错并显示不可用，可再次应用配置或停止后重启。
 持久化失败会恢复旧运行配置；恢复失败也会明确报告。配置提交不因普通请求计时器假报失败，后台存活状态仍可查询。
 
 直接运行原生核心

@@ -228,7 +228,8 @@ struct AddressService::Impl {
     void send(Channel& c, const Json& message) {
         if (c.dead) return;
         try { c.tls->write(wire::frame(message)); flush(c); }
-        catch (...) { close(c, "encrypted control send failed"); }
+        catch (const std::exception& error) { close(c, std::string("encrypted control send failed: ") + error.what()); }
+        catch (...) { close(c, "encrypted control send failed: unknown error"); }
     }
     void make(bool client, const AddressClientConfig* setting, evutil_socket_t fd = EVUTIL_INVALID_SOCKET) {
         std::unique_ptr<Channel> object(new Channel); auto* c = object.get(); c->client = client; c->config = setting;
@@ -236,7 +237,7 @@ struct AddressService::Impl {
         channels.push_back(std::move(object));
         try {
             if (client) {
-                const auto id = "allocation-v1|" + config.listen.address.str() + "|" + c->remote.str();
+                const auto id = "allocation-v1|" + config.listen.bind_address.str() + "|" + c->remote.str();
                 c->tls.reset(new TlsChannel(true, id, [setting](const std::string&) { return setting->shared_key; }));
                 clients[c->remote] = c;
             } else c->tls.reset(new TlsChannel(false, "", [this, c](const std::string& id) {
@@ -259,10 +260,11 @@ struct AddressService::Impl {
             fd = EVUTIL_INVALID_SOCKET; // TcpStream owns accepted_fd, including construction failure.
             c->tcp.reset(new TcpStream(loop, accepted_fd, options.protect,
                 [this, c](const Bytes& bytes) { receive(*c, bytes); },
-                [this, c] { try { c->tls->advance(); flush(*c); } catch (...) { close(*c, "TLS handshake failed"); } },
-                [this, c] { close(*c, "server disconnected or authentication failed"); }));
+                [this, c] { try { c->tls->advance(); flush(*c); } catch (const std::exception& error) { close(*c, std::string("TLS handshake failed: ") + error.what()); } catch (...) { close(*c, "TLS handshake failed: unknown error"); } },
+                [this, c] { const auto reason = c->tcp && !c->tcp->close_reason().empty() ? c->tcp->close_reason() : std::string("TCP connection closed"); close(*c, reason); }));
             if (client) c->tcp->connect(setting->address);
-        } catch (...) { if (fd != EVUTIL_INVALID_SOCKET) evutil_closesocket(fd); close(*c, "connection setup failed"); }
+        } catch (const std::exception& error) { if (fd != EVUTIL_INVALID_SOCKET) evutil_closesocket(fd); close(*c, std::string("connection setup failed: ") + error.what()); }
+        catch (...) { if (fd != EVUTIL_INVALID_SOCKET) evutil_closesocket(fd); close(*c, "connection setup failed: unknown error"); }
     }
     bool validate(const Endpoint& peer, const Network& network, const Endpoint& server, const PublicKey& key,
                   const Json& proof, IpAddress* output) const {
@@ -322,7 +324,7 @@ struct AddressService::Impl {
             if (c.hello || j.at("server") != c.remote.str()) throw std::invalid_argument("invalid allocator welcome");
             c.authority = wire::key(j.at("key")); c.hello = true;
             Json nets = Json::array(); for (const auto& n : c.config->networks) nets.push_back(n.str());
-            send(c, {{"type", "request"}, {"node", config.listen.address.str()}, {"networks", nets}}); return;
+            send(c, {{"type", "request"}, {"node", config.listen.bind_address.str()}, {"networks", nets}}); return;
         }
         if (!c.client && type == "request") {
             if (c.ready || !c.remote.port || (!c.config && config.address_server.shared_key.empty()) || j.at("node") != c.remote.str())
@@ -349,7 +351,7 @@ struct AddressService::Impl {
                 const auto n = Network::parse(proof.at("body").at("network").get<std::string>());
                 Grant g; g.network = n; g.server = c.remote; g.proof = proof;
                 if (std::find(c.config->networks.begin(), c.config->networks.end(), n) == c.config->networks.end() || !seen.insert(n).second ||
-                    !validate(config.listen.address, n, c.remote, c.authority, proof, &g.ip))
+                    !validate(config.listen.bind_address, n, c.remote, c.authority, proof, &g.ip))
                     throw std::invalid_argument("invalid lease proof, expired lease, or clock skew");
                 next.emplace(n, g);
             }
@@ -377,6 +379,7 @@ struct AddressService::Impl {
             while (!c.dead && c.decoder.next(j)) { if (++count > 128) throw std::invalid_argument("too many allocation messages"); message(c, j); }
             flush(c);
         } catch (const std::exception& e) { close(c, e.what()); }
+        catch (...) { close(c, "allocation control message failed: unknown error"); }
     }
     void tick() {
         if (!running) return;
@@ -439,7 +442,7 @@ struct AddressService::Impl {
         for (const auto& c : config.address_clients) if (std::find(c.networks.begin(), c.networks.end(), network) != c.networks.end()) {
             const auto it = clients.find(c.address);
             return it != clients.end() && !it->second->dead && it->second->ready && it->second->grants.count(network) &&
-                validate(config.listen.address, network, c.address, it->second->authority, it->second->grants.at(network).proof, nullptr) &&
+                validate(config.listen.bind_address, network, c.address, it->second->authority, it->second->grants.at(network).proof, nullptr) &&
                 validate(peer, network, c.address, it->second->authority, proof, ip);
         }
         return false;

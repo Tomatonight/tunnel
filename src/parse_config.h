@@ -30,12 +30,14 @@ struct PeerConfig {
     std::string shared_key;
     std::vector<NetworkConfig> networks;
     // Data encapsulation for this adjacency; control traffic always uses TLS/TCP.
-    std::string transport = "udp";
+    std::string transport = "tcp";
 };
 struct ListenConfig {
     bool enabled = false;
-    Endpoint address;
     Endpoint bind_address;
+    // Nonempty: admit inbound peers that present this shared key without an
+    // explicit peers[] entry. Their network access is limited by networks.
+    std::string shared_key;
     std::vector<NetworkConfig> networks;
 };
 struct AdvertisedRoute {
@@ -48,8 +50,10 @@ struct RemoteDesktopConfig {
     bool configured = false;
     bool enabled = false;
     std::vector<Network> networks;
-    std::string access = "authorized_devices";
-    bool unattended = false;
+    // A non-empty key enables pre-shared-key desktop authentication.  The
+    // native parser enforces this when enabled; an empty key is only valid for
+    // an explicitly disabled remote-desktop block.
+    std::string shared_key;
     unsigned port = 47831;
     std::string device_name;
 };
@@ -76,14 +80,13 @@ struct Configure {
     std::string device_backend = default_device_backend();
 };
 using Config = Configure;
-extern Config g_config;
 class config_error : public std::runtime_error {
 public:
     explicit config_error(const std::string& message) : std::runtime_error(message) {}
 };
 Configure parse_config(const std::string& text);
 Configure parse_config_file(const std::string& path);
-// Emit the simplified schema, preserving the exact network authorization sets.
+// Emit the canonical schema, preserving the exact network authorization sets.
 // Configuration text contains peer secrets; callers must store it privately.
 std::string serialize_config(const Configure& config);
 Configure load_config(const std::string& path);

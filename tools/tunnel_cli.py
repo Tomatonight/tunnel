@@ -28,7 +28,7 @@ def redact(value):
 
 def pointer(document, path, value=None, remove=False):
     if not path.startswith('/') or path == '/':
-        raise ValueError('Use a JSON pointer, for example /tun_mtu or /peers/0/address')
+        raise ValueError('Use a JSON pointer, for example /tun_mtu or /peers/0/endpoint')
     parts = path[1:].split('/')
     for part in parts:
         import re
@@ -75,6 +75,35 @@ def network_refs(document):
     return list(dict.fromkeys(refs))
 
 
+def canonical_endpoint(value):
+    """Parse a CLI endpoint using the core's fixed default transport port."""
+    text = str(value).strip()
+    if not text:
+        raise ValueError('Endpoint must be a nonempty IP address')
+    if text.startswith('['):
+        closing = text.find(']')
+        if closing <= 1 or (len(text) > closing + 1 and text[closing + 1] != ':'):
+            raise ValueError('Invalid endpoint; use IP[:PORT] or [IPv6]:PORT')
+        host = text[1:closing]
+        port_text = text[closing + 2:] if len(text) > closing + 1 else '65535'
+    elif text.count(':') == 0:
+        host, port_text = text, '65535'
+    elif text.count(':') == 1:
+        host, port_text = text.rsplit(':', 1)
+    else:
+        host, port_text = text, '65535'
+    try:
+        address = ipaddress.ip_address(host)
+        port = int(port_text)
+    except (ValueError, TypeError):
+        raise ValueError('Invalid endpoint; use IP[:PORT] or [IPv6]:PORT') from None
+    if not 1 <= port <= 65535:
+        raise ValueError('Endpoint port must be between 1 and 65535')
+    if address.is_unspecified or address.is_multicast:
+        raise ValueError('Peer endpoint must be a unicast IP address')
+    return f'[{address}]:{port}' if address.version == 6 else f'{address}:{port}'
+
+
 def freeze_network_permissions(document):
     """Adding an address must not silently give existing peers a new network."""
     refs = network_refs(document)
@@ -92,10 +121,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else ROOT / 'build'
     parser.add_argument('--binary', type=Path, default=base / ('tunnel.exe' if os.name == 'nt' else 'tunnel'))
-    parser.add_argument('--config-dir', type=Path, help='Same private profile directory used by the GUI')
+    parser.add_argument('--config-dir', type=Path, help='Configuration directory (default: the application/project directory)')
     commands = parser.add_subparsers(dest='command', required=True)
     initialize = commands.add_parser('init', help='Create a new profile; does not start it')
-    initialize.add_argument('--address', required=True)
+    bind = initialize.add_mutually_exclusive_group()
+    bind.add_argument('--bind-address', help='Local tunnel IP (default port 65535); may be IP:PORT, 0.0.0.0:PORT or [::]:PORT')
+    bind.add_argument('--no-listen', action='store_true', help='Disable inbound listening; omit the local bind address')
     initialize.add_argument('--network', action='append', required=True, help='Local tunnel IP/prefix; repeat for several networks')
     start = commands.add_parser('start', help='Start core and optional desktop service in the background')
     start.add_argument('--config', type=Path, help='Import this complete JSON configuration before starting')
@@ -119,18 +150,20 @@ def main(argv=None):
     unset.add_argument('path')
     peers = commands.add_parser('peer').add_subparsers(dest='operation', required=True)
     add = peers.add_parser('add', help='Add a peer; prompts for its PSK unless --key-file is supplied')
-    add.add_argument('address')
+    add.add_argument('address', help='Peer IP (default port 65535), or IP:PORT')
     add.add_argument('--key-file', type=Path)
     add.add_argument('--network', action='append', help='Allowed canonical tunnel network; repeat as needed')
-    add.add_argument('--transport', choices=('udp', 'tcp'), default='udp', help='Data encapsulation preference; UDP by default, TCP if either endpoint requests it')
+    add.add_argument('--transport', choices=('udp', 'tcp'), default='tcp', help='Data encapsulation preference; TCP by default, or UDP when explicitly selected')
     remove = peers.add_parser('remove')
-    remove.add_argument('address')
+    remove.add_argument('address', help='Peer IP (default port 65535), or IP:PORT')
     networks = commands.add_parser('network').add_subparsers(dest='operation', required=True)
     add = networks.add_parser('add', help='Add a static local IP/prefix; existing peer permissions stay unchanged')
     add.add_argument('address')
     remove = networks.add_parser('remove', help='Remove a static IP/prefix; dependent permissions must first be changed')
     remove.add_argument('address')
     args = parser.parse_args(arguments)
+    if args.command == 'init' and not args.bind_address and not args.no_listen:
+        parser.error('init requires --bind-address or --no-listen')
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
@@ -166,7 +199,8 @@ def main(argv=None):
         if args.command == 'init':
             if controller.path.exists():
                 raise ValueError('Profile already has a configuration; use config apply FILE to replace it')
-            save({'address': args.address, 'networks': args.network, 'peers': []})
+            listen = {'enabled': False} if args.no_listen else {'bind_address': args.bind_address}
+            save({'listen': listen, 'networks': args.network, 'peers': []})
         elif args.command == 'start':
             text = args.config.read_text(encoding='utf-8-sig') if args.config else json.dumps(read_document())
             emit(request('start', text=text))
@@ -196,13 +230,14 @@ def main(argv=None):
         elif args.command == 'peer':
             document = read_document()
             peers = document.setdefault('peers', [])
-            matches = [item for item in peers if item['address'] == args.address]
+            endpoint = canonical_endpoint(args.address)
+            matches = [item for item in peers if canonical_endpoint(item['endpoint']) == endpoint]
             if args.operation == 'add':
                 if matches:
                     raise ValueError('Peer already exists; use config set to update it')
                 secret = args.key_file.read_text(encoding='utf-8').rstrip('\r\n') if args.key_file else getpass.getpass('Peer PSK: ')
-                entry = {'address': args.address, 'shared_key': secret}
-                if args.transport != 'udp':
+                entry = {'endpoint': endpoint, 'shared_key': secret}
+                if args.transport != 'tcp':
                     entry['transport'] = args.transport
                 if args.network:
                     entry['networks'] = args.network
@@ -210,7 +245,7 @@ def main(argv=None):
             else:
                 if not matches:
                     raise ValueError('Peer was not found')
-                document['peers'] = [item for item in peers if item['address'] != args.address]
+                document['peers'] = [item for item in peers if canonical_endpoint(item['endpoint']) != endpoint]
             save(document)
         elif args.command == 'network':
             document = read_document()

@@ -2,10 +2,30 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   const MAX_CONFIG_BYTES = 1024 * 1024;
+  const DEFAULT_TUNNEL_PORT = 65535;
+  function tunnelEndpoint(value) {
+    const text = String(value == null ? "" : value).trim();
+    if (!text) return "";
+    if (text[0] === "[") return text.includes("]:") ? text : text + ":" + DEFAULT_TUNNEL_PORT;
+    if (!text.includes(":")) return text + ":" + DEFAULT_TUNNEL_PORT;
+    // An unbracketed IPv6 address has several colons and no port separator.
+    if (text.indexOf(":") !== text.lastIndexOf(":")) return "[" + text + "]:" + DEFAULT_TUNNEL_PORT;
+    return text;
+  }
+  function tunnelEndpointDisplay(value) {
+    const text = String(value == null ? "" : value).trim();
+    if (!text) return "";
+    const ipv6 = text.match(/^\[([^\]]+)\]:65535$/);
+    if (ipv6) return ipv6[1];
+    const ipv4 = text.match(/^([^:]+):65535$/);
+    if (ipv4) return ipv4[1];
+    if (text[0] === "[" && text.endsWith("]")) return text.slice(1, -1);
+    return text;
+  }
   const pageInfo = {
     overview: ["OVERVIEW", "网络概览", "查看节点连接与虚拟网络的实时状态。"],
     config: ["CONFIGURATION", "连接配置", "管理节点、虚拟网络与认证信息。"],
-    remote: ["REMOTE DESKTOP", "远程桌面", "查看与操作虚拟网络中的设备，管理本机远控授权。"],
+    remote: ["REMOTE DESKTOP", "远程桌面", "通过预共享密钥查看与操作虚拟网络中的设备。"],
     logs: ["ACTIVITY", "运行日志", "跟踪连接变化，定位运行问题。"]
   };
   const phaseLabels = { stopped: "已停止", starting: "正在启动", running: "运行中", stopping: "正在停止", error: "运行异常" };
@@ -40,18 +60,27 @@
   let pollFailures = 0;
   let lastLogsSignature = "";
   let configRevision = 0;
+  let formSyncTimer = null;
+  let authorizationTimer = null;
   let formModel = null;
   let jsonPending = false;
   let appliedJSON = "";
   let networkSerial = 0;
   let remoteState = {};
   let remoteSession = null;
+  // Keep a remote connection attempt separate from the global `busy` flag so
+  // the rest of the application remains usable while authentication runs.
+  let remoteConnecting = false;
+  let remoteConnectCancel = false;
+  let remoteRfb = null;
   let remoteFrameTimer;
   let remoteFrameBusy = false;
   let remoteFrameSequence = -1;
   let remoteInputQueue = [];
   let remoteInputBusy = false;
   let remoteSignature = "";
+  let remoteWindowFullscreen = false;
+  let remoteNativeFullscreen = false;
 
   function text(element, value) { element.textContent = String(value == null ? "—" : value); }
   function element(tag, className, value) {
@@ -112,13 +141,17 @@
     const retryStop = state.phase === "stopping" && !!state.error;
     const transitional = state.phase === "starting" || (state.phase === "stopping" && !retryStop);
     const validText = $("config-editor").value.trim().length > 0;
+    renderListenFields();
     const serviceOnly = active ? !!(state.status && !state.status.endpoint && state.status.address_service && state.status.address_service.server && state.status.address_service.server.enabled) : !!(formModel && formModel.serverOnly);
-    $("connection-button").disabled = !bridgeReady || busy || transitional || (!active && !validText);
+    // A raw JSON edit must be applied to the form before it can start a
+    // connection. Keep disconnect available while a running node has pending
+    // editor text.
+    $("connection-button").disabled = !bridgeReady || busy || transitional || (!active && (!validText || jsonPending));
     $("connection-button").classList.toggle("disconnect", active);
     text($("connection-label"), retryStop ? "重试断开" : state.phase === "starting" ? "正在启动" : state.phase === "stopping" ? "正在停止" : active ? serviceOnly ? "停止服务" : "断开网络" : serviceOnly ? "启动服务" : "连接网络");
     $("reload-config").disabled = !bridgeReady || busy;
     $("validate-config").disabled = !bridgeReady || busy || !validText;
-    $("save-config").disabled = !bridgeReady || busy || transitional || !validText;
+    $("save-config").disabled = !bridgeReady || busy || transitional || !validText || jsonPending;
     text($("save-config"), active ? "保存并应用" : "保存配置");
     text($("config-apply-help"), active ? "运行中保存会立即应用；网络资源变更可能短暂重连。应用失败会显示原因并保留修改，供你继续编辑。" : "连接时会校验并保存当前配置。运行中也可以保存并应用修改，无需手动断开。");
     $("clear-logs").disabled = !bridgeReady || busy || logs.length === 0;
@@ -130,11 +163,11 @@
     $("basic-config-fields").hidden = !!(formModel && formModel.serverOnly);
     $("advanced-config-fields").hidden = !!(formModel && formModel.serverOnly);
     $("address-service-fields").disabled = busy || jsonPending || !formModel;
-    for (const id of ["merge-access", "replace-access", "copy-access-export"]) $(id).disabled = busy || !bridgeReady;
+    for (const id of ["merge-access", "replace-access", "copy-access-export"]) $(id).disabled = busy || !bridgeReady || jsonPending;
     $("apply-json").disabled = !bridgeReady || busy || !validText || !jsonPending;
     $("discard-json").disabled = busy || !jsonPending;
     $("json-pending-notice").hidden = !jsonPending;
-    document.querySelectorAll(".generate-key,.export-access").forEach((button) => { button.disabled = !bridgeReady || busy; });
+    document.querySelectorAll(".generate-key,.export-access").forEach((button) => { button.disabled = !bridgeReady || busy || jsonPending; });
     $("access-import-text").readOnly = busy; $("choose-access-file").disabled = busy;
     $("add-subnet").disabled = busy || androidHost();
     $("subnet-android-notice").hidden = !androidHost();
@@ -143,13 +176,24 @@
     $("remote-platform-notice").hidden = !androidHost();
     $("remote-save").disabled = !bridgeReady || busy || transitional || jsonPending || !formModel || formModel.serverOnly || androidHost();
     text($("remote-save"), active ? "保存并应用" : "保存远控设置");
-    $("remote-connect").disabled = !bridgeReady || busy || state.phase !== "running" || !!remoteSession || androidHost();
+    const remotePort = Number($("remote-target-port").value || 21118);
+    const rustdeskTargetReady = !!$("remote-target").value.trim() && !!$("remote-target-network").value;
+    const remoteTargetReady = rustdeskTargetReady && !!$("remote-target-shared-key").value.trim() && Number.isInteger(remotePort) && remotePort >= 1 && remotePort <= 65535;
+    $("remote-connect").disabled = !bridgeReady || busy || state.phase !== "running" || (!!remoteSession && !remoteConnecting) || androidHost() || (!remoteTargetReady && !remoteConnecting);
+    text($("remote-connect"), remoteConnecting ? "取消连接" : "连接桌面");
+    const rustdesk = state.rustdesk || {};
+    $("rustdesk-connect").disabled = !bridgeReady || busy || state.phase !== "running" || androidHost() || !rustdeskTargetReady || !rustdesk.available;
+    $("rustdesk-host").disabled = !bridgeReady || busy || androidHost() || !formModel || !formModel.remote.enabled || !formModel.remote.sharedKey.trim() || !rustdesk.available;
+    text($("rustdesk-message"), rustdesk.available
+      ? "RustDesk 已发现；Tunnel 只负责虚拟网络和节点认证。"
+      : "未找到 RustDesk。请安装 RustDesk，或设置 TUNNEL_RUSTDESK_BIN 后重启 GUI。");
     if (androidHost()) text($("remote-message"), "本版远程桌面需要 Windows、Linux 或 macOS 桌面宿主。Android 可继续使用隧道网络。");
     $("remote-android-configuration").hidden = !(androidHost() && formModel && formModel.remote.enabled);
     $("remote-remove-unsupported").disabled = busy || jsonPending || !formModel;
     $("remote-refresh").disabled = !bridgeReady || busy;
   }
   function editorChanged(fromForm = false) {
+    if (!fromForm && formSyncTimer !== null) { clearTimeout(formSyncTimer); formSyncTimer = null; }
     configRevision += 1;
     if (!fromForm) jsonPending = $("config-editor").value !== appliedJSON || !formModel;
     const value = $("config-editor").value;
@@ -162,6 +206,10 @@
     updateControls();
   }
   function configuration(allowRaw = false) {
+    // Text inputs coalesce their form-to-JSON update on the next turn so a
+    // long peer list cannot make every keystroke rebuild the whole editor.
+    flushAuthorizationRender();
+    if (!allowRaw || !jsonPending) flushFormSync();
     if (!allowRaw && jsonPending) throw new Error("请先将 JSON 修改应用到表单，再保存或连接。");
     const value = $("config-editor").value;
     if (!value.trim()) throw new Error("请先载入或填写配置。");
@@ -235,7 +283,11 @@
     };
     if (!ip.includes(":")) {
       const parts = ipv4(ip); if (!parts || prefix > 32) return null;
-      return parts.map((part, index) => { const bits = Math.min(8, Math.max(0, prefix - index * 8)); return part & (bits ? (255 << (8 - bits)) : 0); }).join(".") + "/" + prefix;
+      return parts.map((part, index) => {
+        const bits = Math.min(8, Math.max(0, prefix - index * 8));
+        const mask = bits ? ((255 << (8 - bits)) & 255) : 0;
+        return part & mask;
+      }).join(".") + "/" + prefix;
     }
     if (prefix > 128 || /[^a-fA-F0-9:.]/.test(ip)) return null;
     let value = ip;
@@ -251,7 +303,11 @@
     if (!left.concat(right).every((word) => /^[a-fA-F0-9]{1,4}$/.test(word)) ||
         (halves.length === 1 ? count !== 8 : count >= 8)) return null;
     const words = left.map((word) => parseInt(word, 16)).concat(halves.length === 2 ? Array(8 - count).fill(0) : [], right.map((word) => parseInt(word, 16)));
-    const masked = words.map((word, index) => { const bits = Math.min(16, Math.max(0, prefix - index * 16)); return word & (bits ? (65535 << (16 - bits)) : 0); });
+    const masked = words.map((word, index) => {
+       const bits = Math.min(16, Math.max(0, prefix - index * 16));
+       const mask = bits ? ((65535 << (16 - bits)) & 65535) : 0;
+       return word & mask;
+     });
     let best = -1, length = 1;
     for (let i = 0; i < 8;) {
       if (masked[i] !== 0) { i += 1; continue; }
@@ -264,8 +320,8 @@
   function blankModel() {
     return { address: "", networks: [{ id: ++networkSerial, cidr: "" }], peers: [], clients: [], published: [], serverOnly: false,
       server: { enabled: false, address: "", bind: "", mode: "shared", key: "", exportAddress: "", stateFile: "address-leases.json", reclaim: "86400", pools: [{ id: ++networkSerial, cidr: "" }], clients: [] },
-      listenEnabled: true, bind: "", listenAll: true, listenIds: new Set(), tunMtu: "1280", transportMtu: "1500", deviceBackend: "auto",
-      remote: { present: false, enabled: false, access: "authorized_devices", unattended: false, name: "", port: "47831", ids: new Set() } };
+      listenEnabled: true, bind: "", listenKey: "", listenAll: true, listenIds: new Set(), tunMtu: "1280", transportMtu: "1500", deviceBackend: "auto",
+      remote: { present: false, enabled: false, sharedKey: "", name: "", port: "47831", ids: new Set() } };
   }
   function localNetworks(model = formModel) {
     return model.networks.concat(model.clients.flatMap((client) => client.networks.map((network) => ({ ...network, managed: true }))));
@@ -274,15 +330,30 @@
     const object = (value, allowed, name) => {
       if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !allowed.includes(key))) throw new Error(name + " 包含表单无法表达的字段；已保留完整 JSON。");
     };
-    object(doc, ["endpoint", "networks", "peers", "listen", "tun_mtu", "transport_mtu", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"], "配置");
-    const onlyServer = doc.address_server !== undefined && doc.endpoint === undefined && doc.networks === undefined &&
+    object(doc, ["networks", "peers", "listen", "tun_mtu", "transport_mtu", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"], "配置");
+    const onlyServer = doc.address_server !== undefined && doc.networks === undefined &&
       doc.peers === undefined && doc.listen === undefined && doc.address_clients === undefined;
-    if (!onlyServer && typeof doc.endpoint !== "string") throw new Error("endpoint format invalid");
+    const listen = doc.listen || {};
+    if (doc.listen !== undefined) {
+      object(doc.listen, ["enabled", "bind_address", "shared_key", "networks"], "监听设置");
+      if (doc.listen.enabled !== undefined && typeof doc.listen.enabled !== "boolean") throw new Error("监听开关必须为布尔值。");
+      if (doc.listen.bind_address !== undefined && typeof doc.listen.bind_address !== "string") throw new Error("绑定地址必须是文本。");
+      if (doc.listen.shared_key !== undefined && (typeof doc.listen.shared_key !== "string" || !doc.listen.shared_key)) throw new Error("监听共享密钥不能为空。");
+    }
+    // Omitting listen is the concise outbound-only form.  An explicit
+    // listen block keeps the historical default of enabled=true.
+    const listenEnabled = doc.listen === undefined ? false : listen.enabled !== false;
+    if (!onlyServer && listenEnabled && typeof listen.bind_address !== "string")
+      throw new Error("已开启监听时必须填写本机绑定地址；关闭监听后可以只配置对端节点。");
     const networkList = (value, name) => {
       if (!Array.isArray(value) || !value.every((cidr) => typeof cidr === "string" && subnetReference(cidr))) throw new Error(name + " 必须是有效的 CIDR 列表。");
       return value.map((cidr) => ({ id: ++networkSerial, cidr }));
     };
-    const model = blankModel(); model.address = doc.endpoint || "";
+    const model = blankModel();
+    // The form uses one concrete local address for both binding and peer access.
+    model.listenEnabled = listenEnabled;
+    model.address = onlyServer ? "" : (typeof listen.bind_address === "string" ? tunnelEndpointDisplay(listen.bind_address) : "");
+    model.bind = (typeof listen.bind_address === "string" ? tunnelEndpointDisplay(listen.bind_address) : "") || model.address;
     if (doc.device_backend !== undefined && !["tun", "kernel"].includes(doc.device_backend)) throw new Error("隧道设备必须选择 tun 或 kernel。");
     model.deviceBackend = doc.device_backend || "auto";
     model.networks = networkList(doc.networks || [], "本机网络");
@@ -310,15 +381,22 @@
     };
     if (doc.remote_desktop !== undefined) {
       const remote = doc.remote_desktop;
-      object(remote, ["enabled", "networks", "access", "unattended", "port", "device_name"], "远程桌面");
+      if (remote && typeof remote === "object" && !Array.isArray(remote)) {
+        const legacy = ["access", "approval_required", "unattended"].filter((key) => Object.prototype.hasOwnProperty.call(remote, key));
+        if (legacy.length) throw new Error("远程桌面已改为预共享密钥认证；请删除旧字段 " + legacy.join("、") + " 后再导入。");
+      }
+      // Remote desktop authentication is deliberately PSK-only.  The old
+      // approval/access fields are no longer part of the configuration
+      // schema; rejecting them here keeps the browser form aligned with the
+      // core parser instead of silently weakening authentication.
+      object(remote, ["enabled", "networks", "shared_key", "port", "device_name"], "远程桌面");
       if ((remote.enabled !== undefined && typeof remote.enabled !== "boolean") ||
-          (remote.unattended !== undefined && typeof remote.unattended !== "boolean") ||
-          (remote.access !== undefined && !["authorized_devices", "all_tunnel_nodes"].includes(remote.access)) ||
+          (remote.shared_key !== undefined && (typeof remote.shared_key !== "string" || (remote.enabled === true && !remote.shared_key.trim()))) ||
           (remote.port !== undefined && (!Number.isInteger(remote.port) || remote.port < 1 || remote.port > 65535)) ||
           (remote.device_name !== undefined && typeof remote.device_name !== "string")) throw new Error("远程桌面配置格式不正确。");
-      if (remote.enabled && remote.networks === undefined && localNetworks(model).length !== 1) throw new Error("多个虚拟网络时，需要明确选择远控范围。");
-      model.remote = { present: true, enabled: remote.enabled === true, access: remote.access || "authorized_devices", unattended: remote.unattended === true,
-        name: remote.device_name || "", port: String(remote.port || 47831), ids: remote.networks === undefined ? new Set(localNetworks(model).length === 1 ? [localNetworks(model)[0].id] : []) : ids(remote.networks) };
+      if (remote.enabled && !String(remote.shared_key || "").trim()) throw new Error("开启远程桌面必须填写预共享密钥。");
+      if (remote.enabled && remote.networks === undefined && localNetworks(model).length !== 1) throw new Error("配置多个虚拟网络时，必须明确选择远程桌面的网络范围。");
+      model.remote = { present: true, enabled: remote.enabled === true, sharedKey: remote.shared_key || "", name: remote.device_name || "", port: String(remote.port || 47831), ids: remote.networks === undefined ? new Set(localNetworks(model).length === 1 ? [localNetworks(model)[0].id] : []) : ids(remote.networks) };
     } else if (localNetworks(model).length === 1) model.remote.ids.add(localNetworks(model)[0].id);
     if (doc.address_server !== undefined) {
       const service = doc.address_server;
@@ -333,29 +411,26 @@
       model.server.clients = (service.clients || []).map((client) => {
         object(client, ["address", "shared_key", "networks"], "授权接入节点");
         if (typeof client.address !== "string" || typeof client.shared_key !== "string") throw new Error("授权节点地址或密钥格式不正确。");
-        return { address: client.address, key: client.shared_key, ids: ids(client.networks, model.server.pools) };
+        return { address: tunnelEndpointDisplay(client.address), key: client.shared_key, ids: ids(client.networks, model.server.pools) };
       });
     }
     model.serverOnly = !model.address && model.server.enabled;
-    if (!model.serverOnly && (!model.address || !localNetworks(model).length)) throw new Error("本机需要公布地址及手动或自动获取的虚拟网络。");
+    if (!model.serverOnly && ((model.listenEnabled && !model.address) || !localNetworks(model).length)) throw new Error("已开启监听时必须填写本机绑定地址，并且至少配置一个虚拟网络。");
+    if (!model.serverOnly && model.clients.length && !model.bind.trim())
+      throw new Error("地址分配客户端需要稳定的本机绑定地址；即使关闭入站监听，也请保留 listen.bind_address。");
     if (doc.peers !== undefined && !Array.isArray(doc.peers)) throw new Error("连接节点必须是列表。");
     model.peers = (doc.peers || []).map((peer) => {
       object(peer, ["endpoint", "shared_key", "networks", "transport"], "节点");
       if (typeof peer.endpoint !== "string" || typeof peer.shared_key !== "string") throw new Error("节点地址或共享密钥格式不正确。");
       if (peer.transport !== undefined && !["udp", "tcp"].includes(peer.transport)) throw new Error("节点的数据封装必须为 udp 或 tcp。");
-      if (peer.networks === undefined && localNetworks(model).length !== 1) throw new Error("多个虚拟网络时，节点必须明确列出允许的网络。");
+      if (peer.networks === undefined && localNetworks(model).length !== 1) throw new Error("配置多个虚拟网络时，必须为节点明确选择允许的网络。");
       const selected = peer.networks === undefined ? new Set([localNetworks(model)[0].id]) : ids(peer.networks);
-      if (!selected.size) throw new Error("节点至少需要一个获授权的虚拟网络。");
-      return { address: peer.endpoint, key: peer.shared_key, transport: peer.transport || "udp", ids: selected };
+      if (!selected.size) throw new Error("节点至少需要授权一个虚拟网络。");
+      return { address: tunnelEndpointDisplay(peer.endpoint), key: peer.shared_key, transport: peer.transport || "tcp", ids: selected };
     });
-    if (doc.listen !== undefined) {
-      object(doc.listen, ["enabled", "bind_address", "networks"], "监听设置");
-      if (doc.listen.enabled !== undefined && typeof doc.listen.enabled !== "boolean") throw new Error("监听开关必须为布尔值。");
-      if (doc.listen.bind_address !== undefined && typeof doc.listen.bind_address !== "string") throw new Error("绑定地址必须是文本。");
-      model.listenEnabled = doc.listen.enabled !== false; model.bind = doc.listen.bind_address || "";
-      model.listenAll = doc.listen.networks === undefined;
-      model.listenIds = model.listenAll ? new Set(localNetworks(model).map((network) => network.id)) : ids(doc.listen.networks);
-    }
+    model.listenKey = listen.shared_key || "";
+    model.listenAll = listen.networks === undefined;
+    model.listenIds = model.listenAll ? new Set(localNetworks(model).map((network) => network.id)) : ids(listen.networks);
     for (const [field, target] of [["tun_mtu", "tunMtu"], ["transport_mtu", "transportMtu"]]) {
       if (doc[field] !== undefined) {
         if (!Number.isInteger(doc[field])) throw new Error("MTU 必须是整数。"); model[target] = String(doc[field]);
@@ -370,7 +445,6 @@
     const doc = {};
     if (model.deviceBackend !== "auto") doc.device_backend = model.deviceBackend;
     if (!model.serverOnly) {
-      doc.endpoint = model.address.trim();
       if (model.networks.length || !model.clients.length) doc.networks = model.networks.map((network) => network.cidr.trim());
       if (model.clients.length) doc.address_clients = model.clients.map((client) => ({ address: client.address.trim(), shared_key: client.key, networks: client.networks.map((network) => network.cidr.trim()) }));
       if (model.published.length) doc.advertise_routes = model.published.map((route) => {
@@ -380,24 +454,36 @@
         return result;
       });
       if (model.remote.present || model.remote.enabled) {
+        if (model.remote.enabled && !model.remote.sharedKey.trim()) throw new Error("开启远程桌面必须填写预共享密钥。");
         const remote = { enabled: model.remote.enabled };
+        // Do not keep a stale secret after the feature is disabled.  The core
+        // accepts an omitted key for disabled remote desktop, and omission
+        // also makes the generated JSON easier to audit.
+        if (model.remote.enabled) remote.shared_key = model.remote.sharedKey.trim();
         if (available.length !== 1 || !model.remote.ids.has(available[0].id)) remote.networks = refs(model.remote.ids);
-        if (model.remote.access !== "authorized_devices") remote.access = model.remote.access;
-        if (model.remote.unattended) remote.unattended = true;
         if (model.remote.name.trim()) remote.device_name = model.remote.name.trim();
         if (model.remote.port !== "" && Number(model.remote.port) !== 47831) remote.port = Number(model.remote.port);
         doc.remote_desktop = remote;
       }
     if (model.peers.length) doc.peers = model.peers.map((peer) => {
-      const result = { endpoint: peer.address.trim(), shared_key: peer.key };
-      if (peer.transport !== "udp") result.transport = peer.transport;
+      const result = { endpoint: tunnelEndpoint(peer.address), shared_key: peer.key };
+      if (peer.transport !== "tcp") result.transport = peer.transport;
       if (available.length !== 1 || !peer.ids.has(available[0].id)) result.networks = refs(peer.ids);
       return result;
     });
     const listen = {};
     if (!model.listenEnabled) listen.enabled = false;
-    if (model.bind.trim()) listen.bind_address = model.bind.trim();
-    if (!model.listenAll) listen.networks = refs(model.listenIds);
+    // An outbound-only node should use an ephemeral/wildcard UDP source. A
+    // hidden loopback bind would make the control connection succeed while
+    // all data-plane probes stay local, so omit listener-only values when the
+    // listener is disabled. Keep a concrete bind for address allocation,
+    // which uses it as the allocator identity.
+    if (model.listenEnabled || model.clients.length) {
+      if (model.bind.trim()) listen.bind_address = tunnelEndpoint(model.bind);
+      else if (model.address.trim()) listen.bind_address = tunnelEndpoint(model.address);
+    }
+    if (model.listenEnabled && model.listenKey.trim()) listen.shared_key = model.listenKey.trim();
+    if (model.listenEnabled && !model.listenAll) listen.networks = refs(model.listenIds);
     if (Object.keys(listen).length) doc.listen = listen;
     const tun = model.tunMtu === "" ? 1280 : Number(model.tunMtu);
     const transport = model.transportMtu === "" ? 1500 : Number(model.transportMtu);
@@ -407,7 +493,7 @@
     if (model.server.enabled) {
       const service = { address: model.server.address.trim(), networks: model.server.pools.map((network) => network.cidr.trim()) };
       if (model.server.mode === "shared") service.shared_key = model.server.key;
-      else service.clients = model.server.clients.map((client) => ({ address: client.address.trim(), shared_key: client.key, networks: refs(client.ids, model.server.pools) }));
+      else service.clients = model.server.clients.map((client) => ({ address: tunnelEndpoint(client.address), shared_key: client.key, networks: refs(client.ids, model.server.pools) }));
       if (model.server.bind.trim()) service.bind_address = model.server.bind.trim();
       if (model.server.stateFile.trim() && model.server.stateFile.trim() !== "address-leases.json") service.state_file = model.server.stateFile.trim();
       const reclaim = model.server.reclaim === "" ? 86400 : Number(model.server.reclaim);
@@ -416,11 +502,32 @@
     }
     return JSON.stringify(doc, null, 2) + "\n";
   }
-  function synchronizeForm(saved = false) {
+  function syncFormNow(saved = false) {
     if (!formModel) return;
     appliedJSON = serializeForm(); $("config-editor").value = appliedJSON; jsonPending = false;
     if (saved) savedText = appliedJSON;
     editorChanged(true);
+  }
+  function flushFormSync() {
+    if (formSyncTimer === null) return;
+    clearTimeout(formSyncTimer); formSyncTimer = null; syncFormNow();
+  }
+  // Discrete controls (selects and checkboxes) must update the JSON editor
+  // before the change event returns.  Text inputs keep the short coalescing
+  // delay in synchronizeForm() so typing remains responsive, while callers
+  // that need an immediate canonical snapshot can use this helper.
+  function synchronizeFormImmediate() {
+    if (!formModel) return;
+    if (formSyncTimer !== null) flushFormSync();
+    else syncFormNow();
+  }
+  function synchronizeForm(saved = false) {
+    if (saved) { flushFormSync(); syncFormNow(true); return; }
+    if (formSyncTimer !== null) return;
+    // Coalesce rapid key events. Updating the full JSON editor and all
+    // dependent controls for every character makes WebView input feel hung
+    // when a peer address is pasted or typed quickly.
+    formSyncTimer = setTimeout(() => { formSyncTimer = null; syncFormNow(); }, 50);
   }
   function acceptNormalized(value, saved = false) {
     const model = modelFromDocument(JSON.parse(value));
@@ -444,8 +551,11 @@
     editorChanged(); feedback((error || "此配置需要校验。") + " 原始 JSON 已保留，请修正后应用到表单。", "failure");
   }
   function inputControl(className, value, placeholder, label, type = "text") {
-    const input = element("input", "form-input " + className); input.type = type; input.value = value;
-    input.placeholder = placeholder; input.autocomplete = "off"; input.spellcheck = false; input.setAttribute("aria-label", label); return input;
+    const secret = type === "password";
+    const input = element("input", "form-input " + className + (secret ? " secret-input" : "")); input.type = "text"; input.value = value;
+    input.placeholder = placeholder; input.autocomplete = "off"; input.spellcheck = false; input.setAttribute("aria-label", label);
+    if (secret) input.dataset.secretVisible = "false";
+    return input;
   }
   function smallButton(label, className, callback) {
     const button = element("button", "button secondary small " + className, label); button.type = "button"; button.addEventListener("click", callback); return button;
@@ -464,7 +574,7 @@
       const update = () => { warning.hidden = localNetworks().some((network) => peer.ids.has(network.id)); };
       choices(card.querySelector(".network-choices"), peer.ids, update); update();
     });
-    $("listen-network-fields").hidden = formModel.listenAll;
+    $("listen-network-fields").hidden = !formModel.listenEnabled || formModel.listenAll;
     choices($("listen-network-fields"), formModel.listenIds, () => {});
     choices($("remote-network-fields"), formModel.remote.ids, () => { formModel.remote.present = true; });
     const oldTarget = $("remote-target-network").value;
@@ -476,19 +586,29 @@
     if (Array.from($("remote-target-network").options).some((option) => option.value === oldTarget)) $("remote-target-network").value = oldTarget;
     renderPublishNetworks();
   }
+  function queueAuthorizationRender() {
+    if (authorizationTimer !== null) clearTimeout(authorizationTimer);
+    authorizationTimer = setTimeout(() => { authorizationTimer = null; renderAuthorization(); }, 50);
+  }
+  function flushAuthorizationRender() {
+    if (authorizationTimer === null) return;
+    clearTimeout(authorizationTimer); authorizationTimer = null; renderAuthorization();
+  }
   function renderForm() {
     if (!formModel) return;
-    $("local-endpoint").value = formModel.address; $("bind-address").value = formModel.bind;
+    $("bind-address").value = formModel.bind;
+    $("listen-shared-key").value = formModel.listenKey;
     $("listen-enabled").checked = formModel.listenEnabled; $("listen-all").checked = formModel.listenAll;
     $("tun-mtu").value = formModel.tunMtu; $("transport-mtu").value = formModel.transportMtu;
     $("device-backend").value = formModel.deviceBackend;
-    $("remote-enabled").checked = formModel.remote.enabled; $("remote-unattended").checked = formModel.remote.unattended;
-    $("remote-access").value = formModel.remote.access; $("remote-device-name").value = formModel.remote.name; $("remote-port").value = formModel.remote.port;
+    $("remote-enabled").checked = formModel.remote.enabled;
+    $("remote-shared-key").value = formModel.remote.sharedKey;
+    $("remote-device-name").value = formModel.remote.name; $("remote-port").value = formModel.remote.port;
     renderRemoteAccess();
     $("network-fields").replaceChildren();
     formModel.networks.forEach((network, index) => {
-      const row = element("div", "network-row"); const input = inputControl("network-cidr", network.cidr, "例如 10.1.0.1/24", "本机虚拟 IP 和前缀 " + (index + 1));
-      input.addEventListener("input", () => { network.cidr = input.value; renderAuthorization(); synchronizeForm(); });
+      const row = element("div", "network-row"); const input = inputControl("network-cidr", network.cidr, "示例：10.1.0.1/24", "本机虚拟 IP 和前缀 " + (index + 1));
+      input.addEventListener("input", () => { network.cidr = input.value; queueAuthorizationRender(); synchronizeForm(); });
       const remove = smallButton("移除", "remove-network", () => {
         formModel.networks = formModel.networks.filter((entry) => entry !== network);
         formModel.peers.forEach((peer) => peer.ids.delete(network.id)); formModel.listenIds.delete(network.id); formModel.remote.ids.delete(network.id);
@@ -502,19 +622,19 @@
       heading.append(element("h4", "", "节点 " + (index + 1)), smallButton("移除节点", "remove-peer", () => {
         formModel.peers = formModel.peers.filter((entry) => entry !== peer); renderForm(); synchronizeForm();
       }));
-      const addressLabel = element("label", "form-field"); const address = inputControl("peer-address", peer.address, "例如 100.0.0.2:65535", "对端传输端点 " + (index + 1));
+      const addressLabel = element("label", "form-field"); const address = inputControl("peer-address", peer.address, "示例：192.168.61.129（默认端口 65535）", "对端 IP 或 IP:端口 " + (index + 1));
       address.addEventListener("input", () => { peer.address = address.value; synchronizeForm(); });
       addressLabel.append(element("span", "", "对端传输端点"), address);
       const transportLabel = element("label", "form-field"); const transport = element("select", "form-input peer-transport");
       transport.setAttribute("aria-label", "数据封装 " + (index + 1));
-      for (const [value, label] of [["udp", "UDP（默认）"], ["tcp", "TCP"]]) { const option = element("option", "", label); option.value = value; transport.append(option); }
+      for (const [value, label] of [["tcp", "TCP（默认）"], ["udp", "UDP"]]) { const option = element("option", "", label); option.value = value; transport.append(option); }
       transport.value = peer.transport;
-      transport.addEventListener("change", () => { peer.transport = transport.value; synchronizeForm(); });
+      transport.addEventListener("change", () => { peer.transport = transport.value; synchronizeFormImmediate(); });
       transportLabel.append(element("span", "", "数据封装"), transport, element("small", "", "任一端选择 TCP 时使用 TCP；双方均需支持。UDP 不通时不会自动切换。"));
       const keyLabel = element("div", "form-field"); keyLabel.append(element("span", "", "共享密钥（双方一致）"));
       const keyControl = element("div", "secret-control"); const key = inputControl("peer-key", peer.key, "填写双方约定的密钥，或生成新密钥", "共享密钥 " + (index + 1), "password");
-      key.autocomplete = "new-password"; key.addEventListener("input", () => { peer.key = key.value; synchronizeForm(); });
-      const show = smallButton("显示", "show-key", () => { key.type = key.type === "password" ? "text" : "password"; text(show, key.type === "password" ? "显示" : "隐藏"); show.setAttribute("aria-pressed", String(key.type === "text")); }); show.setAttribute("aria-pressed", "false");
+      key.addEventListener("input", () => { peer.key = key.value; synchronizeForm(); });
+      const show = smallButton("显示", "show-key", () => { const visible = key.dataset.secretVisible === "true"; key.dataset.secretVisible = String(!visible); key.classList.toggle("secret-input", visible); text(show, visible ? "显示" : "隐藏"); show.setAttribute("aria-pressed", String(!visible)); }); show.setAttribute("aria-pressed", "false");
       const generate = smallButton("生成", "generate-key", () => action(async () => {
         if (peer.key && !window.confirm("生成新密钥会替换当前节点的密钥。双方需使用同一新密钥，是否继续？")) return;
         const data = await request("generate_key"); if (!data || typeof data.key !== "string" || !/^[0-9a-f]{64}$/i.test(data.key)) throw new Error("宿主未返回有效的新密钥。");
@@ -527,6 +647,16 @@
       card.append(heading, addressLabel, keyLabel, transportLabel, authorization); $("peer-fields").append(card);
     });
     renderAddressForms(); renderPublished(); renderAuthorization(); updateControls();
+  }
+  function renderListenFields() {
+    if (!formModel) return;
+    const visible = formModel.listenEnabled;
+    $("bind-address").closest("label").hidden = !visible;
+    $("listen-shared-key").closest("label").hidden = !visible;
+    $("listen-all").closest("label").hidden = !visible;
+    const listenHint = $("listen-all").closest("label").nextElementSibling;
+    if (listenHint) listenHint.hidden = !visible;
+    $("listen-network-fields").hidden = !visible || formModel.listenAll;
   }
   function renderPublishNetworks() {
     if (!formModel) return;
@@ -559,7 +689,7 @@
       prefix.addEventListener("input", () => { route.prefix = prefix.value; synchronizeForm(); }); prefixLabel.append(element("span", "", "内网网段"), prefix);
       const snatLabel = element("label", "check-label"); const snat = element("input", "subnet-snat"); snat.type = "checkbox"; snat.checked = route.snat;
       snat.addEventListener("change", () => { route.snat = snat.checked; synchronizeForm(); }); snatLabel.append(snat, element("span", "", "源地址转换（SNAT）"));
-      card.append(heading, networkLabel, prefixLabel, snatLabel, element("p", "field-hint", "开启后，内网设备看到发布节点的地址；关闭时，内网需有返回虚拟网络的路由。系统不支持时会显示错误。"));
+      card.append(heading, networkLabel, prefixLabel, snatLabel, element("p", "field-hint", "开启后，内网设备看到发布节点的地址；关闭时，内网需要配置返回虚拟网络的路由。系统不支持时，保存或连接会显示错误。"));
       $("subnet-fields").append(card);
     });
     renderPublishNetworks();
@@ -578,9 +708,9 @@
   }
   function serviceKeyField(owner, className, title = "专用共享密钥（双方一致）") {
     const label = element("div", "form-field"); label.append(element("span", "", title));
-    const controls = element("div", "secret-control"); const input = inputControl(className, owner.key, "填写密钥，或生成后交给对应节点", "服务认证共享密钥", "password"); input.autocomplete = "new-password";
+    const controls = element("div", "secret-control"); const input = inputControl(className, owner.key, "填写密钥，或生成后交给对应节点", "服务认证共享密钥", "password");
     input.addEventListener("input", () => { owner.key = input.value; synchronizeForm(); });
-    const show = smallButton("显示", "show-service-key", () => { input.type = input.type === "password" ? "text" : "password"; text(show, input.type === "password" ? "显示" : "隐藏"); show.setAttribute("aria-pressed", String(input.type === "text")); }); show.setAttribute("aria-pressed", "false");
+    const show = smallButton("显示", "show-service-key", () => { const visible = input.dataset.secretVisible === "true"; input.dataset.secretVisible = String(!visible); input.classList.toggle("secret-input", visible); text(show, visible ? "显示" : "隐藏"); show.setAttribute("aria-pressed", String(!visible)); }); show.setAttribute("aria-pressed", "false");
     const generate = smallButton("生成", "generate-key generate-service-key", () => action(async () => {
       if (owner.key && !window.confirm("生成会替换当前密钥，使用它的服务端和客户端都需更新。是否继续？")) return;
       const data = await request("generate_key"); if (!data || typeof data.key !== "string" || !/^[0-9a-f]{64}$/i.test(data.key)) throw new Error("宿主未返回有效的新密钥。");
@@ -622,6 +752,7 @@
       const label = element("label", "form-field"); const input = inputControl("address-client-address", client.address, "例如 100.0.0.1:65534", "分配服务公布地址");
       input.addEventListener("input", () => { client.address = input.value; synchronizeForm(); }); label.append(element("span", "", "分配服务地址"), input);
       const networkTitle = element("div", "service-heading"); networkTitle.append(element("h3", "", "申请网段"), smallButton("＋ 添加网段", "add-requested-network", () => {
+        if (client.networks.length >= 64) { showToast("单个分配服务最多申请 64 个网段。", true); return; }
         client.networks.push({ id: ++networkSerial, cidr: "" }); renderForm(); synchronizeForm();
       }));
       const networks = element("div", "network-fields"); addressNetworkRows(networks, client.networks, "requested-network", removeLocalAuthorization, renderAuthorization);
@@ -636,7 +767,7 @@
     $("shared-service-auth").hidden = server.mode !== "shared";
     $("shared-access-export").hidden = server.mode !== "shared";
     $("individual-service-auth").hidden = server.mode !== "individual";
-    $("shared-client-address").value = server.exportAddress;
+    $("shared-client-address").value = tunnelEndpointDisplay(server.exportAddress);
     $("address-shared-key").replaceChildren(serviceKeyField(server, "address-server-key", "接入密钥（所有客户端使用同一把）"));
     addressNetworkRows($("address-pool-fields"), server.pools, "address-pool", (id) => server.clients.forEach((client) => client.ids.delete(id)), renderServerAuthorization);
     $("authorized-client-fields").replaceChildren();
@@ -645,8 +776,8 @@
       heading.append(element("h4", "", "授权节点 " + (index + 1)), smallButton("移除授权", "remove-authorized-client", () => {
         server.clients = server.clients.filter((item) => item !== client); renderForm(); synchronizeForm();
       }));
-      const label = element("label", "form-field"); const address = inputControl("authorized-client-address", client.address, "例如 100.0.0.2:65535", "授权节点传输端点");
-      address.addEventListener("input", () => { client.address = address.value; synchronizeForm(); }); label.append(element("span", "", "节点传输端点（必须与客户端一致）"), address);
+      const label = element("label", "form-field"); const address = inputControl("authorized-client-address", client.address, "例如 100.0.0.2（默认端口 65535）", "授权节点 IP");
+      address.addEventListener("input", () => { client.address = address.value; synchronizeForm(); }); label.append(element("span", "", "节点绑定 IP（必须与客户端一致）"), address);
       card.append(heading, label, serviceKeyField(client, "authorized-client-key"), element("p", "field-hint", "允许申请的地址池（新增池不会自动授权）"), element("div", "network-choices"),
         smallButton("导出接入配置", "service-export export-access", () => action(() => exportAccess(client))));
       $("authorized-client-fields").append(card);
@@ -657,7 +788,7 @@
     await request("normalize_config", { text: configuration() });
     const server = formModel.server;
     const networkRefs = server.pools.filter((pool) => !client || client.ids.has(pool.id)).map((pool) => subnetReference(pool.cidr) || pool.cidr.trim());
-    const value = JSON.stringify({ endpoint: (client ? client.address : server.exportAddress).trim(), address_clients: [{ address: server.address.trim(), shared_key: client ? client.key : server.key, networks: networkRefs }] }, null, 2) + "\n";
+    const value = JSON.stringify({ listen: { bind_address: tunnelEndpoint(client ? client.address : server.exportAddress) }, address_clients: [{ address: server.address.trim(), shared_key: client ? client.key : server.key, networks: networkRefs }] }, null, 2) + "\n";
     await request("normalize_config", { text: value });
     $("access-export-text").value = value; $("access-export-dialog").showModal();
   }
@@ -669,11 +800,14 @@
       if (!Array.isArray(incoming.address_clients) || !incoming.address_clients.length) throw new Error("此配置没有地址分配客户端设置，请使用常规 JSON 导入。");
       if (merge) {
         const supplied = JSON.parse(raw);
-        const extra = Object.keys(supplied).filter((key) => !["endpoint", "address_clients", "networks", "peers"].includes(key));
+        const extra = Object.keys(supplied).filter((key) => !["listen", "address_clients", "networks", "peers"].includes(key));
         if (extra.length || (supplied.networks && supplied.networks.length) || (supplied.peers && supplied.peers.length)) throw new Error("合并只接受服务端导出的接入配置。完整配置请使用替换操作，原文不会丢失。");
         const current = JSON.parse(configuration());
-        if (current.endpoint && current.endpoint !== incoming.endpoint) throw new Error("接入配置的节点 endpoint 与当前地址不同。请核对地址，或明确选择替换当前配置。");
-        current.endpoint = incoming.endpoint;
+        const incomingBind = incoming.listen && incoming.listen.bind_address;
+        if (typeof incomingBind !== "string") throw new Error("接入配置缺少本机绑定地址。");
+        if (current.listen && current.listen.bind_address && current.listen.bind_address !== incomingBind) throw new Error("接入配置的本机绑定地址与当前配置不同。请核对地址，或明确选择替换当前配置。");
+        current.listen = current.listen || {};
+        current.listen.bind_address = incomingBind;
         if (current.networks) current.networks = current.networks.filter((cidr) => cidr.trim());
         // Freeze old single-network shorthand before adding a managed network.
         (current.peers || []).forEach((peer, index) => {
@@ -774,7 +908,7 @@
     text($("metric-peers"), hasStatus ? peers.filter((peer) => peer.state === 3).length : "—");
     text($("metric-peer-total"), hasStatus ? "/ " + peers.length : "");
     const pending = number(state.status && state.status.pending_connections);
-    text($("metric-peer-note"), !hasStatus ? "等待运行状态" : pending ? pending + " 个连接正在握手" : "邻接需通过控制与数据通道验证");
+    text($("metric-peer-note"), !hasStatus ? "等待运行状态" : pending ? pending + " 个连接正在握手" : "邻接需同时通过控制和数据通道验证");
   }
   function renderRoutes(routes, hasStatus) {
     text($("metric-routes"), hasStatus ? routes.length : "—");
@@ -796,7 +930,7 @@
       fragment.append(row);
     });
     $("routes-body").replaceChildren(fragment);
-    text($("metric-route-note"), ecmp ? ecmp + " 个目的地具有等价下一跳" : "按虚拟网络区分目的节点");
+    text($("metric-route-note"), ecmp ? ecmp + " 个目的地具有等价下一跳" : "按虚拟网络统计目的节点");
   }
   function renderCounters(counters, hasStatus) {
     const entries = Object.entries(counters).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).sort(([a], [b]) => a.localeCompare(b));
@@ -813,7 +947,7 @@
       : number(counters.unicast_forwarded) + number(counters.multicast_forwarded) + number(counters.flood_forwarded);
     text($("metric-forwarded"), hasStatus ? formatNumber(forwarded) : "—");
     const dropped = entries.filter(([key]) => /drop|reject|invalid|oversize/.test(key)).reduce((total, [, value]) => total + value, 0);
-    text($("metric-forward-note"), dropped ? "拒绝 / 丢弃事件 " + formatNumber(dropped) : "协议核心累计计数");
+    text($("metric-forward-note"), dropped ? "拒绝 / 丢弃事件 " + formatNumber(dropped) : "核心累计计数");
   }
   function logLevel(value) {
     const level = String(value || "info").toLowerCase();
@@ -856,6 +990,13 @@
   function renderState(next) {
     if (!next || typeof next !== "object") throw new Error("宿主未返回有效运行状态。");
     state = next;
+    const basicMode = state.basic_mode === true;
+    const remoteNav = document.querySelector('[data-page="remote"]');
+    if (remoteNav) remoteNav.hidden = basicMode;
+    if (basicMode) {
+      $("page-remote").hidden = true;
+      if (location.hash.slice(1) === "remote") location.hash = "overview";
+    }
     if (!Object.prototype.hasOwnProperty.call(phaseLabels, state.phase)) state.phase = "error";
     const status = state.status && typeof state.status === "object" && typeof state.status.running === "boolean" ? state.status : null;
     const stale = state.status_stale === true && !!status;
@@ -882,7 +1023,7 @@
     text($("metric-sessions"), status ? sessions.filter((session) => session.ready === true).length : "—");
     const pendingSessions = sessions.filter((session) => session.ready !== true).length;
     text($("metric-session-note"), pendingSessions ? pendingSessions + " 个端到端会话正在协商" : "端到端会话按需建立");
-    text($("refresh-status"), stale ? "核心状态未更新 · 最后快照" : status ? "最近更新 " + new Date().toLocaleTimeString("zh-CN", { hour12: false }) : "尚无运行状态");
+    text($("refresh-status"), stale ? "核心状态暂未更新 · 显示上次快照" : status ? "最近更新 " + new Date().toLocaleTimeString("zh-CN", { hour12: false }) : "尚无运行状态");
     text($("footer-status"), stale ? "核心状态待更新 · 显示最后快照" : phaseLabels[state.phase] + " · 每秒更新");
     const error = [(typeof state.error === "string" ? state.error : ""), ...overlayErrors,
       stale ? "核心状态已超过 3 秒未更新，以下连接和计数为最后一次快照。" : ""].filter(Boolean).join("\n");
@@ -894,20 +1035,26 @@
     renderLogs(); updateControls();
   }
   function renderRemoteAccess() {
-    text($("remote-access-notice"), formModel.remote.access === "all_tunnel_nodes"
-      ? "所选虚拟网络的有效成员均可控制本机；开启无人值守后无需逐次确认。公网访客与其他网络不在此范围内。"
-      : "仅已授权设备可无人值守连接；新设备的请求在下方确认。关闭无人值守时每次仍需本机批准。");
+    if (!formModel) return;
+    const enabled = !!formModel.remote.enabled;
+    // Keep options that only apply to the local remote desktop service out of
+    // the way while the service is disabled. The enable checkbox remains
+    // visible so the section can be turned back on without losing values.
+    $("remote-disabled-hint").hidden = enabled;
+    $("remote-settings").hidden = !enabled;
+    $("remote-network-settings").hidden = !enabled;
+    $("remote-advanced-settings").hidden = !enabled;
+    text($("remote-access-notice"), enabled ? "远程连接必须提供与本机一致的预共享密钥；连接通过后无需本机批准。" : "开启后使用预共享密钥认证远程桌面连接。");
   }
   function renderRemoteState(value) {
     remoteState = value && typeof value === "object" ? value : {};
     const signature = JSON.stringify(remoteState);
     if (signature === remoteSignature) return;
     remoteSignature = signature;
-    const identity = remoteState.identity || {};
-    text($("remote-identity"), identity.fingerprint ? (identity.name || "本机设备") + " · " + identity.fingerprint : "启动网络后显示本机设备指纹。");
     const enabled = remoteState.enabled === true || !!(remoteState.config && remoteState.config.enabled);
     text($("remote-service-state"), remoteState.error ? "服务异常" : enabled ? "允许连接本机" : "本机被控已关闭");
     $("remote-service-state").className = "service-status-tag " + (remoteState.error ? "failed" : enabled ? "ready" : "");
+    text($("remote-identity"), enabled ? "使用预共享密钥认证；无需对端批准。" : "远控服务未启用。");
     if (remoteState.error) text($("remote-message"), remoteState.error);
     const rows = (id, entries, empty, build) => {
       const container = $(id); container.replaceChildren();
@@ -920,19 +1067,9 @@
         row.append(description); build(row, entry); container.append(row);
       });
     };
-    rows("remote-pending", remoteState.pending, "暂无连接请求。", (row, entry) => {
-      const actions = element("div", "remote-row-actions"); const permission = element("select", "form-input remote-permission"); permission.setAttribute("aria-label", "授予设备权限");
-      for (const [value, label] of [["view", "只查看"], ["control", "查看并控制"]]) { const option = element("option", "", label); option.value = value; permission.append(option); }
-      permission.value = (entry.permission || entry.requested) === "view" ? "view" : "control";
-      const rememberLabel = element("label", "check-label"); const remember = element("input"); remember.type = "checkbox"; remember.checked = true; rememberLabel.append(remember, element("span", "", "记住此设备"));
-      const authorize = smallButton("允许连接", "remote-approve", () => action(async () => { await request("remote_authorize", { request_id: entry.request_id || entry.id, permission: permission.value, remember: remember.checked }); await refreshRemote(); }));
-      const deny = smallButton("拒绝", "remote-deny", () => action(async () => { await request("remote_reject", { request_id: entry.request_id || entry.id }); await refreshRemote(); }));
-      actions.append(permission, rememberLabel, authorize, deny); row.append(actions);
-    });
-    rows("remote-devices", remoteState.devices, "暂无已授权设备。", (row, entry) => {
-      const allNodes = remoteState.config && remoteState.config.access === "all_tunnel_nodes";
-      row.append(smallButton(allNodes ? "移出设备名单" : "撤销授权", "remote-revoke", () => action(async () => { await request("remote_revoke", { fingerprint: entry.fingerprint }); await refreshRemote(); showToast(allNodes ? "已移出名单；当前全网络模式仍允许此节点连接。" : "已撤销授权并终止对应会话。"); })));
-    });
+    // PSK authentication needs no pending request or device authorization
+    // lists.  Keep those legacy containers out of the DOM and only show
+    // currently active sessions for diagnostics and manual termination.
     rows("remote-sessions", remoteState.sessions, "暂无会话。", (row, entry) => {
       row.append(smallButton("终止会话", "remote-terminate", () => action(async () => { await request("remote_terminate", { session_id: entry.session_id || entry.id }); await refreshRemote(); })));
     });
@@ -942,24 +1079,113 @@
     renderRemoteState(await request("remote_state"));
   }
   function sessionId(value) { return value && (value.session_id || value.id); }
+  function wait(milliseconds) { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
+  function remoteViewport() {
+    const screen = $("remote-screen");
+    const rect = screen && screen.getBoundingClientRect ? screen.getBoundingClientRect() : { width: 0, height: 0 };
+    const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+    const cssWidth = rect.width > 0 ? rect.width : Math.min(1920, Math.max(640, (window.innerWidth || 1280) * 0.8));
+    const cssHeight = rect.height > 0 ? rect.height : Math.min(1080, Math.max(360, (window.innerHeight || 720) * 0.7));
+    return { width: Math.max(64, Math.min(3840, Math.round(cssWidth * dpr))),
+      height: Math.max(64, Math.min(2160, Math.round(cssHeight * dpr))) };
+  }
+  async function connectVnc(payload) {
+    let connected;
+    try {
+      connected = await request("remote_vnc_connect", payload);
+    } catch (error) {
+      // Older hosts expose the JPEG desktop protocol only. Keep that path
+      // usable while new hosts roll out the VNC gateway.
+      if (/Unknown remote (?:desktop )?action|unknown action|不支持的操作/.test(error.message || "")) return null;
+      throw error;
+    }
+    if (connected && (connected.trust_required || connected.status === "trust_required"))
+      throw new Error("远程桌面仅支持预共享密钥认证，请在两端填写相同密钥。");
+    const pendingId = sessionId(connected);
+    let attempts = 0;
+    while (connected && ["connecting", "pending"].includes(connected.status) && pendingId && attempts++ < 120) {
+      if (remoteConnectCancel) {
+        await request("remote_disconnect", { session_id: pendingId }).catch(() => {});
+        throw new Error("远程连接已取消。");
+      }
+      text($("remote-message"), "正在完成远程桌面认证…");
+      await wait(500);
+      connected = await request("remote_vnc_connect", { ...payload, session_id: pendingId });
+    }
+    if (remoteConnectCancel && connected && pendingId) {
+      await request("remote_disconnect", { session_id: pendingId }).catch(() => {});
+      throw new Error("远程连接已取消。");
+    }
+    if (connected && ["connecting", "pending"].includes(connected.status)) throw new Error("远程桌面连接超时。");
+    if (connected && ["error", "disconnected"].includes(connected.status)) throw new Error(connected.error || "远程桌面连接失败。");
+    if (connected && connected.status === "connected" && !connected.ws_url) throw new Error("远程 VNC 网关未返回连接地址。");
+    if (!connected || !connected.ws_url) return null;
+    return connected;
+  }
+  function startRemoteVnc(connected) {
+    const api = window.TunnelNoVNC;
+    if (!api || typeof api.RFB !== "function") throw new Error("noVNC 客户端未加载。");
+    const url = new URL(connected.ws_url, window.location.href);
+    if (!["ws:", "wss:"].includes(url.protocol) || !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname))
+      throw new Error("远程 VNC 网关地址无效。");
+    const screen = $("remote-screen");
+    // noVNC owns this container while an RFB session is open. The legacy
+    // JPEG placeholders are recreated by resetRemoteViewer() on disconnect.
+    screen.replaceChildren();
+    const rfb = new api.RFB(screen, url.href, { shared: true });
+    rfb.viewOnly = connected.permission === "view";
+    // The Tunnel RFB gateway intentionally sends full-screen JPEG rectangles
+    // and does not have a platform cursor-shape stream.  Use the browser's
+    // normal arrow cursor over the canvas; the CSS rule keeps noVNC from
+    // replacing it with its dot/hidden cursor fallback.
+    rfb.showDotCursor = false;
+    screen.classList.add("remote-rfb-cursor");
+    rfb.scaleViewport = true;
+    rfb.clipViewport = false;
+    // Ask the authenticated peer to match the available local viewport. The
+    // server preserves the source aspect ratio and caps the request to its
+    // own display, so fullscreen and window resize avoid needless pixels.
+    rfb.resizeSession = true;
+    rfb.qualityLevel = 9;
+    rfb.compressionLevel = 1;
+    rfb.addEventListener("connect", () => {
+      text($("remote-message"), rfb.viewOnly ? "正在查看屏幕，无键鼠控制权限。" : "已连接。点击画面以操作远程键盘与鼠标。");
+    });
+    rfb.addEventListener("disconnect", (event) => {
+      if (remoteRfb !== rfb) return;
+      remoteRfb = null;
+      if (remoteSession) resetRemoteViewer(event.detail && event.detail.clean ? "远程桌面已断开。" : "远程桌面连接已中断。");
+    });
+    rfb.addEventListener("securityfailure", (event) => {
+      if (remoteRfb === rfb) text($("remote-message"), "VNC 安全协商失败：" + ((event.detail && event.detail.reason) || "未知原因"));
+    });
+    remoteRfb = rfb;
+  }
   async function connectRemote() {
     const payload = { address: $("remote-target").value.trim(), tunnel: $("remote-target-network").value,
-      port: Number($("remote-target-port").value || 47831), permission: $("remote-view-only").checked ? "view" : "control" };
-    if (!payload.address || !payload.tunnel) throw new Error("请填写对端虚拟 IP 并选择虚拟网络。");
-    text($("remote-message"), "正在验证对端身份…");
-    let connected = await request("remote_connect", payload);
-    if (connected && connected.trust_required) {
-      const identity = connected.identity || {};
-      if (!identity.fingerprint) throw new Error("对端未提供有效设备指纹。");
-      if (!window.confirm("首次连接此设备，请与对端显示的指纹核对：\n\n" + (identity.name || payload.address) + "\n" + identity.fingerprint + "\n\n确认后记住此设备身份。")) { text($("remote-message"), "已取消身份确认。"); return; }
-      await request("remote_trust", { fingerprint: identity.fingerprint });
-      connected = await request("remote_connect", payload);
+      shared_key: $("remote-target-shared-key").value.trim(),
+      port: Number($("remote-target-port").value || 47831), permission: $("remote-view-only").checked ? "view" : "control",
+      viewport: remoteViewport() };
+    if (!payload.address || !payload.tunnel || !payload.shared_key) throw new Error("请填写对端虚拟 IP、虚拟网络和远程桌面预共享密钥。");
+    text($("remote-message"), "正在验证远程桌面预共享密钥…");
+    let connected = await connectVnc(payload);
+    if (connected) {
+      remoteSession = { ...connected, vnc: true, address: payload.address, permission: connected.permission || payload.permission, payload };
+      $("remote-viewer").hidden = false; text($("remote-viewer-title"), payload.address + (remoteSession.permission === "view" ? " · 仅查看" : " · 远程控制"));
+      text($("remote-message"), "连接已建立，正在打开远程画面…");
+      try { startRemoteVnc(remoteSession); }
+      catch (error) { resetRemoteViewer(error.message || String(error)); throw error; }
+      updateControls();
+      return;
     }
+    connected = await request("remote_connect", payload);
+    if (connected && connected.trust_required)
+      throw new Error("远程桌面仅支持预共享密钥认证，请在两端填写相同密钥。");
     if (!sessionId(connected)) throw new Error(connected && connected.message || "未能建立桌面会话。");
     remoteSession = { ...connected, address: payload.address, permission: connected.permission || payload.permission, payload };
     remoteFrameSequence = -1; $("remote-image").hidden = true; $("remote-frame-wait").hidden = false; $("remote-image").removeAttribute("src");
     $("remote-viewer").hidden = false; text($("remote-viewer-title"), payload.address + (remoteSession.permission === "view" ? " · 仅查看" : " · 远程控制"));
-    text($("remote-message"), connected.pending ? "等待对端批准连接…" : "连接已建立，正在获取画面…");
+    text($("remote-message"), "连接已建立，正在获取画面…");
     remoteFrame(); updateControls();
   }
   async function disconnectRemote() {
@@ -969,42 +1195,171 @@
     await request("remote_disconnect", { session_id: sessionId(previous) });
     resetRemoteViewer("远程桌面已断开。");
   }
+  async function runRemoteConnect() {
+    if (remoteConnecting) {
+      remoteConnectCancel = true;
+      text($("remote-message"), "正在取消远程连接…");
+      updateControls();
+      return;
+    }
+    remoteConnecting = true;
+    remoteConnectCancel = false;
+    updateControls();
+    try {
+      await connectRemote();
+    } catch (error) {
+      if (error.message !== "远程连接已取消。") showToast(error.message || String(error), true);
+      else text($("remote-message"), "远程连接已取消。");
+    } finally {
+      remoteConnecting = false;
+      remoteConnectCancel = false;
+      updateControls();
+    }
+  }
+  async function runRustDeskConnect() {
+    const target = $("remote-target").value.trim();
+    const network = $("remote-target-network").value;
+    const password = $("remote-target-shared-key").value;
+    if (!target || !network) throw new Error("请填写对端虚拟 IP 并选择虚拟网络。");
+    text($("rustdesk-message"), "正在启动 RustDesk…");
+    try {
+      const port = Number($("remote-target-port").value || 21118);
+      const result = await request("rustdesk_connect", { target, network, password, port });
+      text($("rustdesk-message"), "RustDesk 已启动，目标：" + (result.target || target));
+    } catch (error) {
+      text($("rustdesk-message"), error.message || String(error));
+      throw error;
+    }
+  }
+  async function runRustDeskHost() {
+    const password = $("remote-shared-key").value;
+    if (!password) throw new Error("请先填写本机 RustDesk 密码并保存配置。");
+      text($("rustdesk-message"), "正在应用 RustDesk 被控密钥…");
+    try {
+      await request("rustdesk_host", { password });
+      text($("rustdesk-message"), "RustDesk 被控密钥已应用；下次连接 Tunnel 会自动启动被控端。");
+    } catch (error) {
+      text($("rustdesk-message"), error.message || String(error));
+      throw error;
+    }
+  }
+  function syncRemoteFullscreen() {
+    const viewer = $("remote-viewer");
+    if (document.fullscreenElement === viewer) remoteNativeFullscreen = true;
+    // The CSS class is also used as a fallback for WebViews without a native
+    // Fullscreen API. Remove it after a native Escape/exit event so Escape
+    // really restores the normal viewer.
+    if (remoteNativeFullscreen && document.fullscreenElement !== viewer) {
+      remoteNativeFullscreen = false; viewer.classList.remove("expanded");
+    }
+    const active = remoteNativeFullscreen || viewer.classList.contains("expanded");
+    text($("remote-fullscreen"), active ? "退出全屏" : "全屏显示");
+    $("remote-fullscreen").setAttribute("aria-pressed", active ? "true" : "false");
+  }
+  async function toggleRemoteFullscreen() {
+    const viewer = $("remote-viewer");
+    if (document.fullscreenElement === viewer || remoteWindowFullscreen || viewer.classList.contains("expanded")) {
+      if (document.fullscreenElement === viewer) {
+        try { if (document.exitFullscreen) await document.exitFullscreen(); } catch (_) { /* keep the CSS fallback state */ }
+      }
+      remoteNativeFullscreen = false;
+      if (remoteWindowFullscreen) {
+        try { await request("window_fullscreen", { enabled: false }); } catch (_) { /* window may already be closed */ }
+        remoteWindowFullscreen = false;
+      }
+      viewer.classList.remove("expanded");
+      syncRemoteFullscreen();
+      return;
+    }
+    if (viewer.requestFullscreen) {
+      try {
+        await viewer.requestFullscreen();
+        // Keep the class for WebViews that implement the API without exposing
+        // the :fullscreen pseudo-class to page CSS.
+        remoteNativeFullscreen = document.fullscreenElement === viewer;
+        if (remoteNativeFullscreen) {
+          viewer.classList.add("expanded");
+          syncRemoteFullscreen();
+          return;
+        }
+      } catch (_) { /* pywebview/WebKit may reject the Fullscreen API */ }
+    }
+    remoteNativeFullscreen = false;
+    try {
+      const result = await request("window_fullscreen", { enabled: true });
+      remoteWindowFullscreen = Boolean(result && result.enabled);
+    } catch (_) { /* CSS fallback remains usable */ }
+    viewer.classList.add("expanded");
+    syncRemoteFullscreen();
+  }
+  function restoreRemoteSurface() {
+    const screen = $("remote-screen");
+    if (!screen) return {};
+    // noVNC owns the children of remote-screen while an RFB session is open.
+    // Rebuild the legacy JPEG placeholders after closing it.
+    screen.replaceChildren();
+    const image = document.createElement("img");
+    image.id = "remote-image"; image.alt = "远程桌面实时画面"; image.draggable = false; image.hidden = true;
+    const canvas = document.createElement("canvas");
+    canvas.id = "remote-canvas"; canvas.hidden = true;
+    const wait = document.createElement("p");
+    wait.id = "remote-frame-wait"; wait.textContent = "等待画面…";
+    screen.append(image, canvas, wait);
+    return { image, canvas, wait };
+  }
   function resetRemoteViewer(message) {
+    if (remoteRfb) {
+      const rfb = remoteRfb;
+      remoteRfb = null;
+      try { rfb.disconnect(); } catch (_) { /* the socket may already be closed */ }
+    }
     remoteSession = null; remoteInputQueue = []; clearTimeout(remoteFrameTimer);
-    $("remote-viewer").hidden = true; $("remote-image").removeAttribute("src"); text($("remote-message"), message); updateControls();
+    const viewer = $("remote-viewer");
+    if (document.fullscreenElement === viewer && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+    remoteNativeFullscreen = false;
+    if (remoteWindowFullscreen) request("window_fullscreen", { enabled: false }).catch(() => {});
+    remoteWindowFullscreen = false;
+    viewer.classList.remove("expanded"); viewer.hidden = true;
+    const surface = restoreRemoteSurface();
+    if (surface.image) surface.image.removeAttribute("src");
+    syncRemoteFullscreen(); text($("remote-message"), message); updateControls();
   }
   async function remoteFrame() {
     clearTimeout(remoteFrameTimer);
-    if (!remoteSession || remoteFrameBusy) return;
+    if (!remoteSession || remoteSession.vnc || remoteFrameBusy) return;
     const current = sessionId(remoteSession); remoteFrameBusy = true;
+    let freshFrame = false;
     try {
       const frame = await request("remote_frame", { session_id: current, after: remoteFrameSequence });
       if (!remoteSession || sessionId(remoteSession) !== current) return;
       if (frame.error || ["closed", "error", "disconnected"].includes(frame.status)) throw new Error(frame.error || "远程连接已结束。");
-      if (frame.status === "trust_required") {
-        const identity = frame.identity || {};
-        if (!identity.fingerprint) throw new Error("对端未提供有效设备指纹。");
-        if (!window.confirm("首次连接此设备，请与对端显示的指纹核对：\n\n" + (identity.name || remoteSession.address) + "\n" + identity.fingerprint + "\n\n确认后记住此设备身份。")) { await disconnectRemote(); return; }
-        await request("remote_trust", { fingerprint: identity.fingerprint });
-        const payload = remoteSession.payload;
-        const connected = await request("remote_connect", payload);
-        if (!sessionId(connected)) throw new Error("未能建立桌面会话。");
-        remoteSession = { ...connected, address: payload.address, payload, permission: connected.permission || payload.permission }; remoteFrameSequence = -1;
-        return;
-      }
+      if (frame.status === "trust_required") throw new Error("远程桌面仅支持预共享密钥认证，请在两端填写相同密钥。");
       if (frame.permission) remoteSession.permission = frame.permission;
       text($("remote-viewer-title"), remoteSession.address + (remoteSession.permission === "view" ? " · 仅查看" : " · 远程控制"));
       if (frame.jpeg) {
         if (typeof frame.jpeg !== "string" || frame.jpeg.length > 16 * 1024 * 1024 || !/^[A-Za-z0-9+/=]+$/.test(frame.jpeg)) throw new Error("收到无效的画面数据。");
-        remoteFrameSequence = frame.sequence; $("remote-image").src = "data:image/jpeg;base64," + frame.jpeg;
-        $("remote-image").hidden = false; $("remote-frame-wait").hidden = true;
-        text($("remote-message"), remoteSession.permission === "view" ? "正在查看屏幕，无键鼠控制权限。" : "已连接。点击画面以操作远程键盘与鼠标。");
-      } else if (frame.status === "pending") text($("remote-frame-wait"), "等待对端批准连接…");
+        // A slow bridge can return the same latest frame more than once. Do
+        // not force WebView to decode and repaint duplicate JPEG data.
+        if (frame.sequence !== remoteFrameSequence) {
+          freshFrame = true;
+          remoteFrameSequence = frame.sequence; $("remote-image").src = "data:image/jpeg;base64," + frame.jpeg;
+          $("remote-image").hidden = false; $("remote-frame-wait").hidden = true;
+          text($("remote-message"), remoteSession.permission === "view" ? "正在查看屏幕，无键鼠控制权限。" : "已连接。点击画面以操作远程键盘与鼠标。");
+        }
+      } else if (frame.status === "pending") text($("remote-frame-wait"), "正在完成远程桌面认证…");
     } catch (error) { if (remoteSession && sessionId(remoteSession) === current) resetRemoteViewer(error.message || String(error)); }
-    finally { remoteFrameBusy = false; if (remoteSession) remoteFrameTimer = setTimeout(remoteFrame, document.hidden ? 500 : 100); }
+    finally {
+      remoteFrameBusy = false;
+      if (remoteSession) {
+        // The remote worker already paces capture at 60 FPS. Request the next
+        // frame immediately after a fresh frame; wait one refresh interval
+        // only when the local viewer has not received a new sequence yet.
+        remoteFrameTimer = setTimeout(remoteFrame, document.hidden ? 500 : freshFrame ? 0 : 1000 / 60);
+      }
+    }
   }
   async function sendRemoteInput(event) {
-    if (!remoteSession || remoteSession.permission === "view") return;
+    if (!remoteSession || remoteSession.vnc || remoteSession.permission === "view") return;
     const current = sessionId(remoteSession);
     // Coalesce pointer movement; preserve key/button transitions in order.
     if (event.type === "mouse_move" && remoteInputQueue.length && remoteInputQueue[remoteInputQueue.length - 1].type === "mouse_move") remoteInputQueue[remoteInputQueue.length - 1] = event;
@@ -1014,11 +1369,15 @@
     if (remoteInputBusy) return;
     remoteInputBusy = true;
     try {
-      while (remoteInputQueue.length && remoteSession && sessionId(remoteSession) === current) await request("remote_input", { session_id: current, event: remoteInputQueue.shift() });
+      while (remoteInputQueue.length && remoteSession && sessionId(remoteSession) === current) {
+        const events = remoteInputQueue.splice(0, 32);
+        await request("remote_input", { session_id: current, events });
+      }
     } catch (error) { remoteInputQueue = []; text($("remote-message"), error.message || String(error)); }
     finally { remoteInputBusy = false; }
   }
   function remotePosition(event) {
+    if (remoteSession && remoteSession.vnc) return null;
     const image = $("remote-image"); if (image.hidden || !image.naturalWidth) return null;
     const bounds = image.getBoundingClientRect();
     return { x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)), y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)) };
@@ -1042,10 +1401,15 @@
   }
   async function initializeBridge() {
     if (initialized || !hostAvailable()) return;
-    initialized = true; bridgeReady = true; document.body.classList.add("bridge-ready"); updateControls();
-    try { await loadConfig(); }
-    catch (error) { feedback(error.message || String(error), "failure"); showToast(error.message || String(error), true); }
-    await poll();
+    initialized = true; bridgeReady = true; busy = true; document.body.classList.add("bridge-ready"); updateControls();
+    try {
+      // Do not allow an edit while the first load/normalization RPC is still
+      // running. WebView can dispatch a second bridge call before the first
+      // one has returned, which makes the window look frozen on slow hosts.
+      await loadConfig();
+      await poll();
+    } catch (error) { feedback(error.message || String(error), "failure"); showToast(error.message || String(error), true); }
+    finally { busy = false; updateControls(); }
   }
   document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => { location.hash = button.dataset.page; }));
   document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => { location.hash = button.dataset.go; }));
@@ -1056,22 +1420,40 @@
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); if (!$("save-config").disabled) $("save-config").click(); }
   });
   $("reload-config").addEventListener("click", () => action(() => loadConfig(true)));
-  for (const [id, property] of [["local-endpoint", "address"], ["bind-address", "bind"], ["tun-mtu", "tunMtu"], ["transport-mtu", "transportMtu"], ["device-backend", "deviceBackend"]]) {
-    $(id).addEventListener(id === "device-backend" ? "change" : "input", () => { if (formModel) { formModel[property] = $(id).value; synchronizeForm(); } });
+  for (const [id, property] of [["bind-address", "bind"], ["listen-shared-key", "listenKey"], ["tun-mtu", "tunMtu"], ["transport-mtu", "transportMtu"], ["device-backend", "deviceBackend"]]) {
+    $(id).addEventListener(id === "device-backend" ? "change" : "input", () => {
+      if (formModel) {
+        formModel[property] = $(id).value;
+        if (property === "bind") formModel.address = $(id).value;
+        if (property === "deviceBackend") synchronizeFormImmediate(); else synchronizeForm();
+      }
+    });
   }
   $("listen-enabled").addEventListener("change", () => { formModel.listenEnabled = $("listen-enabled").checked; synchronizeForm(); });
-  for (const [id, property] of [["remote-enabled", "enabled"], ["remote-unattended", "unattended"]]) {
-    $(id).addEventListener("change", () => { formModel.remote.present = true; formModel.remote[property] = $(id).checked; if (property === "enabled" && $(id).checked && localNetworks().length === 1 && !formModel.remote.ids.size) { formModel.remote.ids.add(localNetworks()[0].id); renderAuthorization(); } synchronizeForm(); });
-  }
-  for (const [id, property] of [["remote-access", "access"], ["remote-device-name", "name"], ["remote-port", "port"]]) {
-    $(id).addEventListener(id === "remote-access" ? "change" : "input", () => { formModel.remote.present = true; formModel.remote[property] = $(id).value; renderRemoteAccess(); synchronizeForm(); });
+  $("remote-enabled").addEventListener("change", () => { formModel.remote.present = true; formModel.remote.enabled = $("remote-enabled").checked; if ($("remote-enabled").checked && localNetworks().length === 1 && !formModel.remote.ids.size) { formModel.remote.ids.add(localNetworks()[0].id); renderAuthorization(); } renderRemoteAccess(); synchronizeForm(); });
+  for (const [id, property] of [["remote-shared-key", "sharedKey"], ["remote-device-name", "name"], ["remote-port", "port"]]) {
+    // Keep keystrokes local to the control. Rebuilding the remote settings
+    // section while a WebKitGTK IME is delivering text can steal focus and
+    // make the field look frozen; visibility only changes when the checkbox
+    // toggles, so no render is needed for ordinary text edits.
+    $(id).addEventListener("input", () => { formModel.remote.present = true; formModel.remote[property] = $(id).value; synchronizeForm(); });
   }
   $("remote-save").addEventListener("click", () => action(saveConfiguration));
   $("remote-refresh").addEventListener("click", () => action(refreshRemote));
   $("remote-remove-unsupported").addEventListener("click", () => { formModel.remote = { ...formModel.remote, present: false, enabled: false }; renderForm(); synchronizeForm(); });
-  $("remote-connect").addEventListener("click", () => action(connectRemote));
+  $("remote-connect").addEventListener("click", runRemoteConnect);
+  $("rustdesk-connect").addEventListener("click", () => action(runRustDeskConnect));
+  $("rustdesk-host").addEventListener("click", () => action(runRustDeskHost));
   $("remote-disconnect").addEventListener("click", () => action(disconnectRemote));
-  $("remote-fullscreen").addEventListener("click", () => { const expanded = $("remote-viewer").classList.toggle("expanded"); text($("remote-fullscreen"), expanded ? "恢复窗口" : "放大画面"); });
+  $("remote-fullscreen").addEventListener("click", () => action(toggleRemoteFullscreen));
+  document.addEventListener("fullscreenchange", syncRemoteFullscreen);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.fullscreenElement && $("remote-viewer").classList.contains("expanded")) {
+      if (remoteWindowFullscreen) request("window_fullscreen", { enabled: false }).catch(() => {});
+      remoteWindowFullscreen = false; $("remote-viewer").classList.remove("expanded"); syncRemoteFullscreen();
+    }
+  });
+  for (const id of ["remote-target", "remote-target-network", "remote-target-shared-key", "remote-target-port"]) $(id).addEventListener(id === "remote-target-network" ? "change" : "input", updateControls);
   $("remote-screen").addEventListener("pointermove", (event) => { const position = remotePosition(event); if (position) sendRemoteInput({ type: "mouse_move", ...position }); });
   for (const [name, down] of [["pointerdown", true], ["pointerup", false]]) $("remote-screen").addEventListener(name, (event) => {
     const position = remotePosition(event); if (!position || ![0, 1, 2].includes(event.button) || !remoteSession || remoteSession.permission === "view") return;
@@ -1088,21 +1470,24 @@
   });
   for (const name of ["blur", "pointercancel"]) $("remote-screen").addEventListener(name, () => sendRemoteInput({ type: "release_all" }));
   window.addEventListener("blur", () => sendRemoteInput({ type: "release_all" }));
-  document.addEventListener("visibilitychange", () => { if (document.hidden) sendRemoteInput({ type: "release_all" }); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) sendRemoteInput({ type: "release_all" });
+    else if (remoteSession && !remoteSession.vnc && !remoteFrameBusy) remoteFrame();
+  });
   $("listen-all").addEventListener("change", () => {
     formModel.listenAll = $("listen-all").checked;
     if (!formModel.listenAll) formModel.listenIds = new Set(localNetworks().map((network) => network.id));
     renderAuthorization(); synchronizeForm();
   });
   $("add-network").addEventListener("click", () => {
-    if (formModel.networks.length >= 64) { showToast("最多支持 64 个虚拟网络。", true); return; }
+    if (localNetworks().filter((network) => network.cidr.trim()).length >= 64) { showToast("最多支持 64 个虚拟网络。", true); return; }
     formModel.networks.push({ id: ++networkSerial, cidr: "" });
     renderForm(); synchronizeForm(); $("network-fields").lastElementChild.querySelector("input").focus();
   });
   $("add-peer").addEventListener("click", () => {
     if (formModel.peers.length >= 256) { showToast("最多支持 256 个连接节点。", true); return; }
     const networks = localNetworks();
-    formModel.peers.push({ address: "", key: "", transport: "udp", ids: new Set(networks.length === 1 ? [networks[0].id] : []) });
+    formModel.peers.push({ address: "", key: "", transport: "tcp", ids: new Set(networks.length === 1 ? [networks[0].id] : []) });
     renderForm(); synchronizeForm(); $("peer-fields").lastElementChild.querySelector("input").focus();
   });
   $("apply-json").addEventListener("click", () => action(async () => { await normalizeIntoForm(configuration(true)); showToast("JSON 配置已应用到表单。"); }));
@@ -1119,6 +1504,7 @@
   });
   $("add-subnet").addEventListener("click", () => {
     if (androidHost()) { showToast("Android 只能访问内网，不支持发布本机内网。", true); return; }
+    if (formModel.published.length >= 64) { showToast("最多发布 64 个内网网段。", true); return; }
     const networks = localNetworks(); const selected = networks.length === 1 ? networks[0] : null;
     formModel.published.push({ networkId: selected ? selected.id : null, tunnel: selected ? subnetReference(selected.cidr) || selected.cidr.trim() : "", prefix: "", snat: false });
     renderForm(); synchronizeForm(); $("subnet-fields").lastElementChild.querySelector(".subnet-prefix").focus();
@@ -1146,8 +1532,12 @@
   for (const [id, property] of [["address-server-address", "address"], ["address-server-bind", "bind"], ["address-reclaim", "reclaim"], ["address-state-file", "stateFile"]]) {
     $(id).addEventListener("input", () => { formModel.server[property] = $(id).value; synchronizeForm(); });
   }
-  $("add-address-pool").addEventListener("click", () => { formModel.server.pools.push({ id: ++networkSerial, cidr: "" }); renderForm(); synchronizeForm(); });
+  $("add-address-pool").addEventListener("click", () => {
+    if (formModel.server.pools.length >= 64) { showToast("最多支持 64 个地址池。", true); return; }
+    formModel.server.pools.push({ id: ++networkSerial, cidr: "" }); renderForm(); synchronizeForm();
+  });
   $("add-authorized-client").addEventListener("click", () => {
+    if (formModel.server.clients.length >= 256) { showToast("最多授权 256 个接入节点。", true); return; }
     formModel.server.clients.push({ address: "", key: "", ids: new Set(formModel.server.pools.length === 1 ? [formModel.server.pools[0].id] : []) }); renderForm(); synchronizeForm();
   });
   $("open-access-import").addEventListener("click", () => {
@@ -1172,7 +1562,10 @@
     const file = $("config-file").files && $("config-file").files[0]; $("config-file").value = "";
     if (!file) return;
     if (file.size > MAX_CONFIG_BYTES) { showToast("配置文件不能超过 1 MiB。", true); return; }
-    if ((formModel.address || formModel.server.enabled || $("config-editor").value !== savedText) && !window.confirm("导入将替换当前配置，包括已有 peer 和网络授权。是否继续？")) return;
+    const hasLocalNetworks = formModel && localNetworks(formModel).some((network) => network.cidr.trim());
+    const hasExistingConfiguration = hasLocalNetworks || formModel.peers.length || formModel.clients.length || formModel.published.length ||
+      formModel.server.enabled || formModel.serverOnly || formModel.remote.present || formModel.address || $("config-editor").value !== savedText;
+    if (hasExistingConfiguration && !window.confirm("导入将替换当前配置，包括已有 peer 和网络授权。是否继续？")) return;
     const revision = configRevision;
     const reader = new FileReader();
     reader.onerror = () => showToast("无法读取选择的配置文件。", true);

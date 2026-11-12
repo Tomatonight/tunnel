@@ -1,0 +1,1 @@
+noVNC 1.7.0 bundled from @novnc/novnc, MPL-2.0

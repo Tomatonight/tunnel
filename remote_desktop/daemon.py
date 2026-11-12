@@ -13,7 +13,6 @@ import signal
 import socket
 import subprocess
 import threading
-import time
 import tempfile
 
 from .core import CoreBridge
@@ -103,6 +102,8 @@ def main(argv=None):
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--status-file", required=True, type=Path)
+    parser.add_argument("--owner-stdin", action="store_true",
+                        help="stop when the owning GUI closes its stdin pipe")
     args = parser.parse_args(argv)
     binary, config_path, state_dir, status_path = (p.resolve() for p in (args.binary, args.config, args.state_dir, args.status_file))
     private_directory(state_dir)
@@ -117,11 +118,28 @@ def main(argv=None):
     workers_lock = threading.Lock()
     slots = threading.BoundedSemaphore(16)
     workers = set()
+    owner_lock = threading.Lock()
+    owner_socket = None
 
     def stop_signal(*unused):
         stopping.set()
     signal.signal(signal.SIGINT, stop_signal)
     signal.signal(signal.SIGTERM, stop_signal)
+
+    def watch_owner_stdin():
+        """Stop a GUI-owned daemon when its parent closes the private pipe."""
+        try:
+            import sys
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            while stream.read(1):
+                pass
+        except (OSError, ValueError):
+            pass
+        finally:
+            stopping.set()
+
+    if args.owner_stdin:
+        threading.Thread(target=watch_owner_stdin, name="owner-stdin", daemon=True).start()
 
     def normalized(document):
         temporary = state_dir / "desktop-validation.json"
@@ -137,47 +155,80 @@ def main(argv=None):
             temporary.unlink(missing_ok=True)
 
     def handle(sock):
+        nonlocal owner_socket
+        is_owner = False
         try:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             sock.settimeout(12)
             authenticate(sock, key, server=True)
-            message = receive(sock, 2 * 1024 * 1024)
-            action, payload = message.get("action"), message.get("payload", {})
-            if not isinstance(payload, dict):
-                raise ValueError("Invalid local request")
-            # Liveness must remain observable while a platform configuration
-            # operation is pending; otherwise clients may try a second start.
-            if action == "host_status":
-                result = {"running": core.process.poll() is None, "stopping": stopping.is_set(),
-                    "pid": os.getpid(), "core_pid": core.process.pid, "exit_code": core.process.poll(), "error": error,
-                    "config_path": str(config_path), "status_path": str(status_path)}
-                send(sock, {"ok": True, "data": result})
-                return
-            if action == "host_stop":
-                stopping.set()
-                send(sock, {"ok": True, "data": {"message": "Stopping background host"}})
-                return
-            with guard:
+            # Keep the authenticated loopback channel open. The GUI requests
+            # one frame per refresh, and reconnecting/authenticating for every
+            # frame adds avoidable latency and CPU load.
+            while not stopping.is_set():
+                # The owner connection is intentionally idle while the GUI
+                # is open; ordinary request connections stay bounded.
+                sock.settimeout(None if is_owner else 12)
+                message = receive(sock, 2 * 1024 * 1024)
+                action, payload = message.get("action"), message.get("payload", {})
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid local request")
+                if action == "owner_attach":
+                    with owner_lock:
+                        if owner_socket is not None and owner_socket is not sock:
+                            raise ValueError("Desktop host already has an owner")
+                        owner_socket = sock
+                        is_owner = True
+                    send(sock, {"ok": True, "data": {"message": "Owner attached"}})
+                    continue
+                # Liveness must remain observable while a platform configuration
+                # operation is pending; otherwise clients may try a second start.
+                if action == "host_status":
+                    result = {"running": core.process.poll() is None, "stopping": stopping.is_set(),
+                        "pid": os.getpid(), "core_pid": core.process.pid, "exit_code": core.process.poll(), "error": error,
+                        "config_path": str(config_path), "status_path": str(status_path)}
+                    send(sock, {"ok": True, "data": result})
+                    continue
+                if action == "host_stop":
+                    stopping.set()
+                    send(sock, {"ok": True, "data": {"message": "Stopping background host"}})
+                    return
                 if stopping.is_set():
                     raise ValueError("Background host is stopping")
-                if action == "remote_configure":
-                    sock.settimeout(None)
-                    document = dict(manager.document)
-                    document["remote_desktop"] = payload["config"]
-                    result = manager.apply(document)
-                elif action == "apply_config":
-                    sock.settimeout(None)
-                    result = manager.apply(payload["config"])
-                elif action == "get_config":
-                    result = {"config": manager.document}
+                # Configuration commits are serialized with one guard because
+                # they rebuild the native core and persist a new snapshot.
+                # Runtime desktop operations have their own lock and must not
+                # share this guard: a viewer waiting for remote approval must
+                # keep runtime state and disconnect requests responsive on
+                # another local RPC connection.
+                if action in ("remote_configure", "apply_config", "get_config"):
+                    with guard:
+                        if action == "remote_configure":
+                            sock.settimeout(None)
+                            document = dict(manager.document)
+                            document["remote_desktop"] = payload["config"]
+                            result = manager.apply(document)
+                        elif action == "apply_config":
+                            sock.settimeout(None)
+                            result = manager.apply(payload["config"])
+                        else:
+                            result = {"config": manager.document}
                 else:
                     result = runtime.request(action, payload)
-            send(sock, {"ok": True, "data": result})
+                send(sock, {"ok": True, "data": result})
         except Exception as problem:
             try:
                 send(sock, {"ok": False, "error": str(problem)[:500]})
             except Exception:
                 pass
         finally:
+            if is_owner:
+                with owner_lock:
+                    if owner_socket is sock:
+                        owner_socket = None
+                        stopping.set()
             sock.close()
             slots.release()
             with workers_lock:
@@ -215,6 +266,20 @@ def main(argv=None):
         stopping.set()
         if listener:
             listener.close()
+        # Wake an idle owner handler when another RPC requested shutdown or
+        # the native core exited first.
+        with owner_lock:
+            attached = owner_socket
+            owner_socket = None
+        if attached is not None:
+            try:
+                attached.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                attached.close()
+            except OSError:
+                pass
         # Finish an in-flight apply before releasing the core it owns. A stop
         # request is acknowledged immediately, but never races a half commit.
         with guard:

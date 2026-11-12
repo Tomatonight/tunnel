@@ -1,71 +1,13 @@
 #!/usr/bin/env sh
 set -eu
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PYTHON=${PYTHON:-python3}
-if [ "$(uname -s)" = "Linux" ]; then
-    if [ ! -x "$ROOT/.venv-gui/bin/python" ] || [ ! -x "$ROOT/build/tunnel" ]; then
-        echo "Linux GUI prerequisites are incomplete; running bash build.sh." >&2
-        bash "$ROOT/build.sh"
-    fi
+# A root-launched GUI can inherit an AT-SPI socket under /root.  The GUI does
+# not use accessibility integration; remove the stale address before Python or
+# GTK/WebKit is imported.
+if [ "$(id -u)" -eq 0 ]; then
+    export NO_AT_BRIDGE=1
+    unset AT_SPI_BUS_ADDRESS AT_SPI_BUS
 fi
-if [ "$(uname -s)" = "Linux" ] && [ "${TUNNEL_SKIP_KERNEL_MODULE:-0}" != "1" ]; then
-    KERNEL_RELEASE=$(uname -r)
-    KERNEL_MODULE="$ROOT/build/kernel/tunnel_kmod.ko"
-    KERNEL_INFO="$ROOT/build/kernel/build-info.json"
-    if [ ! -f "$KERNEL_MODULE" ]; then
-        echo "Linux kernel module is missing; running bash build.sh (including tunnel_kmod.ko)." >&2
-        bash "$ROOT/build.sh"
-    elif [ -f "$KERNEL_INFO" ] && ! grep -Fq "\"kernel_release\": \"$KERNEL_RELEASE\"" "$KERNEL_INFO"; then
-        echo "Linux kernel module targets a different kernel; running bash build.sh." >&2
-        bash "$ROOT/build.sh"
-    fi
-fi
-if [ -x "$ROOT/.venv-gui/bin/python" ]; then
-    PYTHON="$ROOT/.venv-gui/bin/python"
-else
-    echo "GUI dependencies are not prepared. Run ./build.sh first (or create .venv-gui from gui/requirements.txt)." >&2
-    exit 1
-fi
-if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_UID:-}" ] && [ -d "/run/user/$SUDO_UID" ]; then
-    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$SUDO_UID}"
-    export XDG_RUNTIME_DIR
-    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
-        export DBUS_SESSION_BUS_ADDRESS
-    fi
-fi
-if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -S "${XDG_RUNTIME_DIR:-}/wayland-0" ]; then
-    WAYLAND_DISPLAY=wayland-0
-    export WAYLAND_DISPLAY
-fi
-if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-    for socket in /tmp/.X11-unix/X*; do
-        if [ -S "$socket" ]; then
-            DISPLAY=":${socket##*X}"
-            export DISPLAY
-            break
-        fi
-    done
-fi
-if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-    echo "No graphical display is available. Run this from the Linux desktop session, or preserve DISPLAY/WAYLAND_DISPLAY when using sudo." >&2
-    exit 1
-fi
-if [ "$(id -u)" -ne 0 ]; then
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo "This GUI needs root/CAP_NET_ADMIN for the tunnel core, but sudo is not installed." >&2
-        exit 1
-    fi
-    exec sudo --preserve-env=DISPLAY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS bash "$0" "$@"
-fi
-if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_UID:-}" ] && [ -n "${DISPLAY:-}" ] && command -v sudo >/dev/null 2>&1 && command -v xhost >/dev/null 2>&1; then
-    # X11 authorizes the logged-in user, not root. Grant root only for this
-    # GUI lifetime so the elevated core can create TUN devices and routes.
-    if sudo -u "#$SUDO_UID" env DISPLAY="$DISPLAY" xhost +SI:localuser:root >/dev/null 2>&1; then
-        cleanup_xhost() {
-            sudo -u "#$SUDO_UID" env DISPLAY="$DISPLAY" xhost -SI:localuser:root >/dev/null 2>&1 || true
-        }
-        trap cleanup_xhost EXIT INT TERM
-    fi
-fi
-exec "$PYTHON" "$ROOT/gui/main.py" --binary "$ROOT/build/tunnel" "$@"
+sh "$ROOT/stop-gui.sh" --quiet
+exec "${PYTHON:-python3}" "$ROOT/tools/launch_gui.py" "$@"

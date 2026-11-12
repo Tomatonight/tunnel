@@ -1,12 +1,14 @@
 {
-    "networks":  [
-                     "10.1.0.2/24"
-                 ],
-    "peers":  [
-                  {
-                      "shared_key":  "replace-with-the-same-random-peer-secret",
-                      "endpoint":  "192.0.2.1:65535"
-                  }
-              ],
-    "endpoint":  "192.0.2.2:65535"
+  "listen": {
+    "bind_address": "192.0.2.2:65535"
+  },
+  "networks": [
+    "10.1.0.2/24"
+  ],
+  "peers": [
+    {
+      "shared_key": "replace-with-the-same-random-peer-secret",
+      "endpoint": "192.0.2.1:65535"
+    }
+  ]
 }

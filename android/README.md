@@ -19,22 +19,22 @@ x86_64 同样布局。依赖也需 PIC，NDK 27 使用 16 KB 页兼容设置。
 安装 app/build/outputs/apk/debug/app-debug.apk；导入与桌面相同的 JSON 配置，再点击连接并授予系统 VPN 权限。
 四个平台共用 gui/assets 中的界面：配置编辑/导入/校验/保存、连接/断开、节点与路径状态、计数和日志。
 配置表单支持节点地址、虚拟网络和 peer；可为每个 peer 生成独立的 32 字节随机预共享密钥（64 位十六进制文本）。
-规范配置将公布 address 放在根对象；networks 使用本机 IP/前缀字符串（如 10.1.0.2/24），
-peer.networks 使用子网引用，单一虚拟网络时可省略；listen 为可选对象，MTU 可使用核心默认值。
-peer.transport可选择udp（默认）或tcp，表单提供同一选项。TCP数据复用受保护的TLS连接，
+规范配置将本机传输地址放在 `listen.bind_address`；networks 使用本机 IP/前缀字符串（如 10.1.0.2/24），
+peer.endpoint 保存对端传输地址，peer.networks 使用子网引用，单一虚拟网络时可省略；listen.enabled 可控制是否监听入站连接。关闭监听时可省略 listen.bind_address，或使用 `0.0.0.0:端口`/`[::]:端口` 绑定所有网卡，MTU 可使用核心默认值。
+peer.transport可选择tcp（默认）或udp，表单提供同一选项。TCP数据复用受保护的TLS连接，
 保留端到端加密与原MTU预算，不依赖UDP探测；两端程序需支持TCP封装，任一端选择即可协商。
-导入旧版配置时由同一个 C++ 解析器转为规范格式，仅在界面中转换，不自动覆写磁盘。
+导入配置时使用同一个 C++ 解析器校验并转为当前规范格式，不自动覆写磁盘。
 无法解析的已存配置仍返回原文本和错误说明供修复；保存或连接时才校验并写入规范格式。
 Gradle 从仓库的 gui/assets 打包 index.html、app.css、app.js，不依赖远程网页，也不另开 HTTP 服务。
 Android 原生宿主使用受限 WebView 和 VpnService；Android 系统线程不参与协议处理。
-Android本机仍需配置固定公布地址；UDP模式要求TCP/UDP可达，TCP模式要求可建立TCP连接。
+Android 本机若接受入站连接需配置可达绑定地址；只主动连接时可关闭监听并省略该字段。UDP模式要求TCP/UDP可达，TCP模式要求可建立TCP连接。
 本版不提供NAT穿透或移动公网端点学习。
 配置保存在应用私有目录，不备份；通知和日志不输出 PSK。
 日志保留最近 256 条（每条最多 2048 字符），运行状态每 500 毫秒从协议线程发布一次快照。
 关闭界面不会断开已经启动的 VPN；再次打开可查看同一服务的状态与日志。
 拒绝或撤销授权、启动失败、停止过程会在界面中显示；运行时点击“保存并应用”即可热加载配置。
 修改peer时仅重建地址、密钥、数据封装或网络授权发生变化的邻接，未修改的连接保留。
-修改公布/监听地址、网络、MTU、地址分配设置等网络资源时，在原进程内重建核心资源，身份密钥保留，连接可能短暂中断。
+修改绑定地址、网络、MTU、地址分配设置等网络资源时，在原进程内重建核心资源，身份密钥保留，连接可能短暂中断。
 修改 MTU 后，当前接口和随后租约/路由更新建立的替代接口均使用新 MTU。
 无变化的配置不重建资源；校验或应用失败时保留原配置。资源重建失败会尝试恢复旧资源，恢复失败会明确显示错误。
 配置文件先暂存，协议线程确认成功后才原子替换；若写入失败则请求恢复原运行配置，并报告恢复结果。
@@ -50,11 +50,11 @@ VpnService 为已有静态地址或有效租约的虚拟网络配置地址和路
 重建使用全部仍有效的网络，保证撤回一个网络时保留其他网络；空集合关闭 TUN。相同集合（含仅顺序变化）不重建。
 Android 系统以替代接口实现地址变更，切换期间可能短暂丢包；建立失败则关闭旧 TUN 并停止全部 overlay 收发，状态显示 device_error，需手动断开重连恢复。
 单独的 address_server 配置可运行分配服务而不建立 TUN；地址服务仍使用同一协议线程。
-共享接入模式只需 address_server.shared_key 和地址池，无需 clients 名单；客户端使用相同服务密钥，peer 密钥另行配置。旧逐节点授权模式仍可导入和使用。
+共享接入模式只需 address_server.shared_key 和地址池，无需 clients 名单；客户端使用相同服务密钥，peer 密钥另行配置。逐节点授权模式仍可导入和使用。
 Android 将 address_server.state_file 的文件名映射到应用私有 files/address-state 目录，导入桌面绝对路径也不写出该目录；保存的配置文本保持原路径。
 私有租约状态随应用数据保留，用于重启后恢复分配；清除应用数据或卸载将同时删除配置与租约记录。
 停止、撤销授权及网络切换均通过协议线程处理；切换网络不重新生成进程身份密钥。
-默认接管配置中的虚拟网段，以及核心确认有效的远端通告子网；不支持 Always-on 自动启动，公布地址变化后可保存并应用新配置。
+默认接管配置中的虚拟网段，以及核心确认有效的远端通告子网；不支持 Always-on 自动启动，绑定地址变化后可保存并应用新配置。
 Android 只作为通告子网的访问端：advertise_routes 非空会在配置校验和启动前被拒绝，出口和 SNAT 应配置在桌面网关。
 导入子网变动通过完整 DeviceUpdate(networks,routes) 重建同一个 VpnService 接口；删除路由保留其他地址和路由。
 导入路由不得覆盖配置中的公网控制端点、虚拟网段或当前底层网络地址；网络切换仍通过控制管道通知核心重连。
@@ -71,7 +71,7 @@ VpnService 没有按路由指定源地址的 API：导入子网时，同一地�
     normalize_config/validate_config/save_config/reload_config/start 的 payload 为 {text:配置文本}，copy_text 为 {text:待复制文本}。
     normalize_config 返回 {text:规范 JSON}；generate_key 无需 payload 字段，返回 {key:64位十六进制密钥}。
     load_config 返回 {text:规范 JSON}；文件为空则 text 为空字符串，文件无效则返回 {text:原文本,error:错误说明}；不修改磁盘。
-    save_config/reload_config/start 接受新旧两种配置，均由核心规范化后保存；本次启动使用规范化文本的独立快照。
+    save_config/reload_config/start 只接受当前配置 schema，由核心校验后保存；本次启动使用校验文本的独立快照。
     save_config 与 reload_config 等效；运行时成功返回 {saved:true,applied:true,text,message,mode,interrupted,...}。
     mode 为 noop / remote / peers / rebuild；停止状态返回 applied:false，没有运行结果字段。
     应用失败返回 {ok:false,error}，磁盘配置不更新，编辑器保留未保存的内容。

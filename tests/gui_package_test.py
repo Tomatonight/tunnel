@@ -20,7 +20,7 @@ from remote_desktop.host import BackgroundHost
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--package", type=Path, default=ROOT / "build/gui/TunnelUI")
+    parser.add_argument("--package", type=Path, default=ROOT / "build/gui/TunnelUI-live")
     parser.add_argument("--output", type=Path, default=ROOT / "build/gui-tests/remote-package-background.json")
     args = parser.parse_args()
     package = args.package.resolve()

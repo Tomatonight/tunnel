@@ -141,9 +141,9 @@ def main():
         def key_for(i):
             return 'test-shared-allocation-key' if args.auth_mode == 'shared' else f'test-allocation-client-{i}'
         for i in range(3):
-            config = {'device_backend': 'tun', 'address': f'192.0.2.{i+1}:45000', 'networks': [f'10.88.0.{i+1}/24'],
+            config = {'device_backend': 'tun', 'listen': {'bind_address': f'192.0.2.{i+1}:45000'}, 'networks': [f'10.88.0.{i+1}/24'],
                 'address_clients': [{'address': service, 'shared_key': key_for(i), 'networks': managed}],
-                'peers': [{'address': f'192.0.2.{p+1}:45000', 'shared_key': f'test-pair-{min(i,p)}-{max(i,p)}', 'networks': all_networks} for p in graph[i]]}
+                'peers': [{'endpoint': f'192.0.2.{p+1}:45000', 'shared_key': f'test-pair-{min(i,p)}-{max(i,p)}', 'networks': all_networks} for p in graph[i]]}
             (work / f'{i}.json').write_text(json.dumps(config))
         server = {'address_server': {'address': service, 'state_file': 'leases.json', 'reclaim_after': 2,
             'networks': managed, 'clients': [{'address': f'192.0.2.{i+1}:45000', 'shared_key': f'test-allocation-client-{i}', 'networks': managed} for i in range(3)]}}
@@ -154,7 +154,7 @@ def main():
         server['address_server']['state_file'] = f'leases-{prefix}.json'
         (work / 'server.json').write_text(json.dumps(server))
         exported = json.loads(run(binary, work / 'server.json', '--export-client', '192.0.2.1:45000').stdout)
-        assert exported['address'] == '192.0.2.1:45000'
+        assert exported['listen']['bind_address'] == '192.0.2.1:45000'
         assert set(exported['address_clients'][0]['networks']) == set(managed)
         assert exported['address_clients'][0]['shared_key'] == key_for(0)
         mark('export_authorized_client_configuration')

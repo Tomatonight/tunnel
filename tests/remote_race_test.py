@@ -28,7 +28,7 @@ class RaceTests(unittest.TestCase):
         case = self.fixture
         if remember:
             case.server.store.put("devices", dict(case.client.identity.info(), permission="control"))
-        case.server.configure(dict(case.config, access="authorized_devices"))
+        case.server.configure(dict(case.config))
         fixtures.wait_for(lambda: case.server.request("remote_state")["listeners"])
 
     def _buffered_input_revocation(self, action):
@@ -53,10 +53,8 @@ class RaceTests(unittest.TestCase):
                 case.client.request("remote_input", {"session_id": case.viewer()["session_id"],
                     "event": {"type": "key", "key": "KeyA", "down": True}})
                 self.assertTrue(reached.wait(5), "server never received the input poll")
-                if action == "mode":
-                    case.server.configure(dict(case.config, access="authorized_devices"))
-                elif action == "revoke":
-                    case.server.request("remote_revoke", {"fingerprint": case.client.identity.fingerprint})
+                if action in ("mode", "revoke"):
+                    case.server.configure(dict(case.config, shared_key="rotated-desktop-key"))
                 else:
                     session = case.server.request("remote_state")["sessions"][0]
                     case.server.request("remote_terminate", {"session_id": session["session_id"]})
@@ -76,48 +74,11 @@ class RaceTests(unittest.TestCase):
     def test_terminate_rejects_already_received_input(self):
         self._buffered_input_revocation("terminate")
 
-    def _stale_approval(self, action):
+    def test_psk_never_creates_approval_pending(self):
         case = self.fixture
-        self._listed_mode()
-        self.assertEqual(case.connect()["status"], "pending")
-        pending = case.server.request("remote_state")["pending"][0]
-        # The waiting worker cannot remove pending until this lock is released.
-        # This models a stale UI approval arriving directly after revocation.
-        with case.server.lock:
-            if action == "revoke":
-                case.server.request("remote_revoke", {"fingerprint": case.client.identity.fingerprint})
-            elif action == "reject":
-                case.server.request("remote_reject", {"request_id": pending["request_id"]})
-            else:
-                case.server.configure(dict(case.config, enabled=False))
-            with self.assertRaisesRegex(ValueError, "expired"):
-                case.server.request("remote_authorize", {"request_id": pending["request_id"],
-                    "permission": "control", "remember": True})
-            self.assertIsNone(case.server.store.get("devices", case.client.identity.fingerprint))
-        fixtures.wait_for(lambda: not case.server.request("remote_state")["pending"])
-        self.assertFalse(case.backends)
-
-    def test_late_approval_cannot_restore_revoked_device(self):
-        self._stale_approval("revoke")
-
-    def test_late_approval_cannot_override_rejection(self):
-        self._stale_approval("reject")
-
-    def test_late_approval_cannot_survive_policy_change(self):
-        self._stale_approval("mode")
-
-    def test_duplicate_approval_cannot_raise_saved_permission(self):
-        case = self.fixture
-        self._listed_mode()
-        self.assertEqual(case.connect()["status"], "pending")
-        pending = case.server.request("remote_state")["pending"][0]
-        with case.server.lock:
-            case.server.request("remote_authorize", {"request_id": pending["request_id"], "permission": "view", "remember": True})
-            with self.assertRaisesRegex(ValueError, "expired"):
-                case.server.request("remote_authorize", {"request_id": pending["request_id"], "permission": "control", "remember": True})
-            self.assertEqual(case.server.store.get("devices", case.client.identity.fingerprint)["permission"], "view")
-        fixtures.wait_for(lambda: case.viewer()["status"] == "connected")
-        self.assertEqual(case.viewer()["permission"], "view")
+        self.assertEqual(case.connect()["status"], "connected")
+        self.assertFalse(case.server.request("remote_state")["pending"])
+        self.assertFalse(case.server.request("remote_state")["devices"])
 
     def test_shutdown_closes_multiple_stalled_tls_handshakes(self):
         case = self.fixture
@@ -217,7 +178,7 @@ class RaceTests(unittest.TestCase):
             listener.listen(1)
             listener.settimeout(3)
             case.client.request("remote_connect", {"address": case.server_core.ip, "tunnel": fixtures.NETWORK,
-                "port": listener.getsockname()[1]})
+                "port": listener.getsockname()[1], "shared_key": fixtures.REMOTE_PSK})
             accepted, _ = listener.accept()
             # This server intentionally sends no TLS response.
             case.client.request("remote_disconnect", {})

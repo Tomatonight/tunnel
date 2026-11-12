@@ -295,8 +295,8 @@ def main():
         networks = [tunnel] + ([tunnel6] if ipv6 else [])
         for node in ('C', 'R', 'A', 'B'):
             adjacent = ('C', 'A', 'B') if node == 'R' else ('R',)
-            config = {'address': endpoints[node], 'networks': [virtual[node] + '/24'] + ([virtual6[node] + '/64'] if ipv6 else []),
-                'listen': {'enabled': node == 'R'}, 'peers': [{'address': endpoints[other], 'shared_key': 'test-subnet-pair-' + '-'.join(sorted((node, other))), 'networks': networks} for other in adjacent]}
+            config = {'listen': {'enabled': node == 'R', 'bind_address': endpoints[node]}, 'networks': [virtual[node] + '/24'] + ([virtual6[node] + '/64'] if ipv6 else []),
+                'peers': [{'endpoint': endpoints[other], 'shared_key': 'test-subnet-pair-' + '-'.join(sorted((node, other))), 'networks': networks} for other in adjacent]}
             if node in ('A', 'B'):
                 config['advertise_routes'] = [{'tunnel': tunnel, 'prefix': subnet, 'snat': True}]
             configurations[node] = config

@@ -3,7 +3,7 @@
 This module never starts a network listener. Callers must authenticate/authorize
 before calling input(), and must call release_all() when a session disconnects.
 Windows login/UAC desktops and native Wayland sessions need separate backends;
-this backend reports those limitations instead of claiming unattended support.
+this backend reports those limitations instead of claiming support it does not provide.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import math
 import os
 import sys
 import threading
+import time
 from typing import Any
 
 
@@ -381,19 +382,25 @@ class DesktopBackend:
     at a time. `_capture`/`_native` are dependency injection seams for isolated tests.
     """
 
-    def __init__(self, max_width: int = 1600, max_height: int = 900, quality: int = 65,
-                 *, _capture: Any = None, _native: Any = None, _platform: str | None = None) -> None:
+    def __init__(self, max_width: int = 1920, max_height: int = 1080, quality: int = 82,
+                 *, subsampling: int = 0, _capture: Any = None, _native: Any = None,
+                 _platform: str | None = None) -> None:
         if type(max_width) is not int or type(max_height) is not int or not 64 <= max_width <= 3840 or not 64 <= max_height <= 2160:
             raise ValueError("capture bounds must be integers within 64..3840 by 64..2160")
         if type(quality) is not int or not 20 <= quality <= 90:
             raise ValueError("JPEG quality must be an integer between 20 and 90")
+        if type(subsampling) is not int or subsampling not in (0, 1, 2):
+            raise ValueError("JPEG subsampling must be 0, 1 or 2")
         self.platform = _platform or sys.platform
-        self.max_width, self.max_height, self.quality = max_width, max_height, quality
+        self.max_width, self.max_height = max_width, max_height
+        self.quality, self.subsampling = quality, subsampling
         self._lock = threading.RLock()
         self._closed = False
         self._held_keys: set[str] = set()
         self._held_buttons: set[str] = set()
         self._capture, self._native = _capture, _native
+        self._monitor_refresh_at = 0.0
+        self._target_size: tuple[int, int] | None = None
         try:
             from PIL import Image
             self._image = Image
@@ -424,8 +431,15 @@ class DesktopBackend:
             raise
 
     def _refresh_monitor(self) -> None:
-        # Refresh display configuration at each frame, including after sleep.
-        if hasattr(self._capture, "_monitors"):
+        # Display topology changes rarely. Reset mss's monitor cache at most
+        # once per second; doing this for every frame adds a measurable cost to
+        # an otherwise hot capture loop. Test doubles without mss's cache are
+        # still refreshed on every capture so coordinate changes are observed.
+        now = time.monotonic()
+        cached = hasattr(self._capture, "_monitors")
+        if cached and now - self._monitor_refresh_at < 1.0:
+            return
+        if cached:
             self._capture._monitors = None
         monitors = self._capture.monitors
         if len(monitors) < 2:
@@ -440,10 +454,26 @@ class DesktopBackend:
                          for key in ("left", "top", "width", "height")}
         if not 1 <= self._monitor["width"] <= 32768 or not 1 <= self._monitor["height"] <= 32768:
             raise DesktopError("Invalid monitor dimensions")
+        self._monitor_refresh_at = now
 
     def _require_open(self) -> None:
         if self._closed:
             raise DesktopError("Desktop backend is closed")
+
+    def set_capture_bounds(self, max_width: int, max_height: int) -> None:
+        """Limit the next captures to the viewer's requested framebuffer size."""
+        if type(max_width) is not int or type(max_height) is not int:
+            raise ValueError("capture bounds must be integers")
+        if not 64 <= max_width <= 3840 or not 64 <= max_height <= 2160:
+            raise ValueError("capture bounds must be within 64..3840 by 64..2160")
+        with self._lock:
+            self._require_open()
+            # Keep the requested framebuffer dimensions even when the source
+            # display is smaller. capture() fits the source into this exact
+            # size without upscaling, so noVNC receives a stable resize
+            # acknowledgement instead of requesting the larger viewport again.
+            self.max_width, self.max_height = max_width, max_height
+            self._target_size = (max_width, max_height)
 
     def capture(self) -> dict[str, Any]:
         with self._lock:
@@ -452,17 +482,47 @@ class DesktopBackend:
                 _set_windows_dpi()
             self._refresh_monitor()
             try:
-                shot = self._capture.grab(self._monitor)
-                frame = self._image.frombytes("RGB", tuple(shot.size), bytes(shot.bgra), "raw", "BGRX")
-                frame.thumbnail((self.max_width, self.max_height), self._image.Resampling.LANCZOS)
-                encoded = io.BytesIO()
-                frame.save(encoded, format="JPEG", quality=self.quality)
-                return {"jpeg": encoded.getvalue(), "width": frame.width, "height": frame.height,
-                        "source_width": self._monitor["width"], "source_height": self._monitor["height"]}
+                monitor = dict(self._monitor)
+                shot = self._capture.grab(monitor)
+                pixels = bytes(shot.bgra)
             except DesktopError:
                 raise
             except Exception as exc:
                 raise DesktopError("Desktop capture failed: " + str(exc)) from exc
+        # Keep the backend lock out of Pillow's resize/JPEG path. A capture
+        # can take tens of milliseconds on a virtual display; input events
+        # should still reach the native input backend while that frame is
+        # being encoded.
+        try:
+            frame = self._image.frombytes("RGB", tuple(shot.size), pixels, "raw", "BGRX")
+            # Keep a full-HD frame whenever possible.  The previous 1600x900 /
+            # quality=65 defaults visibly softened text on a 1080p desktop,
+            # especially when the viewer was enlarged.  LANCZOS is only used
+            # when the source exceeds the transport bound; native-size frames
+            # are left untouched.  The RFB runtime uses 4:2:0 for a much
+            # smaller/faster real-time stream; the default remains 4:4:4 for
+            # callers that prefer maximum text/chroma fidelity.
+            if frame.width > self.max_width or frame.height > self.max_height:
+                frame.thumbnail((self.max_width, self.max_height), self._image.Resampling.LANCZOS)
+            target = self._target_size
+            if target and frame.size != target:
+                # Keep the source aspect ratio and pad to the exact RFB
+                # viewport. This prevents a resize acknowledgement loop when
+                # the browser viewport is wider/taller than the source.
+                contained = frame.copy()
+                contained.thumbnail(target, self._image.Resampling.LANCZOS)
+                canvas = self._image.new("RGB", target, (0, 0, 0))
+                canvas.paste(contained, ((target[0] - contained.width) // 2,
+                                         (target[1] - contained.height) // 2))
+                frame = canvas
+            encoded = io.BytesIO()
+            frame.save(encoded, format="JPEG", quality=self.quality, subsampling=self.subsampling)
+            return {"jpeg": encoded.getvalue(), "width": frame.width, "height": frame.height,
+                    "source_width": monitor["width"], "source_height": monitor["height"]}
+        except DesktopError:
+            raise
+        except Exception as exc:
+            raise DesktopError("Desktop capture failed: " + str(exc)) from exc
 
     def input(self, event: dict[str, Any]) -> None:
         with self._lock:
@@ -517,6 +577,7 @@ class DesktopBackend:
         return {"platform": self.platform, "capture": True, "mouse": True, "keyboard": True,
                 "text": False, "single_screen": True, "codec": "jpeg", "max_width": self.max_width,
                 "max_height": self.max_height, "quality": self.quality,
+                "subsampling": self.subsampling,
                 "logged_in_session_only": True, "secure_desktop": False, "native_wayland": False,
                 "source_width": self._monitor["width"], "source_height": self._monitor["height"]}
 

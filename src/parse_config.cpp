@@ -7,7 +7,6 @@
 #include <set>
 #include <sstream>
 
-Config g_config;
 namespace {
 using json = nlohmann::json;
 void keys(const json& value, const std::set<std::string>& allowed, const std::string& path) {
@@ -24,16 +23,32 @@ std::string string_value(const json& value, const std::string& path) {
     if (!value.is_string() || value.get<std::string>().empty()) throw config_error(path + ": expected nonempty string");
     return value.get<std::string>();
 }
-unsigned number(const json& object, const char* name, unsigned fallback, unsigned minimum, unsigned maximum) {
+unsigned number(const json& object, const char* name, unsigned fallback, unsigned minimum, unsigned maximum,
+                const std::string& path = {}) {
     const auto it = object.find(name);
     if (it == object.end()) return fallback;
     if (!it->is_number_integer() || *it < minimum || *it > maximum)
-        throw config_error(std::string(name) + ": expected integer in " + std::to_string(minimum) + ".." + std::to_string(maximum));
+        throw config_error((path.empty() ? std::string(name) : path + "." + name) +
+            ": expected integer in " + std::to_string(minimum) + ".." + std::to_string(maximum));
     return it->get<unsigned>();
 }
-Endpoint endpoint(const json& value, const std::string& path, bool allow_wildcard) {
+std::string endpoint_with_default_port(std::string text, unsigned port) {
+    if (!port) return text;
+    const bool bracketed = !text.empty() && text.front() == '[';
+    if (bracketed) {
+        // [IPv6] is an address without a port; [IPv6]:port is already complete.
+        if (text.find("]:") == std::string::npos) return text + ":" + std::to_string(port);
+        return text;
+    }
+    const auto first_colon = text.find(':');
+    const auto last_colon = text.rfind(':');
+    if (first_colon == std::string::npos) return text + ":" + std::to_string(port);
+    if (first_colon != last_colon) return "[" + text + "]:" + std::to_string(port);
+    return text;
+}
+Endpoint endpoint(const json& value, const std::string& path, bool allow_wildcard, unsigned default_port = 0) {
     try {
-        const auto e = Endpoint::parse(string_value(value, path));
+        const auto e = Endpoint::parse(endpoint_with_default_port(string_value(value, path), default_port));
         if (!e.ip.unicast() && !(allow_wildcard && e.ip.unspecified()))
             throw config_error(path + ": expected unicast address");
         return e;
@@ -48,26 +63,6 @@ void add_local(const NetworkConfig& n, const std::string& path, std::map<Network
         } else if (old.first.overlaps(n.tunnel)) throw config_error(path + ": overlapping virtual networks");
     }
     local[n.tunnel] = n.tunnel_ip;
-}
-std::vector<NetworkConfig> legacy_networks(const json& value, const std::string& path,
-                                    std::map<Network, IpAddress>& local) {
-    if (!value.is_array()) throw config_error(path + ": expected array");
-    if (value.size() > 64) throw config_error(path + ": at most 64 networks are supported");
-    std::vector<NetworkConfig> result;
-    std::set<Network> seen;
-    for (std::size_t i = 0; i < value.size(); ++i) {
-        const auto p = path + "[" + std::to_string(i) + "]";
-        keys(value[i], {"tunnel", "tunnel_ip"}, p);
-        NetworkConfig n;
-        try {
-            n.tunnel = Network::parse(string_value(field(value[i], "tunnel", p), p + ".tunnel"));
-            n.tunnel_ip = IpAddress::parse(string_value(field(value[i], "tunnel_ip", p), p + ".tunnel_ip"));
-        } catch (const std::invalid_argument& e) { throw config_error(p + ": " + e.what()); }
-        if (!seen.insert(n.tunnel).second) throw config_error(p + ": duplicate normalized network");
-        add_local(n, p, local);
-        result.push_back(n);
-    }
-    return result;
 }
 std::vector<NetworkConfig> local_networks(const json& value, std::map<Network, IpAddress>& local) {
     if (!value.is_array()) throw config_error("networks: expected host CIDR array");
@@ -151,7 +146,9 @@ std::vector<AddressClientConfig> service_clients(const json& value, const std::s
     for (const auto& entry : value) {
         keys(entry, {"address", "shared_key", "networks"}, path);
         AddressClientConfig c;
-        c.address = endpoint(field(entry, "address", path), path + ".address", false);
+        // This is the authorized node's main tunnel endpoint, so it follows
+        // the same fixed-port shorthand as listen.bind_address and peers.
+        c.address = endpoint(field(entry, "address", path), path + ".address", false, 65535);
         c.shared_key = string_value(field(entry, "shared_key", path), path + ".shared_key");
         c.networks = service_networks(field(entry, "networks", path), path + ".networks");
         if (!seen.insert(c.address).second) throw config_error(path + ": duplicate address");
@@ -169,7 +166,7 @@ AddressServerConfig service_server(const json& value) {
     if (s.bind_address.ip.family != s.address.ip.family) throw config_error(p + ": bind address family mismatch");
     if (value.count("state_file")) s.state_file = string_value(value["state_file"], p + ".state_file");
     if (s.state_file.find('\0') != std::string::npos) throw config_error(p + ": NUL in state_file");
-    s.reclaim_after = number(value, "reclaim_after", 86400, 1, 31536000);
+    s.reclaim_after = number(value, "reclaim_after", 86400, 1, 31536000, p);
     s.networks = service_networks(field(value, "networks", p), p + ".networks");
     if (value.count("shared_key")) {
         if (value.count("clients")) throw config_error(p + ": shared_key and clients are mutually exclusive");
@@ -220,19 +217,23 @@ std::vector<AdvertisedRoute> advertised_routes(const json& value, const std::map
 }
 RemoteDesktopConfig remote_desktop(const json& value, const std::map<Network, IpAddress>& local) {
     const std::string path = "remote_desktop";
-    keys(value, {"enabled", "networks", "access", "unattended", "port", "device_name"}, path);
+    keys(value, {"enabled", "networks", "shared_key", "port", "device_name"}, path);
     RemoteDesktopConfig result; result.configured = true;
-    for (const auto name : {"enabled", "unattended"}) if (value.count(name)) {
+    if (value.count("enabled")) {
+        const auto name = "enabled";
         if (!value[name].is_boolean()) throw config_error(path + "." + name + ": expected boolean");
-        if (std::string(name) == "enabled") result.enabled = value[name].get<bool>();
-        else result.unattended = value[name].get<bool>();
+        result.enabled = value[name].get<bool>();
     }
-    if (value.count("access")) {
-        result.access = string_value(value["access"], path + ".access");
-        if (result.access != "authorized_devices" && result.access != "all_tunnel_nodes")
-            throw config_error(path + ".access: expected authorized_devices or all_tunnel_nodes");
+    if (value.count("shared_key")) {
+        if (!value["shared_key"].is_string())
+            throw config_error(path + ".shared_key: expected string");
+        result.shared_key = value["shared_key"].get<std::string>();
+        if (result.shared_key.size() > 4096)
+            throw config_error(path + ".shared_key: expected at most 4096 UTF-8 bytes");
     }
-    result.port = number(value, "port", 47831, 1, 65535);
+    if (result.enabled && result.shared_key.empty())
+        throw config_error(path + ".shared_key: required when enabled");
+    result.port = number(value, "port", 47831, 1, 65535, path);
     if (value.count("device_name")) {
         if (!value["device_name"].is_string()) throw config_error(path + ".device_name: expected string");
         result.device_name = value["device_name"].get<std::string>();
@@ -272,12 +273,8 @@ Configure parse_config(const std::string& text) {
         });
         const std::string config_path = "configuration";
         const std::string listen_path = "listen";
-        const bool has_endpoint = doc.is_object() && doc.count("endpoint");
-        const bool only_server = doc.is_object() && doc.count("address_server") && !has_endpoint && !doc.count("listen") && !doc.count("networks") && !doc.count("peers") && !doc.count("address_clients");
-        const bool simplified = doc.is_object() && (has_endpoint || doc.count("networks") || doc.count("address_clients") || only_server);
-        keys(doc, simplified ? std::set<std::string>{"endpoint", "networks", "tun_mtu", "transport_mtu", "thread_num", "listen", "peers", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"} :
-                              std::set<std::string>{"tun_mtu", "transport_mtu", "thread_num", "listen", "peers", "address_server", "advertise_routes", "remote_desktop", "device_backend"}, config_path);
-        number(doc, "thread_num", 1, 1, 1);
+        const bool only_server = doc.is_object() && doc.count("address_server") && !doc.count("listen") && !doc.count("networks") && !doc.count("peers") && !doc.count("address_clients");
+        keys(doc, {"networks", "tun_mtu", "transport_mtu", "listen", "peers", "address_server", "address_clients", "advertise_routes", "remote_desktop", "device_backend"}, config_path);
         Configure result;
         result.tun_mtu = number(doc, "tun_mtu", 1280, 576, 65535);
         result.transport_mtu = number(doc, "transport_mtu", 1500, 576, 65535);
@@ -293,38 +290,47 @@ Configure parse_config(const std::string& text) {
             return result;
         }
         if (doc.count("address_clients")) result.address_clients = service_clients(doc["address_clients"], "address_clients");
-        const auto empty_object = json::object();
-        const auto& listen = simplified && !doc.count("listen") ? empty_object : field(doc, "listen", config_path);
-        keys(listen, simplified ? std::set<std::string>{"enabled", "bind_address", "networks"} :
-                                 std::set<std::string>{"enabled", "address", "bind_address", "networks"}, listen_path);
-        const json default_enabled = true;
-        const auto& enabled = simplified && !listen.count("enabled") ? default_enabled : field(listen, "enabled", listen_path);
+        // `listen` is optional for outbound-only nodes.  An omitted block is
+        // equivalent to `{ "enabled": false }`; requiring a dummy bind
+        // address here made manually written connect-only configurations fail
+        // before the GUI could even display them.
+        const json empty_listen = json::object();
+        const bool has_listen = doc.count("listen") != 0;
+        const auto& listen = has_listen ? doc.at("listen") : empty_listen;
+        keys(listen, {"enabled", "bind_address", "shared_key", "networks"}, listen_path);
+        const json default_enabled = has_listen;
+        const auto& enabled = !listen.count("enabled") ? default_enabled : field(listen, "enabled", listen_path);
         if (!enabled.is_boolean()) throw config_error("listen.enabled: expected boolean");
         result.listen.enabled = enabled.get<bool>();
-        result.listen.address = simplified ? endpoint(field(doc, "endpoint", config_path), "endpoint", false) :
-                                             endpoint(field(listen, "address", listen_path), "listen.address", false);
-        result.listen.bind_address = result.listen.address;
-        result.listen.bind_address.ip.bytes.fill(0);
-        if (listen.count("bind_address"))
-            result.listen.bind_address = endpoint(listen["bind_address"], "listen.bind_address", true);
-        const auto family = result.listen.address.ip.family;
-        if (result.listen.bind_address.ip.family != family) throw config_error("listen.bind_address: address family differs from advertised address");
+        const bool has_bind_address = listen.count("bind_address") != 0;
+        // A fixed listener address has no meaning for an outbound-only node.
+        // Keep it only for address allocation clients, which use it as their
+        // stable allocator identity even when inbound listening is disabled.
+        const bool use_bind_address = has_bind_address &&
+            (result.listen.enabled || !result.address_clients.empty());
+        if (result.listen.enabled && !has_bind_address)
+            throw config_error("listen.bind_address: required when listen.enabled is true");
+        if (use_bind_address)
+            result.listen.bind_address = endpoint(listen.at("bind_address"), "listen.bind_address", true, 65535);
+        if (listen.count("shared_key")) {
+            const auto key = string_value(listen["shared_key"], "listen.shared_key");
+            if (result.listen.enabled) result.listen.shared_key = key;
+        }
+        const unsigned configured_family = use_bind_address ? result.listen.bind_address.ip.family : 0;
         std::map<Network, IpAddress> local;
         std::map<Network, Endpoint> managed;
-        if (simplified) {
-            if (doc.count("networks") && (!doc["networks"].is_array() || !doc["networks"].empty())) local_networks(doc["networks"], local);
-            else if (result.address_clients.empty()) throw config_error("networks: at least one static or managed network is required");
-            for (const auto& c : result.address_clients) for (const auto& n : c.networks) {
-                for (const auto& old : local) if (old.first.overlaps(n)) throw config_error("address_clients: duplicate or overlapping static/managed network");
-                if (local.size() >= 64) throw config_error("at most 64 distinct virtual networks are supported");
-                IpAddress ip; ip.family = n.address.family; local[n] = ip; managed[n] = c.address;
-            }
-            std::vector<NetworkConfig> all;
-            for (const auto& item : local) { NetworkConfig n; n.tunnel = item.first; n.tunnel_ip = item.second; all.push_back(n); }
-            result.listen.networks = listen.count("networks") ? network_refs(listen["networks"], "listen.networks", local) : all;
-        } else result.listen.networks = legacy_networks(field(listen, "networks", listen_path), "listen.networks", local);
+        if (doc.count("networks") && (!doc["networks"].is_array() || !doc["networks"].empty())) local_networks(doc["networks"], local);
+        else if (result.address_clients.empty()) throw config_error("networks: at least one static or managed network is required");
+        for (const auto& c : result.address_clients) for (const auto& n : c.networks) {
+            for (const auto& old : local) if (old.first.overlaps(n)) throw config_error("address_clients: duplicate or overlapping static/managed network");
+            if (local.size() >= 64) throw config_error("at most 64 distinct virtual networks are supported");
+            IpAddress ip; ip.family = n.address.family; local[n] = ip; managed[n] = c.address;
+        }
+        std::vector<NetworkConfig> all;
+        for (const auto& item : local) { NetworkConfig n; n.tunnel = item.first; n.tunnel_ip = item.second; all.push_back(n); }
+        result.listen.networks = listen.count("networks") ? network_refs(listen["networks"], "listen.networks", local) : all;
         const auto empty_array = json::array();
-        const auto& peers = simplified && !doc.count("peers") ? empty_array : field(doc, "peers", config_path);
+        const auto& peers = !doc.count("peers") ? empty_array : field(doc, "peers", config_path);
         if (!peers.is_array()) throw config_error("peers: expected array");
         if (peers.size() > 256) throw config_error("peers: at most 256 peers are supported");
         std::set<Endpoint> endpoints;
@@ -332,9 +338,10 @@ Configure parse_config(const std::string& text) {
             const auto p = "peers[" + std::to_string(i) + "]";
             keys(peers[i], {"endpoint", "shared_key", "networks", "transport"}, p);
             PeerConfig peer;
-            peer.address = endpoint(field(peers[i], "endpoint", p), p + ".endpoint", false);
-            if (peer.address == result.listen.address) throw config_error(p + ": peer is the local node");
-            if (peer.address.ip.family != family) throw config_error(p + ": first transport version requires one outer IP family");
+            peer.address = endpoint(field(peers[i], "endpoint", p), p + ".endpoint", false, 65535);
+            if (peer.address == result.listen.bind_address) throw config_error(p + ": peer is the local node");
+            if (configured_family && peer.address.ip.family != configured_family)
+                throw config_error(p + ": first transport version requires one outer IP family");
             if (!endpoints.insert(peer.address).second) throw config_error(p + ": duplicate peer");
             peer.shared_key = string_value(field(peers[i], "shared_key", p), p + ".shared_key");
             if (peers[i].count("transport")) {
@@ -342,8 +349,7 @@ Configure parse_config(const std::string& text) {
                 if (peer.transport != "udp" && peer.transport != "tcp")
                     throw config_error(p + ".transport: expected udp or tcp");
             }
-            if (!simplified) peer.networks = legacy_networks(field(peers[i], "networks", p), p + ".networks", local);
-            else if (peers[i].count("networks")) peer.networks = network_refs(peers[i]["networks"], p + ".networks", local);
+            if (peers[i].count("networks")) peer.networks = network_refs(peers[i]["networks"], p + ".networks", local);
             else if (local.size() == 1) {
                 NetworkConfig n; n.tunnel = local.begin()->first; n.tunnel_ip = local.begin()->second;
                 peer.networks.push_back(n);
@@ -352,6 +358,29 @@ Configure parse_config(const std::string& text) {
             result.peers.push_back(std::move(peer));
         }
         if (local.empty()) throw config_error("configuration: at least one virtual network is required");
+        if (!use_bind_address) {
+            unsigned family = configured_family;
+            if (!family && !result.peers.empty()) family = result.peers.front().address.ip.family;
+            if (!family && !result.address_clients.empty()) family = result.address_clients.front().address.ip.family;
+            if (!family) family = 4;
+            result.listen.bind_address.ip.family = family;
+            result.listen.bind_address.ip.bytes.fill(0);
+            // Outbound-only nodes do not own a public listener. Let the OS
+            // choose an ephemeral UDP source port so a stale process or a
+            // second GUI instance cannot collide on the default listener port.
+            // The concrete port is advertised after the socket is bound.
+            result.listen.bind_address.port = 0;
+        }
+        // Address allocation clients use the configured bind endpoint as the
+        // authenticated node identity. A synthesized or wildcard endpoint
+        // cannot be authorized by the allocator, so reject it explicitly
+        // instead of allowing a client that will fail every TLS handshake.
+        if (!result.address_clients.empty() && !result.listen.bind_address.ip.unicast())
+            throw config_error("address_clients requires a concrete unicast listen.bind_address");
+        const auto family = result.listen.bind_address.ip.family;
+        for (const auto& peer : result.peers)
+            if (peer.address.ip.family != family)
+                throw config_error("peers: first transport version requires one outer IP family");
         if (doc.count("advertise_routes")) result.advertise_routes = advertised_routes(doc["advertise_routes"], local);
         if (doc.count("remote_desktop")) result.remote_desktop = remote_desktop(doc["remote_desktop"], local);
         if (result.tun_mtu > protocol::maximum_tun_mtu(result.transport_mtu, family))
@@ -411,8 +440,11 @@ std::string serialize_config(const Configure& config) {
         }
         for (const auto& owner : owners) if (!local.count(owner.first)) throw config_error("undeclared managed local network");
         json doc = json::object();
-        const bool overlay = config.listen.address.port != 0;
-        if (overlay) { doc["endpoint"] = config.listen.address.str(); doc["networks"] = json::array(); }
+        // A node may be outbound-only: it still needs its virtual networks,
+        // but can omit a fixed outer bind endpoint when the listener is off.
+        const bool overlay = !config.networks.empty() || !config.peers.empty() ||
+            !config.address_clients.empty() || config.listen.bind_address.port != 0;
+        if (overlay) doc["networks"] = json::array();
         auto all_refs = json::array();
         for (const auto& item : local) {
             if (!owners.count(item.first)) doc["networks"].push_back(item.second.str() + "/" + std::to_string(item.first.prefix));
@@ -426,9 +458,13 @@ std::string serialize_config(const Configure& config) {
         doc["device_backend"] = config.device_backend;
         auto listen = json::object();
         if (!config.listen.enabled) listen["enabled"] = false;
-        auto default_bind = config.listen.address;
-        default_bind.ip.bytes.fill(0);
-        if (!(config.listen.bind_address == default_bind)) listen["bind_address"] = config.listen.bind_address.str();
+        // The wildcard/ephemeral bind synthesized for an outbound-only node
+        // is an implementation detail; keep omitted bind fields omitted when
+        // writing the canonical configuration.
+        if (config.listen.bind_address.port != 0 &&
+            (config.listen.enabled || !config.address_clients.empty()))
+            listen["bind_address"] = config.listen.bind_address.str();
+        if (config.listen.enabled && !config.listen.shared_key.empty()) listen["shared_key"] = config.listen.shared_key;
         const auto listen_refs = serialized_refs(config.listen.networks, local);
         if (listen_refs != all_refs) listen["networks"] = listen_refs;
         if (overlay && !listen.empty()) doc["listen"] = listen;
@@ -439,7 +475,7 @@ std::string serialize_config(const Configure& config) {
         });
         for (const auto* peer : peers) {
             json value = {{"endpoint", peer->address.str()}, {"shared_key", peer->shared_key}};
-            if (peer->transport != "udp") value["transport"] = peer->transport;
+            if (peer->transport != "tcp") value["transport"] = peer->transport;
             const auto refs = serialized_refs(peer->networks, local);
             if (refs.empty()) throw config_error("cannot serialize a peer without network authorization");
             // Never use an implicit all-networks permission for a multi-network
@@ -454,12 +490,11 @@ std::string serialize_config(const Configure& config) {
             doc["advertise_routes"].push_back(value);
         }
         const auto& remote = config.remote_desktop;
-        if (remote.configured || remote.enabled || remote.unattended || !remote.networks.empty() ||
-                remote.port != 47831 || !remote.device_name.empty() || remote.access != "authorized_devices") {
+        if (remote.configured || remote.enabled || !remote.networks.empty() ||
+                !remote.shared_key.empty() || remote.port != 47831 || !remote.device_name.empty()) {
             json value = {{"enabled", remote.enabled}, {"networks", json::array()}};
             for (const auto& n : remote.networks) value["networks"].push_back(n.str());
-            if (remote.access != "authorized_devices") value["access"] = remote.access;
-            if (remote.unattended) value["unattended"] = true;
+            if (!remote.shared_key.empty()) value["shared_key"] = remote.shared_key;
             if (remote.port != 47831) value["port"] = remote.port;
             if (!remote.device_name.empty()) value["device_name"] = remote.device_name;
             doc["remote_desktop"] = value;

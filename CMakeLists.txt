@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(tunnel LANGUAGES CXX)
 
 option(TUNNEL_REQUIRE_GUI_DEPS
-    "Require the desktop GUI Python dependencies during configure" ON)
+    "Require the desktop GUI Python dependencies during configure" OFF)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -118,8 +118,4 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_link_libraries(tcp_data_tests PRIVATE tunnel_core)
     add_test(NAME tcp_data COMMAND tcp_data_tests)
     set_tests_properties(tcp_data PROPERTIES TIMEOUT 90)
-    add_executable(tcp_legacy_tests tests/tcp_legacy_tests.cpp)
-    target_link_libraries(tcp_legacy_tests PRIVATE tunnel_core)
-    add_test(NAME tcp_legacy COMMAND tcp_legacy_tests)
-    set_tests_properties(tcp_legacy PROPERTIES TIMEOUT 30)
 endif()

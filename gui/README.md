@@ -3,13 +3,13 @@ Tunnel 图形界面
 Windows、Linux、macOS 桌面窗口采用 pywebview；Android 使用系统 WebView 和 VpnService。
 四个平台共用 assets/ 下的本地 HTML/CSS/JS，不加载 CDN，也不开放 HTTP 管理端口。
 本版包含：表单配置、JSON 导入/高级编辑、校验/保存，连接/断开，邻居和 ECMP 路径、会话与计数，日志筛选/复制/清空。
-桌面宿主另提供“远程桌面”页：远控配置、授权请求与设备名单、连接状态、JPEG 画面及鼠标键盘操作。Android 尚未提供远控功能。
+桌面启动器保留远程桌面入口：Tunnel 负责虚拟网络、节点认证和路由，GUI 调用已安装的 RustDesk 负责画面、编码、鼠标键盘和全屏。旧版 RFB/noVNC 代码保留为兼容回退，主界面不再依赖它。需要只运行基础隧道时，可显式加入 `--basic-mode`；该模式会隐藏远程桌面页面并直接管理核心，不启动远控 Runtime 或本地 IPC。
 “运行中”表示本机核心已启动；邻居是否已认证连接，要查看邻居列表。
 PSK 在表单中默认隐藏，可以显示、生成或复制；高级 JSON 中保留完整配置。运行日志会遮盖已知 PSK。
 
 简单配置
-填写本机传输端点，添加本机虚拟 IP/前缀（例如 10.1.0.2/24），再添加对端传输端点和 PSK。节点身份按每个虚拟网络的 tunnel_ip 区分。
-每个节点可选择“数据封装”：默认 UDP；UDP 受限时可选 TCP。任一端选择 TCP 且双方均支持时使用 TCP，旧版对端不支持时连接报错，不会自动回退。
+填写本机绑定 IP，添加本机虚拟 IP/前缀（例如 10.1.0.2/24），再添加对端 IP 和 PSK。主隧道控制与数据默认共用端口 65535；需要时仍可写成 IP:端口。节点身份按每个虚拟网络的 tunnel_ip 区分。
+每个节点可选择“数据封装”：默认 TCP；只有需要 UDP 时才选择 UDP。任一端选择 TCP 且双方配置支持时使用 TCP，不会自动回退到 UDP。
 TCP 数据与控制消息共用已认证的 TLS 连接；丢包重传可能阻塞后续数据。UDP 模式不因连通失败自动切换 TCP。
 概览的“数据封装”列显示已连接节点实际协商的 UDP/TCP；连接前显示请求的封装。运行时更改封装会重连对应邻接，其他节点保持原封装。
 每个本机网络只填写一次。只有一个网络时自动关联；多个网络时勾选每个对端允许通信的网络。
@@ -22,11 +22,11 @@ On Linux, build and load the tunnel_kmod module first; see [development.md](../d
 内核后端的 UDP 数据在内核处理，TCP 沿用用户态 TLS；切换后端会重建设备与连接。
 非 Linux 平台可以查看/编辑该字段，但选择内核后端启动会明确报错，不会自动回退。导入及保存保持原选择。
 编辑 JSON 后先点“应用到表单”；未应用的 JSON 不会被旧表单默默覆盖或忽略。
-旧配置导入会由核心校验后转换，保持监听和对端授权；无效配置原文保留供修改。
+配置只接受当前 JSON schema；无效配置原文保留供修改。
 
 Windows 成品
-    build/gui/TunnelUI/TunnelUI.exe
-    build/gui/TunnelUI/TunnelCtl.exe
+    build/gui/TunnelUI-live/TunnelUI.exe
+    build/gui/TunnelUI-live/TunnelCtl.exe
 现有成品保留 2026-10-16 的 TCP 封装版本。2026-10-19 内核设备后端本轮未重新打包 Windows GUI/CLI；新后端选择界面请使用下方源码入口。
 TunnelCtl提供独立命令行配置，与界面共用配置目录和后台。例如：
     TunnelCtl.exe config show
@@ -36,8 +36,8 @@ TunnelCtl提供独立命令行配置，与界面共用配置目录和后台。�
 See the packaged CLI-README.md or the repository [CLI guide](../docs/cli.md) for complete commands.
 保留整个 TunnelUI 文件夹（包括 _internal、核心程序、DLL 和许可证），不要只复制 EXE。
 窗口请求管理员权限以创建 Wintun。电脑需要 Microsoft Edge WebView2 Runtime。
-首次打开载入仓库示例，必须按实际节点修改地址和 shared_key 后连接。
-默认关闭窗口会正常停止后台与核心。只有同时开启本机远程桌面和无人值守时，关闭窗口才保留后台连接；重新打开同一配置目录会接回后台。
+首次打开载入仓库示例，必须按实际节点修改地址和 shared_key 后连接。关闭“接受对端主动建立 TCP 连接”后可只主动连接已配置节点，并省略本机绑定地址；开启监听时可填写具体地址或 `0.0.0.0:端口`/`[::]:端口` 绑定所有网卡。高级设置中的监听共享密钥可让持钥节点直接建立入站邻接，无需在本机逐一添加 peer；入站网络仍按监听网络授权限制。
+默认关闭窗口会停止后台与核心；关闭窗口不会保留远程桌面后台连接。
 界面的“断开网络”始终停止后台、核心和远控会话。关闭控制端窗口也会断开其正在查看的桌面，释放远端按键。
 核心 stdin 由独立后台持有；后台退出或管道 EOF 才通知核心停止，GUI 的关闭不再直接关闭核心管道。
 
@@ -58,9 +58,13 @@ gir1.2-webkit2-4.1 和 python3-venv；Python 环境必须能够导入系统 gi�
 开发阶段可以在有显示会话和权限的终端启动宿主。Linux/macOS 本版未实现独立提权服务。
 Linux 日志复制需要 wl-clipboard 或 xclip；中文显示需要可用的中文系统字体。
 本工作区已安装 WSLg 的 GTK/WebKit，隔离 Python 环境为 build-wsl/gui-venv。
-从 WSL 有显示会话的终端运行：
-    sudo --preserve-env=DISPLAY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR build-wsl/gui-venv/bin/python gui/main.py --binary build-wsl-reload/tunnel
+从 WSL 有显示会话的终端运行（推荐使用仓库根目录的 `run-gui.sh`）：
+    bash run-gui.sh
+Linux 先执行仓库根目录的 `bash build.sh`，再运行 `bash run-gui.sh`；核心没有 `CAP_NET_ADMIN` 时，脚本会直接提示执行 `sudo bash run-gui.sh`，不会在后台弹出密码请求。以 sudo 启动时脚本设置文件能力后切回桌面用户运行 WebView，避免窗口卡在“正在启动”。Wayland 会自动切换到当前桌面的 XWayland 显示。使用 `device_backend=kernel` 时，还需预先为当前内核安装模块和设备权限。Windows 先执行 `build.bat --gui`，再使用 `run-gui.bat`/`.vbs` 无黑框启动并保留远程桌面功能。
+构建脚本会同时准备 RustDesk：Linux 自动安装官方 `.deb`，Windows `build.bat --gui` 优先使用 winget，找不到 winget 包时下载官方便携版。离线或只构建核心可加入 `--skip-rustdesk`。
 macOS 使用 Cocoa/WKWebView 后端；系统权限还必须允许核心配置 utun 和路由。
+
+启动脚本会先清理当前 `TUNNEL` 目录下残留的 GUI、后台宿主和核心进程，再启动新实例。需要手动退出时可运行 `stop-gui.sh`（Linux）或 `stop-gui.bat`（Windows）；脚本只匹配当前项目目录，不会结束其他目录的 Tunnel。
     python3 gui/main.py --binary build/tunnel
 依赖安装说明：https://pywebview.flowrl.com/guide/installation.html
 
@@ -72,10 +76,10 @@ macOS 使用 Cocoa/WKWebView 后端；系统权限还必须允许核心配置 ut
 服务使用独立 TCP 地址；同一机器与隧道监听共存时使用不同端口。改变授权方式只修改当前表单，保存或重新连接后才生效。
 “仅提供分配服务”只保存 address_server，不创建 TUN；高端口独立服务本身不需要创建虚拟网卡的权限。
 共享模式新增的地址池对所有持钥节点开放；逐节点模式新增池不会自动授权给已有节点。地址池不会使服务端自动加入对应虚拟网络。
-共享模式下填写“客户端 endpoint”后导出接入配置；此 endpoint 只用于导出，不保存到服务配置。导出包含接入密钥和所有地址池。
+共享模式下填写“客户端绑定地址”后导出接入配置；该地址只用于导出，不保存到服务配置。导出包含接入密钥和所有地址池。
 逐节点模式仍可从对应节点卡片导出，只包含该节点的密钥及授权池。复制完整客户端 JSON，交给对应节点。
 客户端在“自动获取虚拟 IP”中导入这份 JSON，也可直接填写分配服务地址、密钥和申请网段。
-导入可明确选择合并或替换：合并保留现有静态地址、peer、监听设置和授权，不会覆盖已有不同密钥；endpoint 不一致时拒绝合并。
+导入可明确选择合并或替换：合并保留现有静态地址、peer、监听设置和授权，不会覆盖已有不同密钥；绑定地址不一致时拒绝合并。
 替换会先确认，再替换整个当前配置。导入后仍需保存或连接；分配服务不会代替 peer 连接配置。
 自动申请的网段参与 peer 和入站网络授权；新增网段不会扩大已有 peer 的权限。静态网络与自动申请网段不能重叠。
 “IP 地址分配”概览分别显示等待、连接、已取得地址、各池失败原因，以及服务端在线/离线保留的绑定记录。
@@ -97,32 +101,26 @@ examples/subnet-gateway.json 与 subnet-client.json 提供配对示例；先替�
 真实 Linux 子网回归 tests/subnet_network_integration.py 使用独立命名空间验证两级转发、双出口切换、SNAT 与无 SNAT 的 TCP/UDP/ICMP、返回流量限制及 IPv6 路由。
 
 远程桌面（Windows、Linux、macOS 桌面宿主）
-先导入 examples/desktop-host.json 和 desktop-client.json，修改 endpoint、虚拟地址与双方一致的 peer 密钥，确认隧道互通。
-被控端在“远程桌面”页开启服务并选择允许的虚拟网络。单网络可省略网络列表；多个网络必须明确选择，新增网络不会自动加入远控范围。
-控制端输入被控端的虚拟 IP 和共同网络，点击“连接桌面”。首次连接需核对并信任对端长期设备指纹。
-“仅已授权设备”是默认模式：被控端在待批准列表核对设备指纹，选择只查看或键鼠控制，并决定是否记住设备。
-开启无人值守后，已经记住的设备可免逐次确认；关闭无人值守时，每次仍需被控端批准。
-“本虚拟网络内所有节点”允许所选网络内经认证的有效节点访问；同时开启无人值守即可免逐台批准。公网访客和其他网络不在此范围内。
-全网络模式下移出设备名单不会阻止该节点再次连接；切回名单模式、关闭服务或收缩网络范围会即时重新检查权限并关闭现有会话。
-名单模式撤销设备会终止对应会话。当前会话可单独点“终止会话”，控制端可点“断开桌面”。
-点击画面后使用鼠标键盘；画面失焦或连接断开会释放按键。只查看权限在服务端强制限制输入。
+两端先安装 RustDesk，在 RustDesk 设置中启用直连 IP；Tunnel 两端配置相同的 peer 密钥、虚拟 IP 和网段，确认虚拟 IP 互通。
+控制端在“远程桌面”页选择共同虚拟网络，填写对端虚拟 IP，点击“用 RustDesk 打开”。RustDesk 密码由 RustDesk 自己管理，可以留空让客户端提示；RustDesk 的全屏、画质、鼠标和键盘也由客户端负责。
+GUI 只允许启动所选 Tunnel 网络中的虚拟 IP，不接受 RustDesk ID，避免绕过 Tunnel 的节点认证和路由。
+远控配置不再支持设备授权名单、批准请求或无人值守开关；旧配置中的这些字段必须删除后才能导入。
 运行中“保存并应用”会同时应用当前表单的全部配置，包括远控策略和网络配置。节点增删及密钥修改只影响相关连接；虚拟网络、监听、MTU 等资源变更可能短暂重连。应用失败会显示原因并保留编辑内容，不宣称已保存生效。
-本版支持已登录桌面的单屏操作。Linux 使用 X11；Wayland 明确不支持。macOS 需首次本机授予屏幕录制和辅助功能权限。
-尚未实现系统开机服务、登录界面、UAC/锁屏安全桌面、音频、剪贴板与文件传输。关闭 GUI 保留后台不等于重启后自动运行。
-授权设备密钥独立于 peer 的 PSK，并持久保存；加入隧道本身不会在名单模式下自动获得桌面权限。
+本版支持已登录桌面的单屏操作。GUI 可运行在 Linux Wayland，但屏幕采集和输入后端仍要求 X11。macOS 需首次本机授予屏幕录制和辅助功能权限。
+尚未实现系统开机服务、登录界面、UAC/锁屏安全桌面、音频、剪贴板与文件传输。关闭 GUI 会停止后台，重启后需要重新启动应用。
+远控预共享密钥独立于 peer 的 PSK；加入隧道后仍必须提供正确的远控密钥，才能建立桌面会话。
 协议、身份文件、后台命令行和具体平台边界见 ../remote_desktop/README.md。
 
 配置存储位置
-Windows: %LOCALAPPDATA%/Tunnel/configure.json
-Linux:   $XDG_CONFIG_HOME/Tunnel/configure.json，未设置时 ~/.config/Tunnel/configure.json
-macOS:   ~/Library/Application Support/Tunnel/configure.json
-可用 --config-dir PATH 指定目录；POSIX 下新配置文件权限为 0600。
+源码运行或打包运行时，`configure.json` 和 `background/configure.json` 默认保存在
+Tunnel 应用/项目目录中，也就是本仓库的 `TUNNEL` 文件夹。可用 `--config-dir PATH`
+指定独立配置目录；POSIX 下新配置文件权限为 0600。
 保存通过核心 --normalize-config 校验并转成新格式；错误配置不会覆盖已保存文件。
-加载旧配置只转换返回给界面的文本，不修改原文件；显式保存或连接才写入新格式。
+加载配置只转换返回给界面的文本，不修改原文件；显式保存或连接才写入规范格式。
 运行期间保存的全部配置即时应用；无需先手动断开。核心按照配置差异更新节点或重建网络资源，界面会提示重连；只有保存配置尚未启动服务时，才在下次连接生效。
 运行配置应用成功后才提交用户保存文件；提交失败会尝试恢复原运行配置，回滚失败会明确报告。界面和命令行共享配置应用入口，同一配置目录的保存操作串行执行。
 如果另一窗口或命令行已修改保存文件，界面会拒绝覆盖并保留当前编辑；先重新载入，再合并需要保留的修改。
-后台使用持久目录中的 background/configure.json 运行快照与 background/status.json 状态文件；界面重新打开可读取同一后台状态。
+后台使用持久目录中的 background/configure.json 运行快照与 background/status.json 状态文件；应用重新启动后会读取当前配置并重新建立后台。
 界面保留最近 500 条日志，包含核心输出和远控事件。核心输出保存在 remote-core.log，后台诊断写入 desktop-host.log；关闭界面不会删除这些文件。
 “清空日志”只清除当前界面记录，不删除磁盘日志。日志和身份文件应与配置一样保存在用户私有目录。
 
@@ -154,7 +152,7 @@ Android 本版没有远程桌面控制端或被控端，页面明确显示不支
     python tests/gui_host_test.py --binary build-reload/tunnel.exe
     python tests/gui_host_test.py --binary build-reload/tunnel.exe --live
     python tests/gui_window_smoke.py --binary build-reload/tunnel.exe
-    python tests/gui_package_test.py --package build/gui/TunnelUI
+    python tests/gui_package_test.py --package build/gui/TunnelUI-live
 打包后台检查使用隔离的 loopback 地址分配服务，验证冻结程序后台入口、持久身份、重新接回、策略更新与停止，不创建 TUN 或操作屏幕输入。
 --live 和窗口测试会临时创建 198.18.253.0/30 的 TUN；需要权限且该网段不应已被占用。
 The browser regression is tests/gui_frontend_test.js; platform results are listed in [test-results.md](../docs/test-results.md).

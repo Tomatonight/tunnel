@@ -4,7 +4,7 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
-#define TNLK_ABI 2
+#define TNLK_ABI 3
 #define TNLK_MAX_BLOB (1024U * 1024U)
 #define TNLK_MAX_PACKET 65536U
 #define TNLK_MAX_NETWORKS 128U
@@ -42,6 +42,7 @@ struct tnlk_net {
 } __attribute__((packed));
 struct tnlk_peer {
     struct tnlk_endpoint endpoint;
+    struct tnlk_endpoint source; /* local address used for UDP replies */
     struct tnlk_keys keys;
     __u8 tcp, ready;
     __u8 networks[TNLK_MAX_NETWORKS / 8]; /* snapshot network index bitmap */

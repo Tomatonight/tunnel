@@ -29,7 +29,7 @@ def main():
             root = Path(directory)
             pools = ['10.66.0.0/24', 'fd00:66::/64']
             local, server, secret = '127.0.0.1:45100', '127.0.0.1:45101', 'test-only-self-allocation'
-            config = {'device_backend': 'tun', 'address': local,
+            config = {'device_backend': 'tun', 'listen': {'bind_address': local},
                 'address_server': {'address': server, 'networks': pools, 'shared_key': secret},
                 'address_clients': [{'address': server, 'shared_key': secret, 'networks': pools}]}
             path, status = root / 'node.json', root / 'status.json'

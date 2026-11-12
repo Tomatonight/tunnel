@@ -25,64 +25,8 @@ void invalid_config(const json& value) {
     CHECK(!try_parse_config(value.dump(), &result, &error)); CHECK(!error.empty());
 }
 Endpoint node(unsigned n) { return Endpoint::parse("100.0.0." + std::to_string(n) + ":65535"); }
+NodeId node_id(unsigned n) { return IpAddress::parse("10.1.0." + std::to_string(n)); }
 Network network() { return Network::parse("10.1.0.0/24"); }
-void legacy_configuration_tests(const json& base) {
-    auto config = parse_config(base.dump());
-    CHECK(config.networks.size() == 2); CHECK(config.peers.size() == 1);
-    CHECK(config.listen.bind_address.str() == "0.0.0.0:65535");
-    CHECK(protocol::maximum_tun_mtu(1500, 4) == 1306);
-    CHECK(protocol::maximum_tun_mtu(1500, 6) == 1286);
-    auto d = base; d.erase("tun_mtu"); d.erase("transport_mtu"); d["listen"].erase("bind_address");
-    CHECK(parse_config(d.dump()).tun_mtu == 1280);
-    CHECK(parse_config(d.dump()).listen.bind_address.ip.unspecified());
-    d = base; d["thread_num"] = 1; CHECK(parse_config(d.dump()).tun_mtu == 1280);
-    d["thread_num"] = 2; invalid_config(d);
-    d["thread_num"] = true; invalid_config(d);
-    d = base; d["tun_mtu"] = 1306; CHECK(parse_config(d.dump()).tun_mtu == 1306);
-    d["tun_mtu"] = 1307; invalid_config(d);
-    d["tun_mtu"] = -1; invalid_config(d);
-    d = base; d["transport_mtu"] = 1280; invalid_config(d);
-    d = base; d["peers"][0]["networks"][0]["tunnel"] = "10.1.0.99/24";
-    CHECK(parse_config(d.dump()).networks[0].tunnel.str() == "10.1.0.0/24");
-    d["peers"][0]["networks"][0]["tunnel_ip"] = "10.1.0.3"; invalid_config(d);
-    d = base; d["peers"][0]["networks"][1] = {{"tunnel", "10.0.0.0/8"}, {"tunnel_ip", "10.2.0.1"}}; invalid_config(d);
-    d = base; d["listen"]["address"] = "0.0.0.0:65535"; invalid_config(d);
-    d = base; d["listen"]["address"] = "100.0.0.1:65536"; invalid_config(d);
-    d = base; d["peers"][0]["address"] = "100.0.0.1:65535"; invalid_config(d);
-    d = base; d["peers"][0]["shared_key"] = ""; invalid_config(d);
-    d = base; d["peers"].push_back(d["peers"][0]); invalid_config(d);
-    d = base; d["peers"][0]["networks"][0]["tunnel_ip"] = "10.1.0.255"; invalid_config(d);
-    d = base; d["peers"][0]["networks"][0]["tunnel_ip"] = "10.2.0.1"; invalid_config(d);
-    d = base; d["auto_key"] = true; invalid_config(d);
-    d = base; d["listen"]["enabled"] = false; CHECK(!parse_config(d.dump()).listen.enabled);
-    d = base; d["listen"]["address"] = "[2001:db8::1]:65535";
-    d["listen"].erase("bind_address"); d["peers"][0]["address"] = "[2001:db8::2]:65535";
-    CHECK(parse_config(d.dump()).listen.bind_address.str() == "[::]:65535");
-    d["peers"][0]["networks"][1] = {{"tunnel", "fd00::/64"}, {"tunnel_ip", "fd00::1"}};
-    CHECK(parse_config(d.dump()).networks.size() == 2);
-    d["tun_mtu"] = 1200; invalid_config(d);
-    std::string error;
-    CHECK(!try_parse_config("{\"listen\":{},\"listen\":{}}", &config, &error));
-    CHECK(error.find("duplicate") != std::string::npos);
-    CHECK(!try_parse_config("[]", &config, &error));
-    CHECK(!try_parse_config("{\"shared_key\": SECRET_SHOULD_NOT_APPEAR}", &config, &error));
-    CHECK(error.find("SECRET_SHOULD_NOT_APPEAR") == std::string::npos);
-    CHECK(!try_parse_config(base.dump(), nullptr, &error));
-    CHECK(!try_parse_config(std::string(1048577, ' '), &config, &error));
-    CHECK(error.find("1 MiB") != std::string::npos);
-    CHECK(!try_parse_config(std::string(40, '[') + "0" + std::string(40, ']'), &config, &error));
-    CHECK(error.find("nesting") != std::string::npos);
-    d = base; d["peers"] = json::array();
-    for (unsigned i = 0; i < 257; ++i) d["peers"].push_back(base["peers"][0]);
-    invalid_config(d);
-    d = base; d["peers"][0]["networks"] = json::array();
-    for (unsigned i = 0; i < 64; ++i) d["peers"][0]["networks"].push_back(
-        {{"tunnel", "172.20." + std::to_string(i) + ".0/24"}, {"tunnel_ip", "172.20." + std::to_string(i) + ".1"}});
-    invalid_config(d); // Limit applies to the union, including listen.networks.
-    CHECK(Network::parse("2001:db8:0:0::1/64") == Network::parse("2001:db8::/64"));
-    CHECK(Endpoint::parse("[2001:0db8::1]:1234") == Endpoint::parse("[2001:db8::1]:1234"));
-}
-
 json network_policy(const std::vector<NetworkConfig>& networks) {
     auto result = json::object();
     for (const auto& n : networks) result[n.tunnel.str()] = n.tunnel_ip.str();
@@ -90,8 +34,7 @@ json network_policy(const std::vector<NetworkConfig>& networks) {
 }
 json expanded_config(const Configure& c) {
     json result = {{"tun_mtu", c.tun_mtu}, {"transport_mtu", c.transport_mtu}, {"device_backend", c.device_backend},
-        {"address", c.listen.address.str()}, {"bind", c.listen.bind_address.str()},
-        {"enabled", c.listen.enabled}, {"networks", network_policy(c.networks)},
+        {"bind", c.listen.bind_address.str()}, {"enabled", c.listen.enabled}, {"listen_key", c.listen.shared_key}, {"networks", network_policy(c.networks)},
         {"inbound_networks", network_policy(c.listen.networks)}, {"peers", json::object()}};
     for (const auto& peer : c.peers) result["peers"][peer.address.str()] = {
         {"key", peer.shared_key}, {"networks", network_policy(peer.networks)}, {"transport", peer.transport}};
@@ -105,30 +48,46 @@ void roundtrip_policy(const json& source) {
     CHECK(serialize_config(reloaded) == normalized);
 }
 void configuration_tests(const json& base) {
-    const auto legacy = json::parse(R"({
-      "tun_mtu":1280,"transport_mtu":1500,
-      "listen":{"enabled":true,"address":"100.0.0.1:65535","bind_address":"0.0.0.0:65535",
-        "networks":[{"tunnel":"10.1.0.0/24","tunnel_ip":"10.1.0.2"}]},
-      "peers":[{"address":"100.0.0.2:65535","shared_key":"use-a-random-high-entropy-secret",
-        "networks":[{"tunnel":"10.1.0.0/24","tunnel_ip":"10.1.0.2"},
-                    {"tunnel":"192.168.0.0/24","tunnel_ip":"192.168.0.2"}]}]
-    })");
-    legacy_configuration_tests(legacy);
     const auto simple = parse_config(base.dump());
     CHECK(simple.networks.size() == 1 && simple.peers.size() == 1);
     CHECK(simple.networks[0].tunnel.str() == "10.1.0.0/24");
     CHECK(simple.networks[0].tunnel_ip.str() == "10.1.0.2");
-    CHECK(simple.listen.enabled && simple.listen.bind_address.str() == "0.0.0.0:65535");
+    CHECK(simple.listen.enabled && simple.listen.bind_address.str() == "100.0.0.1:65535");
+    CHECK(simple.listen.shared_key.empty());
+    CHECK(simple.peers[0].transport == "tcp");
     CHECK(simple.tun_mtu == 1280 && simple.transport_mtu == 1500);
-    auto old_single = legacy; old_single["peers"][0]["networks"].erase(1);
-    CHECK(expanded_config(simple) == expanded_config(parse_config(old_single.dump())));
-    CHECK(serialize_config(simple) == serialize_config(parse_config(old_single.dump())));
-    roundtrip_policy(base); roundtrip_policy(legacy);
-    auto canonical = json::parse(serialize_config(parse_config(legacy.dump())));
-    CHECK(canonical.at("networks") == json({"10.1.0.2/24", "192.168.0.2/24"}));
-    CHECK(canonical.at("listen").at("networks") == json({"10.1.0.0/24"}));
-    CHECK(canonical.at("peers")[0].at("networks") == json({"10.1.0.0/24", "192.168.0.0/24"}));
-    CHECK(!canonical.contains("tun_mtu") && !canonical.contains("transport_mtu"));
+    auto omitted_listen = base;
+    omitted_listen.erase("listen");
+    const auto outbound_only = parse_config(omitted_listen.dump());
+    CHECK(!outbound_only.listen.enabled && outbound_only.listen.bind_address.port == 0);
+    roundtrip_policy(omitted_listen);
+    const auto canonical = json::parse(serialize_config(simple));
+    CHECK(!canonical.contains("endpoint"));
+    CHECK(canonical.at("listen").at("bind_address") == "100.0.0.1:65535");
+    CHECK(canonical.at("peers")[0].at("endpoint") == "100.0.0.2:65535");
+    auto shorthand = base;
+    shorthand["listen"]["bind_address"] = "100.0.0.1";
+    shorthand["peers"][0]["endpoint"] = "100.0.0.2";
+    const auto shorthand_config = parse_config(shorthand.dump());
+    CHECK(shorthand_config.listen.bind_address.str() == "100.0.0.1:65535");
+    CHECK(shorthand_config.peers[0].address.str() == "100.0.0.2:65535");
+    auto shorthand_v6 = base;
+    shorthand_v6["listen"]["bind_address"] = "fd00::1";
+    shorthand_v6["peers"][0]["endpoint"] = "fd00::2";
+    const auto shorthand_v6_config = parse_config(shorthand_v6.dump());
+    CHECK(shorthand_v6_config.listen.bind_address.str() == "[fd00::1]:65535");
+    CHECK(shorthand_v6_config.peers[0].address.str() == "[fd00::2]:65535");
+    auto managed = base;
+    managed["address_server"] = {
+        {"address", "100.0.0.10:65534"},
+        {"networks", {"10.90.0.0/24"}},
+        {"clients", {{{"address", "100.0.0.3"}, {"shared_key", "managed-client-key"}, {"networks", {"10.90.0.0/24"}}}}}
+    };
+    const auto managed_config = parse_config(managed.dump());
+    CHECK(managed_config.address_server.clients.size() == 1);
+    CHECK(managed_config.address_server.clients[0].address.str() == "100.0.0.3:65535");
+    roundtrip_policy(managed);
+    roundtrip_policy(base);
 #if defined(__linux__) && !defined(__ANDROID__)
     CHECK(simple.device_backend == "kernel");
 #else
@@ -136,63 +95,42 @@ void configuration_tests(const json& base) {
 #endif
     CHECK(Configure().device_backend == simple.device_backend);
     CHECK(canonical.at("device_backend") == simple.device_backend);
-    for (auto source : {base, legacy}) {
-        source["device_backend"] = "kernel";
-        CHECK(parse_config(source.dump()).device_backend == "kernel");
-        CHECK(json::parse(serialize_config(parse_config(source.dump())))["device_backend"] == "kernel");
-        roundtrip_policy(source);
-        source["device_backend"] = "tun";
-        CHECK(parse_config(source.dump()).device_backend == "tun");
-        CHECK(json::parse(serialize_config(parse_config(source.dump())))["device_backend"] == "tun");
-        roundtrip_policy(source);
-        for (const auto& invalid_backend : json::array({"auto", "Kernel", "", true, 1, nullptr, json::array(), json::object()})) {
-            source["device_backend"] = invalid_backend;
-            invalid_config(source);
-        }
-    }
-    auto invalid_backend_config = simple; invalid_backend_config.device_backend = "unknown";
-    bool backend_rejected = false;
-    try { serialize_config(invalid_backend_config); } catch (const config_error&) { backend_rejected = true; }
-    CHECK(backend_rejected);
-    // Defaults remain compatible with existing UDP configurations. Transport is
-    // a per-adjacency choice and survives legacy-to-simplified normalization.
-    CHECK(simple.peers[0].transport == "udp");
-    CHECK(parse_config(legacy.dump()).peers[0].transport == "udp");
-    CHECK(!canonical["peers"][0].contains("transport"));
-    for (auto source : {base, legacy}) {
-        source["peers"][0]["transport"] = "tcp";
-        CHECK(parse_config(source.dump()).peers[0].transport == "tcp");
-        CHECK(json::parse(serialize_config(parse_config(source.dump())))["peers"][0]["transport"] == "tcp");
-        roundtrip_policy(source);
-        source["peers"][0]["transport"] = "udp";
-        CHECK(parse_config(source.dump()).peers[0].transport == "udp");
-        CHECK(!json::parse(serialize_config(parse_config(source.dump())))["peers"][0].contains("transport"));
-        for (const auto& invalid_transport : json::array({"auto", "TCP", "", true, 1, nullptr, json::array(), json::object()})) {
-            source["peers"][0]["transport"] = invalid_transport;
-            invalid_config(source);
-        }
-    }
-    auto mixed = base;
-    mixed["peers"][0]["transport"] = "tcp";
-    auto second = mixed["peers"][0]; second["address"] = "100.0.0.3:65535"; second.erase("transport");
-    mixed["peers"].push_back(second);
-    const auto mixed_config = parse_config(mixed.dump());
-    CHECK(mixed_config.peers[0].transport == "tcp" && mixed_config.peers[1].transport == "udp");
-    roundtrip_policy(mixed);
-    // TCP links may coexist with UDP transit links, so they retain the same MTU
-    // validation instead of allowing oversized packets on only some paths.
-    auto tcp_oversized = base; tcp_oversized["peers"][0]["transport"] = "tcp";
-    tcp_oversized["tun_mtu"] = 1307; invalid_config(tcp_oversized);
-    auto d = base; d.erase("peers");
-    CHECK(parse_config(d.dump()).peers.empty()); roundtrip_policy(d);
-    d["listen"] = json::object(); CHECK(parse_config(d.dump()).listen.enabled);
-    d = base; d["thread_num"] = 1; CHECK(parse_config(d.dump()).tun_mtu == 1280);
-    CHECK(!json::parse(serialize_config(parse_config(d.dump()))).contains("thread_num"));
-    d["thread_num"] = 2; invalid_config(d);
+
+    auto d = base; d["listen"].erase("bind_address"); invalid_config(d);
+    d = base; d["endpoint"] = "100.0.0.1:65535"; invalid_config(d);
+    d = base; d["listen"]["address"] = "100.0.0.1:65535"; invalid_config(d);
+    d = base; d["peers"][0]["address"] = "100.0.0.2:65535"; invalid_config(d);
+    d = base; d["networks"][0] = {{"tunnel", "10.1.0.0/24"}, {"tunnel_ip", "10.1.0.2"}}; invalid_config(d);
+    d = base; d["auto_key"] = true; invalid_config(d);
+    d = base; d["listen"]["enabled"] = false; CHECK(!parse_config(d.dump()).listen.enabled); roundtrip_policy(d);
+    d = base; d["listen"]["shared_key"] = "listen-admission-key";
+    CHECK(parse_config(d.dump()).listen.shared_key == "listen-admission-key"); roundtrip_policy(d);
+    d["listen"]["shared_key"] = ""; invalid_config(d);
+    d = base; d["listen"]["bind_address"] = "0.0.0.0:65535"; CHECK(parse_config(d.dump()).listen.bind_address.ip.unspecified()); roundtrip_policy(d);
+    d = base; d["listen"] = {{"enabled", false}};
+    auto outbound_only = parse_config(d.dump()); CHECK(!outbound_only.listen.enabled && outbound_only.listen.bind_address.ip.unspecified() && outbound_only.listen.bind_address.port == 0);
+    roundtrip_policy(d);
+    d = base; d["listen"]["bind_address"] = "100.0.0.1:65536"; invalid_config(d);
+    d = base; d["peers"][0]["endpoint"] = "100.0.0.1:65535"; invalid_config(d);
+    d = base; d["peers"][0]["shared_key"] = ""; invalid_config(d);
+    d = base; d["peers"].push_back(d["peers"][0]); invalid_config(d);
+    d = base; d["peers"][0]["networks"] = json::array(); invalid_config(d);
+    d = base; d["peers"][0]["networks"] = {"10.2.0.0/24"}; invalid_config(d);
+    d = base; d["peers"][0]["networks"] = {"10.1.0.2/24"}; invalid_config(d);
+    d = base; d["listen"]["networks"] = {"10.2.0.0/24"}; invalid_config(d);
+    d = base; d["listen"] = {{"enabled", false}, {"networks", json::array()}, {"bind_address", "127.0.0.1:45000"}, {"shared_key", "stale-listener-key"}};
+    const auto disabled_bind = parse_config(d.dump());
+    CHECK(disabled_bind.listen.bind_address.ip.unspecified() && disabled_bind.listen.bind_address.port == 0);
+    CHECK(disabled_bind.listen.shared_key.empty());
+    const auto disabled_bind_normalized = json::parse(serialize_config(disabled_bind));
+    CHECK(disabled_bind_normalized["listen"] == json({{"enabled", false}, {"networks", json::array()}}));
+
+    d = base; d.erase("peers"); CHECK(parse_config(d.dump()).peers.empty()); roundtrip_policy(d);
+    d = base; d["listen"] = json::object(); invalid_config(d);
+    d = base; d["obsolete_option"] = 1; invalid_config(d);
     d = base; d["tun_mtu"] = 1306; roundtrip_policy(d);
     d["tun_mtu"] = 1307; invalid_config(d);
     d = base; d["transport_mtu"] = 1600; d["tun_mtu"] = 1400; roundtrip_policy(d);
-    d = base; d.erase("address"); invalid_config(d);
     d = base; d.erase("networks"); invalid_config(d);
     d = base; d["networks"] = json::array(); invalid_config(d);
     d = base; d["networks"] = nullptr; invalid_config(d);
@@ -201,66 +139,42 @@ void configuration_tests(const json& base) {
     d = base; d["networks"] = {"10.1.0.255/24"}; invalid_config(d);
     d = base; d["networks"].push_back("10.1.0.3/24"); invalid_config(d);
     d = base; d["networks"].push_back("10.2.0.1/8"); invalid_config(d);
-    d = base; d["address"] = "0.0.0.0:65535"; invalid_config(d);
-    d = base; d["address"] = "100.0.0.1:65536"; invalid_config(d);
-    d = base; d["listen"] = {{"address", "100.0.0.1:65535"}}; invalid_config(d);
-    d = legacy; d["address"] = "100.0.0.1:65535"; invalid_config(d);
-    d = base; d["networks"] = legacy["listen"]["networks"]; invalid_config(d);
-    d = base; d["peers"][0]["networks"] = legacy["listen"]["networks"]; invalid_config(d);
-    d = base; d["listen"] = {{"networks", legacy["listen"]["networks"]}}; invalid_config(d);
-    d = base; d["listen"] = {{"enabled", "true"}}; invalid_config(d);
-    d = base; d["listen"] = {{"bind_address", "[::]:65535"}}; invalid_config(d);
     d = base; d["peers"] = nullptr; invalid_config(d);
-    d = base; d["peers"][0]["shared_key"] = ""; invalid_config(d);
-    d = base; d["peers"][0]["address"] = base["address"]; invalid_config(d);
-    d = base; d["peers"][0]["networks"] = json::array(); invalid_config(d);
-    d = base; d["peers"][0]["networks"] = {"10.2.0.0/24"}; invalid_config(d);
-    d = base; d["peers"][0]["networks"] = {"10.0.0.0/8"}; invalid_config(d);
-    d = base; d["peers"][0]["networks"] = {"10.1.0.2/24"}; invalid_config(d);
-    d = base; d["peers"][0]["networks"] = {"10.1.0.0/24", "10.1.0.0/24"}; invalid_config(d);
-    d = base; d["listen"] = {{"networks", {"10.2.0.0/24"}}}; invalid_config(d);
-    d = base; d["listen"] = {{"enabled", false}, {"networks", json::array()}, {"bind_address", "127.0.0.1:45000"}};
-    roundtrip_policy(d);
-    canonical = json::parse(serialize_config(parse_config(d.dump())));
-    CHECK(canonical["listen"]["enabled"] == false && canonical["listen"]["networks"].empty());
-    CHECK(canonical["listen"]["bind_address"] == "127.0.0.1:45000");
-    d = old_single; d["listen"]["networks"] = json::array(); roundtrip_policy(d);
-    canonical = json::parse(serialize_config(parse_config(d.dump())));
-    CHECK(canonical["listen"]["networks"].empty());
-
-    // A formerly implicit single-network peer must fail closed when a second
-    // local network is added, rather than silently receiving both permissions.
+    d = base; d["peers"][0]["transport"] = "quic"; invalid_config(d);
+    d = base; d["peers"][0]["transport"] = "tcp"; CHECK(parse_config(d.dump()).peers[0].transport == "tcp"); roundtrip_policy(d);
+    d["peers"][0]["transport"] = "udp"; CHECK(json::parse(serialize_config(parse_config(d.dump())))["peers"][0]["transport"] == "udp");
+    for (const auto& invalid_transport : json::array({"auto", "TCP", "", true, 1, nullptr, json::array(), json::object()})) {
+        d["peers"][0]["transport"] = invalid_transport; invalid_config(d);
+    }
     d = base; d["networks"].push_back("192.168.0.2/24"); invalid_config(d);
     d["peers"][0]["networks"] = {"10.1.0.0/24"}; roundtrip_policy(d);
     CHECK(parse_config(d.dump()).peers[0].networks.size() == 1);
-    canonical = json::parse(serialize_config(parse_config(d.dump())));
-    CHECK(canonical["peers"][0]["networks"] == json({"10.1.0.0/24"}));
-    canonical["networks"].push_back("172.18.0.2/24");
-    CHECK(parse_config(canonical.dump()).peers[0].networks.size() == 1);
-    CHECK(parse_config(canonical.dump()).peers[0].networks[0].tunnel == network());
-    d["peers"].push_back({{"address", "100.0.0.3:65535"}, {"shared_key", "different-peer-key"}, {"networks", {"192.168.0.0/24"}}});
-    d["listen"] = {{"networks", {"192.168.0.0/24"}}}; roundtrip_policy(d);
-
-    d = base; d["address"] = "[2001:db8::1]:65535"; d["peers"][0]["address"] = "[2001:db8::2]:65535";
-    d["networks"] = {"fd00:0:0::123/64"};
-    CHECK(parse_config(d.dump()).listen.bind_address.str() == "[::]:65535");
-    CHECK(parse_config(d.dump()).networks[0].tunnel_ip.str() == "fd00::123"); roundtrip_policy(d);
-    d["peers"][0]["networks"] = {"fd00:0::/64"}; roundtrip_policy(d);
-    d["peers"][0]["networks"].push_back("fd00::/64"); invalid_config(d);
-    d["peers"][0].erase("networks"); d["tun_mtu"] = 1200; invalid_config(d);
-    d = base; d["peers"] = json::array(); d["networks"] = json::array();
+    d["peers"].push_back({{"endpoint", "100.0.0.3:65535"}, {"shared_key", "different-peer-key"}, {"networks", {"10.1.0.0/24"}}}); roundtrip_policy(d);
+    d = base; d["networks"] = json::array();
     for (unsigned i = 0; i < 64; ++i) d["networks"].push_back("172.20." + std::to_string(i) + ".1/24");
-    CHECK(parse_config(d.dump()).networks.size() == 64); roundtrip_policy(d);
+    d["peers"] = json::array(); CHECK(parse_config(d.dump()).networks.size() == 64); roundtrip_policy(d);
     d["networks"].push_back("172.20.64.1/24"); invalid_config(d);
-    // Caller-built configuration objects must not serialize a permission using
-    // an undeclared network or a different local host address.
+    std::string error; Configure result;
+    CHECK(!try_parse_config("{\"listen\":{},\"listen\":{}}", &result, &error));
+    CHECK(error.find("duplicate") != std::string::npos);
+    CHECK(!try_parse_config("[]", &result, &error));
+    CHECK(!try_parse_config("{\"shared_key\": SECRET_SHOULD_NOT_APPEAR}", &result, &error));
+    CHECK(error.find("SECRET_SHOULD_NOT_APPEAR") == std::string::npos);
+    CHECK(!try_parse_config(base.dump(), nullptr, &error));
+    CHECK(!try_parse_config(std::string(1048577, ' '), &result, &error));
+    CHECK(error.find("1 MiB") != std::string::npos);
+    CHECK(!try_parse_config(std::string(40, '[') + "0" + std::string(40, ']'), &result, &error));
+    CHECK(error.find("nesting") != std::string::npos);
+    d = base; d["peers"] = json::array();
+    for (unsigned i = 0; i < 257; ++i) d["peers"].push_back(base["peers"][0]);
+    invalid_config(d);
+    CHECK(Network::parse("2001:db8:0:0::1/64") == Network::parse("2001:db8::/64"));
+    CHECK(Endpoint::parse("[2001:0db8::1]:1234") == Endpoint::parse("[2001:db8::1]:1234"));
     auto invalid = simple; invalid.peers[0].networks[0].tunnel_ip = IpAddress::parse("10.1.0.3");
-    bool rejected = false;
-    try { serialize_config(invalid); } catch (const config_error&) { rejected = true; }
-    CHECK(rejected);
+    bool rejected = false; try { serialize_config(invalid); } catch (const config_error&) { rejected = true; } CHECK(rejected);
     invalid = simple; invalid.peers[0].transport = "quic"; rejected = false;
-    try { serialize_config(invalid); } catch (const config_error&) { rejected = true; }
-    CHECK(rejected);
+    try { serialize_config(invalid); } catch (const config_error&) { rejected = true; } CHECK(rejected);
+    CHECK(!try_parse_config(base.dump(), nullptr, &error));
 }
 
 void crypto_tests() {
@@ -302,7 +216,7 @@ void crypto_tests() {
 }
 
 protocol::ForwardHeader header() {
-    protocol::ForwardHeader h; h.network = network(); h.source = node(1); h.destination = node(4); h.flow_id = 1234; return h;
+    protocol::ForwardHeader h; h.network = network(); h.source = node_id(1); h.destination = node_id(4); h.flow_id = 1234; return h;
 }
 void protocol_tests() {
     auto h = header(); Bytes packet(1280, 0x42), decoded;
@@ -318,47 +232,56 @@ void protocol_tests() {
     encoded = protocol::encode(header(), packet); encoded.push_back(0); CHECK(!protocol::decode(encoded, &parsed, &decoded));
     encoded = protocol::encode(header(), packet); encoded[4] = 9; CHECK(!protocol::decode(encoded, &parsed, &decoded));
     encoded = protocol::encode(header(), packet); encoded[21] = 33; CHECK(!protocol::decode(encoded, &parsed, &decoded));
-    h = header(); h.kind = protocol::PacketKind::Multicast; h.destination = Endpoint();
+    h = header(); h.kind = protocol::PacketKind::Multicast; h.destination = NodeId();
     CHECK(protocol::decode(protocol::encode(h, packet), &parsed, &decoded));
 }
 
-PathAnnouncement route(const std::vector<Endpoint>& path, unsigned key_value = 1) {
-    PathAnnouncement result; result.network = network(); result.destination = node(4);
+PathAnnouncement route(const std::vector<NodeId>& path, unsigned key_value = 1) {
+    PathAnnouncement result; result.network = network(); result.destination = node_id(4);
     result.tunnel_ip = IpAddress::parse("10.1.0.4"); result.public_key.fill(static_cast<unsigned char>(key_value)); result.path = path; return result;
 }
 void routing_tests() {
     const auto a = node(1), b = node(2), c = node(3), d = node(4), e = node(5);
     NetworkConfig local; local.tunnel = network(); local.tunnel_ip = IpAddress::parse("10.1.0.1");
-    Gossip table(a, {local}); table.authorize(b, {network()}); table.authorize(c, {network()});
-    CHECK(!table.announce(b, route({b,d})));
+    Gossip table({local}); table.authorize(b, {network()}); table.authorize(c, {network()});
+    table.set_peer_nodes(b, {{network(), node_id(2)}}); table.set_peer_nodes(c, {{network(), node_id(3)}});
+    CHECK(!table.announce(b, route({node_id(2), node_id(4)})));
     table.set_available(b, true); table.set_available(c, true);
-    CHECK(table.announce(b, route({b,d})));
-    CHECK(table.announce(c, route({c,d}, 2)));
-    CHECK(table.next_hops(network(), d).size() == 2);
-    CHECK(table.accept_rpf(network(), d, b)); CHECK(!table.accept_rpf(network(), d, c));
-    PublicKey key{}; CHECK(table.public_key(d, &key)); CHECK(key[0] == 2);
+    CHECK(table.announce(b, route({node_id(2), node_id(4)})));
+    CHECK(table.announce(c, route({node_id(3), node_id(4)}, 2)));
+    CHECK(table.next_hops(network(), node_id(4)).size() == 2);
+    CHECK(table.accept_rpf(network(), node_id(4), b)); CHECK(!table.accept_rpf(network(), node_id(4), c));
+    PublicKey key{}; CHECK(table.public_key(network(), node_id(4), &key)); CHECK(key[0] == 2);
     Endpoint selected, again; std::set<Endpoint> selected_peers;
     for (unsigned i = 0; i < 20; ++i) {
-        CHECK(table.select_unicast(network(), d, i, &selected)); CHECK(table.select_unicast(network(), d, i, &again));
+        CHECK(table.select_unicast(network(), node_id(4), i, &selected)); CHECK(table.select_unicast(network(), node_id(4), i, &again));
         CHECK(selected == again); selected_peers.insert(selected);
     }
     CHECK(selected_peers.size() == 2);
-    CHECK(!table.announce(b, route({b,a,d})));
-    CHECK(!table.announce(b, route({b,c,b,d})));
-    CHECK(!table.announce(b, route({c,d})));
-    auto wrong = route({b,d}); wrong.network = Network::parse("192.168.0.0/24");
+    CHECK(!table.announce(b, route({node_id(2), node_id(1), node_id(4)})));
+    CHECK(!table.announce(b, route({node_id(2), node_id(3), node_id(2), node_id(4)})));
+    CHECK(!table.announce(b, route({node_id(3), node_id(4)})));
+    auto wrong = route({node_id(2), node_id(4)}); wrong.network = Network::parse("192.168.0.0/24");
     CHECK(!table.announce(b, wrong));
-    wrong = route({b,d}); wrong.tunnel_ip = local.tunnel_ip; CHECK(!table.announce(b, wrong));
-    table.withdraw(c, network(), d); CHECK(table.public_key(d, &key)); CHECK(key[0] == 1);
-    CHECK(table.announce(c, route({c,e,d}, 3)));
-    CHECK(table.next_hops(network(), d) == std::vector<Endpoint>{b});
+    wrong = route({node_id(2), node_id(4)}); wrong.destination = IpAddress::parse("fd00::4"); wrong.path.back() = wrong.destination;
+    CHECK(!table.announce(b, wrong));
+    wrong = route({node_id(2), node_id(4)}); wrong.destination = IpAddress::parse("10.2.0.4"); wrong.path.back() = wrong.destination;
+    CHECK(!table.announce(b, wrong));
+    wrong = route({node_id(2), IpAddress::parse("fd00::5"), node_id(4)});
+    CHECK(!table.announce(b, wrong));
+    wrong = route({node_id(2), IpAddress::parse("10.2.0.5"), node_id(4)});
+    CHECK(!table.announce(b, wrong));
+    wrong = route({node_id(2), node_id(4)}); wrong.tunnel_ip = local.tunnel_ip; CHECK(!table.announce(b, wrong));
+    table.withdraw(c, network(), node_id(4)); CHECK(table.public_key(network(), node_id(4), &key)); CHECK(key[0] == 1);
+    CHECK(table.announce(c, route({node_id(3), node_id(5), node_id(4)}, 3)));
+    CHECK(table.next_hops(network(), node_id(4)) == std::vector<Endpoint>{b});
     // Losing adjacency A-B must not remove C's path merely because it contains B.
-    CHECK(table.announce(c, route({c,b,d}, 4)));
+    CHECK(table.announce(c, route({node_id(3), node_id(2), node_id(4)}, 4)));
     table.set_available(b, false);
-    CHECK(table.next_hops(network(), d) == std::vector<Endpoint>{c});
-    CHECK(table.public_key(d, &key) && key[0] == 4);
-    CHECK(table.node_for_ip(network(), IpAddress::parse("10.1.0.4"), &selected) && selected == d);
-    table.set_available(c, false); CHECK(table.size() == 0); CHECK(!table.public_key(d, &key));
+    CHECK(table.next_hops(network(), node_id(4)) == std::vector<Endpoint>{c});
+    CHECK(table.public_key(network(), node_id(4), &key) && key[0] == 4);
+    NodeId selected_node; CHECK(table.node_for_ip(network(), IpAddress::parse("10.1.0.4"), &selected_node) && selected_node == node_id(4));
+    table.set_available(c, false); CHECK(table.size() == 0); CHECK(!table.public_key(network(), node_id(4), &key));
 }
 
 void peer_tests(const Configure& config) {
@@ -460,6 +383,39 @@ void udp_tests(unsigned family) {
     CHECK(deadline); CHECK(!a.send(b.local_address(), Bytes(max_payload + 1))); CHECK(a.counters().oversize == 1);
     CHECK(a.send(b.local_address(), wire)); CHECK(loop.run() == 0); CHECK(received && !timeout);
     CHECK(a.counters().sent == 1); CHECK(b.counters().received == 1);
+    if (family == 4) {
+        // A wildcard listener must be able to pin a datagram to the local
+        // address used by the authenticated control connection.  Without the
+        // source override the route lookup is free to choose another address.
+        EventLoop source_loop; bool source_received = false; Endpoint observed;
+        Endpoint wildcard; wildcard.ip = IpAddress::parse("0.0.0.0");
+        UdpTransport sender(source_loop, wildcard, max_payload, [](const Endpoint&, Bytes) {});
+        Endpoint receiver_bind; receiver_bind.ip = IpAddress::parse("127.0.0.1");
+        UdpTransport receiver(source_loop, receiver_bind, max_payload, [&](const Endpoint& remote, Bytes packet) {
+            observed = remote; source_received = packet == Bytes{0x7f}; source_loop.breakLoop();
+        });
+        Endpoint source; source.ip = receiver_bind.ip;
+        bool source_timeout = false;
+        auto source_deadline = source_loop.addTimer(std::chrono::seconds(2), [&](evutil_socket_t, short) {
+            source_timeout = true; source_loop.breakLoop();
+        });
+        CHECK(source_deadline); CHECK(sender.send(receiver.local_address(), Bytes{0x7f}, source));
+        CHECK(source_loop.run() == 0); CHECK(source_received && !source_timeout && observed.ip == source.ip);
+        // If the requested local address is unavailable, the transport must
+        // retry with ordinary route-based source selection instead of dropping.
+        EventLoop fallback_loop; bool fallback_received = false; Endpoint fallback_observed;
+        UdpTransport fallback_sender(fallback_loop, wildcard, max_payload, [](const Endpoint&, Bytes) {});
+        UdpTransport fallback_receiver(fallback_loop, receiver_bind, max_payload, [&](const Endpoint& remote, Bytes packet) {
+            fallback_observed = remote; fallback_received = packet == Bytes{0x7e}; fallback_loop.breakLoop();
+        });
+        Endpoint unavailable; unavailable.ip = IpAddress::parse("192.0.2.1");
+        bool fallback_timeout = false;
+        auto fallback_deadline = fallback_loop.addTimer(std::chrono::seconds(2), [&](evutil_socket_t, short) {
+            fallback_timeout = true; fallback_loop.breakLoop();
+        });
+        CHECK(fallback_deadline); CHECK(fallback_sender.send(fallback_receiver.local_address(), Bytes{0x7e}, unavailable));
+        CHECK(fallback_loop.run() == 0); CHECK(fallback_received && !fallback_timeout && fallback_observed.ip != unavailable.ip);
+    }
     bool protect_called = false, refused = false;
     try { UdpTransport failed(loop, bind, max_payload, [](const Endpoint&, Bytes) {}, [&](evutil_socket_t) { protect_called = true; return false; }); }
     catch (const std::runtime_error&) { refused = true; }

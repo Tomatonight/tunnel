@@ -4,6 +4,7 @@
 
 struct KernelPeer {
     Endpoint endpoint;
+    Endpoint source;
     const CryptoSession* crypto = nullptr;
     bool tcp = false, ready = false;
     std::vector<Network> networks;

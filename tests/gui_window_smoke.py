@@ -32,10 +32,9 @@ def main():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             address = "127.0.0.1:%s" % sock.getsockname()[1]
-        config = json.dumps({"device_backend": "tun", "peers": [], "listen": {"enabled": True, "address": address,
-            "bind_address": address, "networks": [{"tunnel": "198.18.253.0/30", "tunnel_ip": "198.18.253.1"}]}})
-        # Leave a real legacy file on disk. The form must use the native parser's
-        # migrated view without changing this file merely because it was opened.
+        config = json.dumps({"device_backend": "tun", "peers": [], "listen": {"enabled": True, "bind_address": address},
+            "networks": ["198.18.253.1/30"]})
+        # Leave a canonical file on disk. Opening it must not rewrite it.
         controller.path.write_text(config, encoding="utf-8")
         token = secrets.token_hex(32)
         window = webview.create_window("Tunnel UI smoke test", html=bundled_html(token), js_api=Bridge(controller, token),
@@ -55,14 +54,14 @@ def main():
             try:
                 if not window.events.loaded.wait(60):
                     raise RuntimeError("WebView did not load the initial page within 60s")
-                wait(lambda: window.evaluate_js("document.getElementById('local-endpoint').value") == address, "legacy form loaded")
-                assert controller.path.read_text(encoding="utf-8") == config, "loading rewrote legacy file"
+                wait(lambda: window.evaluate_js("document.getElementById('bind-address').value") == address, "canonical form loaded")
+                assert controller.path.read_text(encoding="utf-8") == config, "loading rewrote canonical file"
                 wait(lambda: window.evaluate_js("!!document.getElementById('connection-button') && !document.getElementById('connection-button').disabled"), "bridge ready")
                 window.evaluate_js("document.querySelector('[data-page=config]').click(); const input = document.querySelector('.network-cidr'); input.value = '198.18.253.2/30'; input.dispatchEvent(new Event('input', {bubbles:true})); document.getElementById('save-config').click()")
                 def saved_new_form():
                     try:
                         saved = json.loads(controller.path.read_text(encoding="utf-8"))
-                        return saved.get("address") == address and saved.get("networks") == ["198.18.253.2/30"]
+                        return saved.get("listen", {}).get("bind_address") == address and saved.get("networks") == ["198.18.253.2/30"]
                     except (OSError, ValueError):
                         return False
                 wait(saved_new_form, "form save through native validation")
@@ -73,7 +72,7 @@ def main():
                 window.evaluate_js("document.getElementById('connection-button').click()")
                 wait(lambda: controller.state()["phase"] == "stopped", "UI stop")
                 wait(lambda: window.evaluate_js("document.getElementById('phase-pill').dataset.phase") == "stopped", "stopped rendered")
-                result.update(ok=True, checks=["offline_html", "authenticated_bridge", "legacy_load_preserves_file",
+                result.update(ok=True, checks=["offline_html", "authenticated_bridge", "canonical_load_preserves_file",
                     "form_save_simple_config", "UI_start_real_TUN", "live_status_render", "UI_stop_cleanup"])
             except Exception as error:
                 result["error"] = str(error)

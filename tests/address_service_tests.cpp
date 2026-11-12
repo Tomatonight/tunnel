@@ -72,7 +72,7 @@ Configure server_config(const std::vector<Endpoint>& p, const std::string& file)
         {"state_file", file}, {"reclaim_after", 1}, {"networks", nets}, {"clients", clients}}}}.dump());
 }
 Configure client_config(const std::vector<Endpoint>& p, unsigned id, const Json& nets = Json{"198.18.241.1/32", "fd00:241::/126"}) {
-    return parse_config(Json{{"address", p[id].str()}, {"address_clients", Json::array({client_entry(p[0], id, nets)})}}.dump());
+    return parse_config(Json{{"listen", {{"bind_address", p[id].str()}}}, {"address_clients", Json::array({client_entry(p[0], id, nets)})}}.dump());
 }
 const std::string admission_key = "test-only-shared-admission-key";
 Configure shared_server_config(const std::vector<Endpoint>& p, const std::string& file) {
@@ -97,7 +97,7 @@ struct Observed {
 AddressService::Callback watch(Observed& o) { return [&o](const Network& n, const AddressService::Grant* g) { o.update(n, g); }; }
 void config_tests(const std::vector<Endpoint>& p, const std::string& file) {
     const auto server = server_config(p, file); const auto client = client_config(p, 1);
-    CHECK(server.networks.empty()); CHECK(server.listen.address.port == 0); CHECK(server.address_server.enabled);
+    CHECK(server.networks.empty()); CHECK(server.listen.bind_address.port == 0); CHECK(server.address_server.enabled);
     CHECK(server.address_server.clients.size() == p.size() - 1); CHECK(server.address_server.reclaim_after == 1);
     CHECK(client.networks.size() == 2); CHECK(client.listen.networks.size() == 2);
     for (const auto& n : client.networks) { CHECK(n.tunnel_ip.unspecified()); CHECK(n.tunnel_ip.family == n.tunnel.address.family); CHECK(n.allocation_server == p[0]); }
@@ -105,8 +105,8 @@ void config_tests(const std::vector<Endpoint>& p, const std::string& file) {
     CHECK(!doc.count("networks")); CHECK(doc.at("address_clients").size() == 1);
     CHECK(serialize_config(parse_config(serialized)) == serialized);
     CHECK(serialize_config(parse_config(serialize_config(server))) == serialize_config(server));
-    auto mixed = doc; mixed["networks"] = {"10.190.1.1/24"}; mixed["listen"] = {{"networks", Json::array()}};
-    mixed["peers"] = Json::array({{{"address", p[2].str()}, {"shared_key", "overlay-secret"}, {"networks", {"fd00:241::/126"}}}});
+    auto mixed = doc; mixed["networks"] = {"10.190.1.1/24"}; mixed["listen"]["networks"] = Json::array();
+    mixed["peers"] = Json::array({{{"endpoint", p[2].str()}, {"shared_key", "overlay-secret"}, {"networks", {"fd00:241::/126"}}}});
     auto parsed = parse_config(mixed.dump()); CHECK(parsed.networks.size() == 3); CHECK(parsed.listen.networks.empty());
     CHECK(parsed.peers[0].networks[0].allocation_server == p[0]); CHECK(parse_config(serialize_config(parsed)).listen.networks.empty());
     auto bad = mixed; bad["networks"] = {"198.18.241.1/32"}; rejects([&] { parse_config(bad.dump()); });
@@ -123,13 +123,20 @@ void config_tests(const std::vector<Endpoint>& p, const std::string& file) {
     bad = Json::parse(serialize_config(server)); bad["address_server"]["state_file"] = "relative.json";
     CHECK(parse_config(bad.dump()).address_server.state_file == "relative.json");
     bad["address"] = p[0].str(); bad["networks"] = {"10.190.1.1/24"}; rejects([&] { parse_config(bad.dump()); });
-    bad["address"] = p[1].str(); CHECK(parse_config(bad.dump()).address_server.enabled);
+    bad.erase("address");
     bad["networks"] = {"198.18.241.2/24"}; rejects([&] { parse_config(bad.dump()); });
     bad.erase("networks");
+    bad["listen"] = {{"bind_address", p[1].str()}};
     bad["address_clients"] = Json::array({client_entry(p[0], 1, {"198.18.241.1/32", "fd00:241::/126"})});
     const auto own_server = parse_config(bad.dump()); CHECK(own_server.networks.size() == 2);
     CHECK(own_server.address_clients[0].address == own_server.address_server.address);
     CHECK(parse_config(serialize_config(own_server)).networks.size() == 2);
+    auto outbound_only_client = bad;
+    outbound_only_client["listen"] = {{"enabled", false}};
+    rejects([&] { parse_config(outbound_only_client.dump()); });
+    auto wildcard_client = bad;
+    wildcard_client["listen"] = {{"bind_address", "0.0.0.0:65535"}};
+    rejects([&] { parse_config(wildcard_client.dump()); });
     for (const auto& invalid_pool : {"0.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4", "::/128", "ff00::/8"}) {
         bad = Json::parse(serialize_config(server)); bad["address_server"]["networks"] = {invalid_pool}; bad["address_server"]["clients"] = Json::array();
         rejects([&] { parse_config(bad.dump()); });

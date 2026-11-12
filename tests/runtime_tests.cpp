@@ -1,4 +1,5 @@
 #include "node.h"
+#include "peer.h"
 #include "tls.h"
 #include "tcp_transport.h"
 #include <algorithm>
@@ -13,6 +14,7 @@
 namespace {
 unsigned checks = 0;
 std::function<void()> diagnostics;
+std::vector<Endpoint> known_addresses;
 #define CHECK(x) do { ++checks; if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (0)
 void handshake(TlsChannel& a, TlsChannel& b) {
     a.advance();
@@ -78,9 +80,12 @@ void spin(EventLoop& loop, unsigned milliseconds) {
     loop.run();
 }
 void until(EventLoop& loop, std::function<bool()> predicate, unsigned timeout = 10000) {
-    auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { if (predicate()) loop.breakLoop(); }, true);
-    auto deadline = loop.addTimer(std::chrono::milliseconds(timeout), [&](evutil_socket_t, short) { loop.breakLoop(); });
-    loop.run(); if (!predicate() && diagnostics) diagnostics(); CHECK(predicate());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        auto tick = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { loop.breakLoop(); });
+        loop.run();
+    }
+    if (!predicate() && diagnostics) diagnostics(); CHECK(predicate());
 }
 void until_both(EventLoop& left, EventLoop& right, std::function<bool()> predicate, unsigned timeout = 10000) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
@@ -106,7 +111,7 @@ Bytes packet(unsigned source, unsigned destination, unsigned flow = 1, bool v6 =
     p[99] = 0xaa; return p;
 }
 Configure config_for(unsigned i, const std::vector<Endpoint>& addresses, const std::vector<unsigned>& peers, bool v6 = true) {
-    Configure c; c.listen.enabled = true; c.listen.address = c.listen.bind_address = addresses.at(i);
+    Configure c; c.listen.enabled = true; c.listen.bind_address = addresses.at(i);
     NetworkConfig n; n.tunnel = Network::parse("10.77.0.0/24"); n.tunnel_ip = IpAddress::parse("10.77.0." + std::to_string(i + 1));
     c.networks.push_back(n);
     if (v6) { n.tunnel = Network::parse("fd00:77::/64"); n.tunnel_ip = IpAddress::parse("fd00:77::" + std::to_string(i + 1)); c.networks.push_back(n); }
@@ -130,11 +135,21 @@ std::vector<Endpoint> ports(EventLoop& loop, unsigned count, bool v6 = false) {
         } catch (const std::exception&) {} // Already used by another local process.
     }
     if (result.size() != count) throw std::runtime_error("no free test TCP/UDP port pairs");
+    known_addresses = result;
     return result;
 }
 wire::Json find_route(Node& node, const Endpoint& destination, const std::string& network = "10.77.0.0/24") {
     const auto status = node.status();
-    for (const auto& r : status.at("routes")) if (r.at("node") == destination.str() && r.at("network") == network) return r;
+    std::string identity;
+    for (const auto& peer : status.at("peers")) if (peer.at("endpoint") == destination.str()) {
+        const auto& identities = peer.at("identities");
+        if (identities.is_object() && identities.count(network)) identity = identities.at(network).get<std::string>();
+    }
+    if (identity.empty()) for (std::size_t i = 0; i < known_addresses.size(); ++i) if (known_addresses[i] == destination) {
+        identity = network.find(':') == std::string::npos ? "10.77.0." + std::to_string(i + 1) : "fd00:77::" + std::to_string(i + 1);
+        break;
+    }
+    for (const auto& r : status.at("routes")) if (r.at("node") == identity && r.at("network") == network) return r;
     return nullptr;
 }
 std::uint64_t counter(Node& node, const std::string& key) { const auto c = node.status().at("counters"); return c.count(key) ? c.at(key).get<std::uint64_t>() : 0; }
@@ -165,6 +180,7 @@ void subnet_runtime_tests() {
             if (r.at("state") == "active") return r.at("gateway").get<std::string>();
         return {};
     };
+    auto node_address = [](unsigned index) { return std::string("10.77.0.") + std::to_string(index + 1); };
     diagnostics = [&] { for (const auto& node : nodes) std::cerr << node->status().dump(2) << '\n'; };
     std::cerr << "subnet: converge\n";
     auto converged = [&] {
@@ -180,7 +196,7 @@ void subnet_runtime_tests() {
     CHECK(devices[0]->imported.size() == 1 && devices[1]->imported.size() == 1);
     CHECK(devices[2]->imported.empty() && devices[3]->imported.empty());
     CHECK(devices[2]->exported.size() == 1 && devices[3]->exported.size() == 1);
-    const unsigned chosen = gateway() == addresses[2].str() ? 2 : 3, backup = chosen == 2 ? 3 : 2;
+    const unsigned chosen = gateway() == node_address(2) ? 2 : 3, backup = chosen == 2 ? 3 : 2;
     auto request = packet(1,20,4001); request[17] = 78;
     std::cerr << "subnet: request\n";
     devices[0]->inject(request);
@@ -203,7 +219,7 @@ void subnet_runtime_tests() {
     CHECK(counter(*nodes[backup], "subnet_unsolicited_drop") > 0);
     nodes[chosen]->stop();
     std::cerr << "subnet: failover\n";
-    until(loop, [&] { return gateway() == addresses[backup].str(); });
+    until(loop, [&] { return gateway() == node_address(backup); });
     auto new_request = packet(1,20,4002); new_request[17] = 78; devices[0]->inject(new_request);
     until(loop, [&] { return devices[backup]->delivered.size() == 1; });
     CHECK(devices[backup]->delivered[0] == new_request);
@@ -383,6 +399,34 @@ void rejection_and_ipv6_tests() {
     da->inject(packet(1,2,1,true)); until(loop, [&] { return db->delivered.size() == 2; });
     a.stop(); b->stop();
 }
+void wildcard_listener_tests() {
+    EventLoop loop; const auto addresses = ports(loop, 2);
+    auto server_config = config_for(0, addresses, {}, false);
+    // A listener may bind all interfaces while peers still connect through a
+    // concrete address assigned to the host. The advertised hello endpoint
+    // must remain compatible with the configured peer endpoint.
+    server_config.listen.bind_address.ip = IpAddress::parse("0.0.0.0");
+    server_config.listen.shared_key = "wildcard-listener-key";
+    auto client_config = config_for(1, addresses, {0}, false);
+    // An outbound-only node may omit its fixed outer endpoint.  It binds a
+    // wildcard/ephemeral UDP socket and advertises the concrete endpoint once
+    // the control TCP connection is established.
+    client_config.listen.enabled = false;
+    client_config.listen.bind_address = Endpoint::parse("0.0.0.0:65535");
+    client_config.listen.bind_address.port = 0;
+    client_config.peers[0].shared_key = server_config.listen.shared_key;
+    auto* server_device = new MemoryDevice; auto* client_device = new MemoryDevice;
+    Node server(loop, server_config, std::unique_ptr<PacketDevice>(server_device), fast_options());
+    Node client(loop, client_config, std::unique_ptr<PacketDevice>(client_device), fast_options());
+    server.start(); client.start();
+    until(loop, [&] { return !find_route(server, addresses[1]).is_null() && !find_route(client, addresses[0]).is_null(); });
+    const auto status = server.status(); CHECK(status.at("peers").size() == 1);
+    CHECK(status.at("peers")[0].at("dynamic") == true);
+    CHECK(status.at("peers")[0].at("state") == PEER_STATE_ESTABLISHED);
+    server_device->inject(packet(1, 2)); until(loop, [&] { return client_device->delivered.size() == 1; });
+    CHECK(client_device->delivered.size() == 1);
+    server.stop(); client.stop();
+}
 void lifecycle_tests() {
     EventLoop loop; const auto addresses = ports(loop, 2);
     auto ca = config_for(0, addresses, {1}); auto cb = config_for(1, addresses, {0});
@@ -429,7 +473,7 @@ int main() {
 #ifdef SIGPIPE
         std::signal(SIGPIPE, SIG_IGN);
 #endif
-        SocketSystem sockets; tls_tests(); mesh_tests(); handshake_retry_tests(); rejection_and_ipv6_tests(); lifecycle_tests(); subnet_runtime_tests();
+        SocketSystem sockets; tls_tests(); mesh_tests(); handshake_retry_tests(); rejection_and_ipv6_tests(); wildcard_listener_tests(); lifecycle_tests(); subnet_runtime_tests();
         std::cout << "Passed " << checks << " runtime checks\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

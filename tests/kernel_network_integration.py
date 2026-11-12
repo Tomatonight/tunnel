@@ -98,7 +98,7 @@ def main():
             report['ok'] = True
             return 0
         minimal = work / 'missing-module.json'
-        minimal.write_text(json.dumps({'address': '127.0.0.1:45298', 'networks': ['10.98.1.1/24']}))
+        minimal.write_text(json.dumps({'listen': {'bind_address': '127.0.0.1:45298'}, 'networks': ['10.98.1.1/24']}))
         assert not Path('/dev/tunnel_kmod').exists(), 'run missing-module check before module is loaded'
         for options in ([], ['--device-backend', 'kernel']):
             result = run(binary, minimal, *options, '--run-for', '1', check=False, timeout=20)
@@ -151,12 +151,12 @@ def main():
             run('ip', '-n', spaces[node], 'address', 'add', f'192.0.2.{index + 1}/24', 'dev', 'eth0')
             run('ip', '-n', spaces[node], 'link', 'set', 'eth0', 'up')
         for node in 'ABC':
-            cfg = {'address': endpoints[node], 'networks': [address4[node] + '/24', address6[node] + '/64'],
-                'peers': [{'address': endpoints[peer], 'shared_key': 'kernel-integration-test-key',
-                    'networks': ['10.98.0.0/24', 'fd00:98::/64']} for peer in graph[node]]}
+            cfg = {'listen': {'bind_address': endpoints[node]}, 'networks': [address4[node] + '/24', address6[node] + '/64'],
+                'peers': [{'endpoint': endpoints[peer], 'shared_key': 'kernel-integration-test-key',
+                    'networks': ['10.98.0.0/24', 'fd00:98::/64'], 'transport': 'udp'} for peer in graph[node]]}
             if node == 'B':
                 cfg['device_backend'] = 'kernel'
-                next(p for p in cfg['peers'] if p['address'] == endpoints['C'])['transport'] = 'tcp'
+                next(p for p in cfg['peers'] if p['endpoint'] == endpoints['C'])['transport'] = 'tcp'
             elif node == 'C':
                 cfg['device_backend'] = 'tun'
             configurations[node] = cfg
@@ -213,7 +213,7 @@ def main():
         # Switching B-C to UDP exercises wire compatibility with the original
         # TUN implementation as well as mixed TLS/UDP datapath state replacement.
         original = {node: (processes[node].pid, state(node)['public_key']) for node in 'ABC'}
-        next(p for p in configurations['B']['peers'] if p['address'] == endpoints['C'])['transport'] = 'udp'
+        next(p for p in configurations['B']['peers'] if p['endpoint'] == endpoints['C'])['transport'] = 'udp'
         (work / 'B.json').write_text(json.dumps(configurations['B']))
         processes['B'].send_signal(signal.SIGHUP)
         wait(lambda: converged('udp'), 'hot reload TCP to UDP with kernel data path', 90)
@@ -256,7 +256,7 @@ def main():
         mark('explicit_tun_then_default_kernel_hot_reload_preserves_identity_and_dual_stack')
         # Fail-closed: removing a peer must stop forwarding, rather than keeping
         # a stale route/session in the kernel snapshot.
-        configurations['B']['peers'] = [p for p in configurations['B']['peers'] if p['address'] != endpoints['C']]
+        configurations['B']['peers'] = [p for p in configurations['B']['peers'] if p['endpoint'] != endpoints['C']]
         (work / 'B.json').write_text(json.dumps(configurations['B']))
         processes['B'].send_signal(signal.SIGHUP)
         wait(lambda: not route('A', 'C', '10.98.0.0/24'), 'withdrawal removes imported kernel route', 30)

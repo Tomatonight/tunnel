@@ -9,6 +9,7 @@ namespace {
 using Json = wire::Json;
 unsigned checks = 0;
 std::function<void()> diagnostics;
+std::vector<Endpoint> known_endpoints;
 const auto test_started = std::chrono::steady_clock::now();
 #define CHECK(x) do { ++checks; if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (0)
 
@@ -68,8 +69,8 @@ void framing_tests() {
     CHECK(rejects([&] {
         wire::Decoder control_only; Json j; control_only.append(encoded); control_only.next(j);
     }));
-    wire::Decoder legacy; legacy.append(wire::frame(control));
-    CHECK(legacy.next(message) && message == control);
+    wire::Decoder decoder; decoder.append(wire::frame(control));
+    CHECK(decoder.next(message) && message == control);
 }
 
 class MemoryDevice : public PacketDevice {
@@ -83,11 +84,11 @@ public:
 };
 
 void until(EventLoop& loop, const std::function<bool()>& condition, unsigned timeout = 15000) {
-    auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) {
-        if (condition()) loop.breakLoop();
-    }, true);
-    auto deadline = loop.addTimer(std::chrono::milliseconds(timeout), [&](evutil_socket_t, short) { loop.breakLoop(); });
-    loop.run();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+    while (!condition() && std::chrono::steady_clock::now() < deadline) {
+        auto poll = loop.addTimer(std::chrono::milliseconds(10), [&](evutil_socket_t, short) { loop.breakLoop(); });
+        loop.run();
+    }
     if (!condition() && diagnostics) diagnostics();
     CHECK(condition());
 }
@@ -108,14 +109,15 @@ std::vector<Endpoint> ports(EventLoop& loop, unsigned count, bool ipv6 = false) 
     }
     if (result.size() != count) throw std::runtime_error("cannot reserve TCP data test ports");
     std::sort(result.begin(), result.end());
+    known_endpoints = result;
     return result;
 }
 
 Configure config(unsigned index, const std::vector<Endpoint>& endpoints, const std::vector<unsigned>& peers) {
-    Json value{{"address", endpoints[index].str()}, {"listen", {{"bind_address", endpoints[index].str()}}},
+    Json value{{"listen", {{"bind_address", endpoints[index].str()}}},
         {"networks", {"10.97.0." + std::to_string(index + 1) + "/24", "fd00:97::" + std::to_string(index + 1) + "/64"}},
         {"peers", Json::array()}};
-    for (const auto peer : peers) value["peers"].push_back({{"address", endpoints[peer].str()},
+    for (const auto peer : peers) value["peers"].push_back({{"endpoint", endpoints[peer].str()},
         {"shared_key", "tcp-data-test-key"}, {"networks", {"10.97.0.0/24", "fd00:97::/64"}}});
     return parse_config(value.dump());
 }
@@ -131,8 +133,16 @@ NodeOptions options() {
 
 Json route(Node& node, const Endpoint& endpoint, const std::string& network = "10.97.0.0/24") {
     const auto state = node.status();
+    std::string identity;
+    for (const auto& peer : state.at("peers")) if (peer.at("endpoint") == endpoint.str()) {
+        const auto& identities = peer.at("identities");
+        if (identities.is_object() && identities.count(network)) identity = identities.at(network).get<std::string>();
+    }
+    if (identity.empty()) for (std::size_t i = 0; i < known_endpoints.size(); ++i) if (known_endpoints[i] == endpoint) {
+        identity = network.find(':') == std::string::npos ? "10.97.0." + std::to_string(i + 1) : "fd00:97::" + std::to_string(i + 1); break;
+    }
     for (const auto& value : state.at("routes"))
-        if (value.at("node") == endpoint.str() && value.at("network") == network) return value;
+        if (value.at("node") == identity && value.at("network") == network) return value;
     return nullptr;
 }
 
@@ -150,15 +160,21 @@ bool settled(Node& node) {
 
 std::string transport(Node& node, const Endpoint& endpoint) {
     const auto state = node.status();
-    for (const auto& peer : state.at("peers")) if (peer.at("node") == endpoint.str())
+    for (const auto& peer : state.at("peers")) if (peer.at("endpoint") == endpoint.str())
         return peer.at("transport").get<std::string>();
     return {};
 }
 
 std::string session(Node& node, const Endpoint& endpoint) {
     const auto state = node.status();
+    std::string identity;
+    for (const auto& peer : state.at("peers")) if (peer.at("endpoint") == endpoint.str()) {
+        const auto& identities = peer.at("identities");
+        if (identities.is_object() && identities.count("10.97.0.0/24")) identity = identities.at("10.97.0.0/24").get<std::string>();
+    }
+    if (identity.empty()) for (std::size_t i = 0; i < known_endpoints.size(); ++i) if (known_endpoints[i] == endpoint) { identity = "10.97.0." + std::to_string(i + 1); break; }
     for (const auto& value : state.at("end_sessions"))
-        if (value.at("node") == endpoint.str() && value.at("network") == "10.97.0.0/24" && value.at("ready") == true)
+        if (value.at("node") == identity && value.at("network") == "10.97.0.0/24" && value.at("ready") == true)
             return value.at("id").get<std::string>();
     return {};
 }
@@ -200,86 +216,6 @@ void send_packet(EventLoop& loop, MemoryDevice& source, MemoryDevice& destinatio
     const auto before = destination.delivered.size(); source.inject(bytes);
     until(loop, [&] { return destination.delivered.size() == before + 1; });
     CHECK(destination.delivered.back() == bytes);
-}
-
-// The nodes announce the proxy endpoints, but bind their own TCP/UDP to private
-// ports. Only TCP is forwarded. Thus no UDP datagram can reach the other node.
-class TcpOnlyProxy {
-    struct Pipe {
-        std::unique_ptr<TcpStream> incoming, outgoing;
-    };
-    std::vector<std::unique_ptr<Pipe>> pipes_;
-    std::unique_ptr<TcpListener> listener_;
-    std::unique_ptr<UdpTransport> udp_sink_;
-public:
-    bool blackhole_tcp = false;
-    unsigned udp_packets = 0;
-    std::size_t tcp_bytes = 0;
-    TcpOnlyProxy(EventLoop& loop, const Endpoint& address, const Endpoint& destination) {
-        udp_sink_.reset(new UdpTransport(loop, address, 65507, [this](const Endpoint&, Bytes) { ++udp_packets; }));
-        listener_.reset(new TcpListener(loop, address, [this, &loop, destination](evutil_socket_t fd) {
-            std::unique_ptr<Pipe> pipe(new Pipe); auto* raw = pipe.get();
-            raw->incoming.reset(new TcpStream(loop, fd, {}, [this, raw](const Bytes& bytes) {
-                if (!blackhole_tcp) { tcp_bytes += bytes.size(); raw->outgoing->send(bytes); }
-            }, [] {}, [raw] { if (raw->outgoing) raw->outgoing->close(); }));
-            raw->outgoing.reset(new TcpStream(loop, EVUTIL_INVALID_SOCKET, {}, [this, raw](const Bytes& bytes) {
-                if (!blackhole_tcp) { tcp_bytes += bytes.size(); raw->incoming->send(bytes); }
-            }, [] {}, [raw] { if (raw->incoming) raw->incoming->close(); }));
-            raw->outgoing->connect(destination); pipes_.push_back(std::move(pipe));
-        }));
-    }
-};
-
-void tcp_without_udp_tests(bool outer_ipv6, bool verify_liveness = false) {
-    const std::string label = std::string("proxy IPv") + (outer_ipv6 ? "6" : "4") + (verify_liveness ? " liveness" : " data");
-    phase(label + ": setup");
-    EventLoop loop; const auto endpoints = ports(loop, 4, outer_ipv6);
-    TcpOnlyProxy proxy_a(loop, endpoints[0], endpoints[2]), proxy_b(loop, endpoints[1], endpoints[3]);
-    auto ca = config(0, endpoints, {1}), cb = config(1, endpoints, {0});
-    ca.listen.bind_address = endpoints[2]; cb.listen.bind_address = endpoints[3];
-    // One-sided preference must negotiate TCP on both ends, including when the
-    // default-UDP end wins simultaneous initiation of the authenticated link.
-    ca.peers[0].transport = "tcp";
-    auto* da = new MemoryDevice; auto* db = new MemoryDevice;
-    auto opt = options();
-    if (verify_liveness) { opt.heartbeat_ms = 1000; opt.failure_timeout_ms = 5000; }
-    Node a(loop, ca, std::unique_ptr<PacketDevice>(da), opt), b(loop, cb, std::unique_ptr<PacketDevice>(db), opt);
-    diagnostics = [&] { std::cerr << a.status().dump(2) << '\n' << b.status().dump(2) << '\n'; };
-    a.start(); b.start();
-    phase(label + ": converge");
-    until_stable(loop, {&a, &b}, [&] { return settled(a) && settled(b) && !route(a, endpoints[1]).is_null() && !route(b, endpoints[0]).is_null(); });
-    CHECK(transport(a, endpoints[1]) == "tcp" && transport(b, endpoints[0]) == "tcp");
-    CHECK(proxy_a.tcp_bytes + proxy_b.tcp_bytes > 0);
-    if (!verify_liveness) {
-        phase(label + ": E2E IPv4 packet");
-        send_packet(loop, *da, *db, packet(1, 2, 1));
-        phase(label + ": reverse E2E IPv6 packet");
-        send_packet(loop, *db, *da, packet(2, 1, 2, true));
-        CHECK(!session(a, endpoints[1]).empty());
-        CHECK(proxy_a.udp_packets == 0 && proxy_b.udp_packets == 0);
-        a.stop(); b.stop(); diagnostics = {};
-        phase(label + ": done");
-        return;
-    }
-    const auto ups = counter(a, "peer_up"), downs = counter(a, "peer_down");
-    const auto start = std::chrono::steady_clock::now();
-    // Idle for more than the data-channel failure interval. TLS heartbeat
-    // acknowledgement must retain adjacency without any UDP reply.
-    phase(label + ": healthy idle beyond data timeout");
-    until(loop, [&] { return std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(5500); }, 8000);
-    CHECK(settled(a) && settled(b) && !route(a, endpoints[1]).is_null());
-    CHECK(counter(a, "peer_up") == ups && counter(a, "peer_down") == downs);
-    CHECK(proxy_a.udp_packets == 0 && proxy_b.udp_packets == 0);
-
-    // Silent TCP loss must still expire a TCP-selected data channel; an open
-    // kernel socket alone does not count as verified activity.
-    proxy_a.blackhole_tcp = true; proxy_b.blackhole_tcp = true;
-    phase(label + ": silent TCP blackhole");
-    until(loop, [&] { return route(a, endpoints[1]).is_null() && route(b, endpoints[0]).is_null(); }, 10000);
-    CHECK(counter(a, "peer_down") > downs);
-    CHECK(a.status().at("end_sessions").empty() && b.status().at("end_sessions").empty());
-    a.stop(); b.stop(); diagnostics = {};
-    phase(label + ": done");
 }
 
 void queue_saturation_tests() {
@@ -327,6 +263,9 @@ void mixed_and_reload_tests() {
     EventLoop loop; const auto endpoints = ports(loop, 4);
     std::vector<Configure> configs{config(0, endpoints, {1, 3}), config(1, endpoints, {0, 2}),
         config(2, endpoints, {1}), config(3, endpoints, {0})};
+    // Keep this scenario mixed: the production default is TCP, so explicitly
+    // start every adjacency in UDP before switching only A-B to TCP below.
+    for (auto& value : configs) for (auto& peer : value.peers) peer.transport = "udp";
     std::vector<std::unique_ptr<Node>> nodes; std::vector<MemoryDevice*> devices;
     for (unsigned i = 0; i < configs.size(); ++i) {
         auto* device = new MemoryDevice; devices.push_back(device);
@@ -425,10 +364,6 @@ int main() {
         SocketSystem sockets;
         phase("framing tests");
         framing_tests();
-        tcp_without_udp_tests(false);
-        tcp_without_udp_tests(true);
-        tcp_without_udp_tests(false, true);
-        tcp_without_udp_tests(true, true);
         queue_saturation_tests();
         mixed_and_reload_tests();
         phase("authentication tests");

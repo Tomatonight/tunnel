@@ -191,7 +191,7 @@ std::vector<ImportedRoute> checked_imports(const Configure& config, const std::v
         for (const auto& n : config.networks) if (r.prefix.overlaps(n.tunnel)) throw std::invalid_argument("imported route overlaps a virtual network");
         for (std::size_t j = 0; j < i; ++j) if (r.prefix.overlaps(result[j].prefix)) throw std::invalid_argument("overlapping imported routes");
         auto protects = [&](const Endpoint& e) { return e.port && !e.ip.unspecified() && r.prefix.contains(e.ip); };
-        if (protects(config.listen.address) || (config.address_server.enabled && protects(config.address_server.address)))
+        if (protects(config.listen.bind_address) || (config.address_server.enabled && protects(config.address_server.address)))
             throw std::invalid_argument("imported route covers a local public endpoint");
         for (const auto& p : config.peers) if (protects(p.address)) throw std::invalid_argument("imported route covers a peer endpoint");
         for (const auto& s : config.address_clients) if (protects(s.address)) throw std::invalid_argument("imported route covers an address server endpoint");

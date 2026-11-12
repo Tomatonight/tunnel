@@ -1,6 +1,8 @@
 #include "tcp_transport.h"
 #include <event2/buffer.h>
+#include <event2/util.h>
 #include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #ifdef _WIN32
@@ -22,6 +24,12 @@ void configure_socket(evutil_socket_t socket) {
     setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
 }
+std::string socket_error_reason() {
+    const int code = EVUTIL_SOCKET_ERROR();
+    const char* text = evutil_socket_error_to_string(code);
+    if (!code || !text) return "TCP socket error";
+    return std::string("TCP socket error ") + std::to_string(code) + ": " + text;
+}
 }
 TcpStream::TcpStream(EventLoop& loop, evutil_socket_t accepted, UdpTransport::Protector protect,
                      Receive receive, Notify connected, Notify closed)
@@ -29,14 +37,30 @@ TcpStream::TcpStream(EventLoop& loop, evutil_socket_t accepted, UdpTransport::Pr
     try {
         if (accepted != invalid_socket) {
             configure_socket(accepted);
+            sockaddr_storage address{};
+            ev_socklen_t length = sizeof(address);
+            if (getpeername(accepted, reinterpret_cast<sockaddr*>(&address), &length) == 0)
+                peer_address_ = Endpoint::from_sockaddr(reinterpret_cast<const sockaddr*>(&address));
             if (protect_ && !protect_(accepted)) throw std::runtime_error("TCP protection failed");
         }
         stream_ = bufferevent_socket_new(loop.native_base(), accepted, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
         if (!stream_) throw std::runtime_error("TCP event allocation");
         bufferevent_setcb(stream_, read_callback, nullptr, event_callback, this);
         bufferevent_setwatermark(stream_, EV_READ, 0, queue_limit);
-        bufferevent_enable(stream_, EV_READ | EV_WRITE);
-    } catch (...) { if (accepted != invalid_socket) evutil_closesocket(accepted); throw; }
+        if (bufferevent_enable(stream_, EV_READ | EV_WRITE) < 0)
+            throw std::runtime_error("TCP event enable failed");
+    } catch (...) {
+        // Once bufferevent_socket_new succeeds it owns the accepted descriptor
+        // (BEV_OPT_CLOSE_ON_FREE).  Free it on constructor failure instead of
+        // leaking the bufferevent or closing the descriptor behind its back.
+        if (stream_) {
+            bufferevent_free(stream_);
+            stream_ = nullptr;
+        } else if (accepted != invalid_socket) {
+            evutil_closesocket(accepted);
+        }
+        throw;
+    }
 }
 TcpStream::~TcpStream() { if (stream_) bufferevent_free(stream_); }
 void TcpStream::connect(const Endpoint& endpoint) {
@@ -48,19 +72,47 @@ void TcpStream::connect(const Endpoint& endpoint) {
     } catch (...) { evutil_closesocket(socket); throw; }
     if (bufferevent_setfd(stream_, socket) < 0) { evutil_closesocket(socket); throw std::runtime_error("TCP attach"); }
     int length; const auto address = endpoint.sockaddr_value(&length);
-    if (bufferevent_socket_connect(stream_, reinterpret_cast<const sockaddr*>(&address), length) < 0) close();
+    if (bufferevent_socket_connect(stream_, reinterpret_cast<const sockaddr*>(&address), length) < 0)
+        close("TCP connect setup failed");
+}
+Endpoint TcpStream::local_address() const {
+    const auto socket = bufferevent_getfd(stream_);
+    if (socket == invalid_socket) throw std::runtime_error("TCP local address unavailable");
+    sockaddr_storage address{};
+    ev_socklen_t length = sizeof(address);
+    if (getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length) < 0)
+        throw std::runtime_error("TCP local address unavailable");
+    return Endpoint::from_sockaddr(reinterpret_cast<const sockaddr*>(&address));
+}
+Endpoint TcpStream::peer_address() const {
+    if (peer_address_.port) return peer_address_;
+    const auto socket = bufferevent_getfd(stream_);
+    if (socket == invalid_socket) throw std::runtime_error("TCP peer address unavailable");
+    sockaddr_storage address{};
+    ev_socklen_t length = sizeof(address);
+    if (getpeername(socket, reinterpret_cast<sockaddr*>(&address), &length) < 0)
+        throw std::runtime_error("TCP peer address unavailable");
+    return Endpoint::from_sockaddr(reinterpret_cast<const sockaddr*>(&address));
 }
 bool TcpStream::send(const Bytes& bytes) {
     if (closed_flag_) return false;
-    if (bytes.size() + evbuffer_get_length(bufferevent_get_output(stream_)) > queue_limit ||
-        bufferevent_write(stream_, bytes.data(), bytes.size()) < 0) { close(); return false; }
+    const auto pending = evbuffer_get_length(bufferevent_get_output(stream_));
+    if (pending > queue_limit || bytes.size() > queue_limit - pending) {
+        close("TCP output queue limit exceeded");
+        return false;
+    }
+    if (bufferevent_write(stream_, bytes.data(), bytes.size()) < 0) {
+        close("TCP output write failed");
+        return false;
+    }
     return true;
 }
 std::size_t TcpStream::pending_bytes() const {
     return stream_ ? evbuffer_get_length(bufferevent_get_output(stream_)) : 0;
 }
-void TcpStream::close() {
+void TcpStream::close(const std::string& reason) {
     if (closed_flag_) return;
+    close_reason_ = reason.empty() ? "TCP connection closed" : reason;
     closed_flag_ = true; bufferevent_disable(stream_, EV_READ | EV_WRITE);
     auto fd = bufferevent_getfd(stream_);
     if (fd != invalid_socket) {
@@ -78,14 +130,24 @@ void TcpStream::read_callback(bufferevent* stream, void* argument) {
         const auto size = std::min<std::size_t>(65536, evbuffer_get_length(bufferevent_get_input(stream)));
         Bytes bytes(size); evbuffer_remove(bufferevent_get_input(stream), bytes.data(), size);
         self.receive_(bytes);
-    } catch (...) { self.close(); }
+    } catch (const std::exception& error) {
+        self.close(std::string("TCP receive callback failed: ") + error.what());
+    } catch (...) {
+        self.close("TCP receive callback failed");
+    }
 }
 void TcpStream::event_callback(bufferevent*, short events, void* argument) {
     auto& self = *static_cast<TcpStream*>(argument);
     try {
-        if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT)) self.close();
+        if (events & BEV_EVENT_TIMEOUT) self.close("TCP connection timeout");
+        else if (events & BEV_EVENT_ERROR) self.close(socket_error_reason());
+        else if (events & BEV_EVENT_EOF) self.close("peer closed TCP connection");
         else if (events & BEV_EVENT_CONNECTED) self.connected_();
-    } catch (...) { self.close(); }
+    } catch (const std::exception& error) {
+        self.close(std::string("TCP event callback failed: ") + error.what());
+    } catch (...) {
+        self.close("TCP event callback failed");
+    }
 }
 TcpListener::TcpListener(EventLoop& loop, const Endpoint& endpoint, Accept accept_callback, UdpTransport::Protector protect) {
     socket_ = socket(endpoint.ip.family == 4 ? AF_INET : AF_INET6, SOCK_STREAM, IPPROTO_TCP);
@@ -110,6 +172,7 @@ TcpListener::TcpListener(EventLoop& loop, const Endpoint& endpoint, Accept accep
                 accept_callback(fd); // callback takes ownership, including on failure
             }
         });
+        if (!event_) throw std::runtime_error("TCP event registration failed");
     } catch (...) { evutil_closesocket(socket_); throw; }
 }
 TcpListener::~TcpListener() { event_.reset(); if (socket_ != invalid_socket) evutil_closesocket(socket_); }

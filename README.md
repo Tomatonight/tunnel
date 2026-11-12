@@ -15,10 +15,10 @@
 - **虚拟网络**：IPv4/IPv6、单设备多地址、多个不重叠网段、按 peer 授权。
 - **加密通信**：TLS 1.3 与每对 peer 的预共享密钥（PSK）认证；单播端到端 AES-256-GCM 加密，以及链路逐跳保护。
 - **多跳与选路**：路径通告和撤回、按跳数 ECMP、单播按流选择下一跳、故障重连；广播/组播使用 RPF 检查和跳数限制。
-- **传输选择**：默认 UDP，可按 peer 选择 TCP；TCP 数据复用已认证的 TLS 控制连接。
+- **传输选择**：默认 TCP，可按 peer 选择 UDP；TCP 数据复用已认证的 TLS 控制连接。
 - **地址与内网**：可选独立地址分配服务、持久租约与离线回收；内网网段发布、主备出口及系统 SNAT。
 - **管理**：配置、连接状态、日志界面；命令行编辑、运行状态查询与配置热加载。
-- **远程桌面**：屏幕查看、键鼠操作、只读权限、设备授权、预授权无人值守和实时撤销。
+- **远程桌面**：Tunnel 提供已认证的虚拟网络和路由，GUI 调用 RustDesk 提供屏幕采集、编码、键鼠和全屏；旧 RFB/noVNC 代码仅保留兼容回退。
 - **Linux 内核后端**：自定义三层 `net_device`，UDP 数据封装、加解密与转发在内核完成；控制面及 TCP/TLS 通道保留用户态。
 
 项目采用 C++11、libevent 和 OpenSSL 3.x。桌面界面使用 Python/pywebview，Android 宿主使用 WebView、VpnService 和 JNI。
@@ -26,16 +26,24 @@
 
 Directory layout is intentionally small: `src/` contains the cross-platform C++ core; `config/` contains the repository default configuration; `examples/` contains sample node profiles; `gui/`, `remote_desktop/`, `android/`, and `kernel/` contain platform or feature code; `tests/` contains automated tests; `tools/` contains development utilities; `third_party/` contains bundled runtime dependencies; `docs/` contains documentation; and `build/` contains generated files only.
 
-On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script configures CMake and builds the core; run CTest separately when you want the test suite. Add `--gui` on Windows to package the desktop application under `build/gui/TunnelUI/`.
+On Windows, double-click `build.bat`. On Linux or macOS, run `./build.sh`. The script configures CMake and builds a Release core; add `--tests` to build and run CTest in the same invocation. Add `--build-type Debug` for a debug build and `--gui` on Windows to package the desktop application under `build/gui/TunnelUI-live/`.
 
-On Windows, double-click `run-gui.vbs` to start the packaged desktop UI without opening a console window. Use `run-gui.bat` from a terminal when you need to pass command-line options or start the source fallback. On Linux/macOS, use `./run-gui.sh`. Run the command-line manager with `run-cli.bat` or `./run-cli.sh`; arguments after the script are passed to the CLI, for example `./run-cli.sh status`.
+On Windows, run `build.bat --gui` once, then double-click `run-gui.vbs` or `run-gui.bat` to start the packaged desktop UI without opening a console window. The first launch may show a standard UAC prompt because the TUN adapter requires administrator rights; approve it to open the GUI. On Linux and macOS, run `./build.sh` first, then use `./run-gui.sh`. If the Linux core has no TUN capability, run `sudo bash run-gui.sh` once; the launcher grants the capability and opens the WebView as the desktop user. The normal user path never starts a hidden sudo password prompt. Run the command-line manager with `run-cli.bat` or `./run-cli.sh`; arguments after the script are passed to the CLI, for example `./run-cli.sh status`.
+
+The three GUI entry scripts are thin wrappers around `tools/launch_gui.py`, which owns package discovery, desktop-session setup, Linux capability handling, UAC elevation, and argument forwarding.
 
 The same entry point is available everywhere:
 
 ```bash
 python3 scripts/build.py
 python3 scripts/build.py --clean
+python3 scripts/build.py --tests --skip-gui-deps --skip-kernel-module
 ```
+
+The default build compiles the core without test targets. Use `--tests` when
+you want the native CTest targets built and executed as part of the same
+command; `--skip-gui-deps` and `--skip-kernel-module` keep that check usable on
+machines that only have the core toolchain installed.
 
 Android continues to use Gradle from `android/`; the Linux kernel module continues to use `tools/build_kernel.py`. These platform builds keep their own outputs and do not reuse incompatible CMake caches.
 
@@ -48,7 +56,7 @@ Android continues to use Gradle from `android/`; the Linux kernel module continu
 | macOS | utun | 后端已编写，尚未在目标平台构建和实机验证 |
 | Android | VpnService/TUN | 宿主及 JNI 工程已编写，尚未在目标平台构建和实机验证 |
 
-远程桌面已验证 Windows 屏幕采集和 Linux X11 的端到端键鼠操作；macOS 后端待实测。需要已登录的图形会话，当前不支持 Wayland、登录/安全桌面或 Android 远控。直接启动 C++ 核心只建立隧道，远控需通过桌面界面或独立后台启动。
+远程桌面主路径由已安装的 RustDesk 客户端负责；Tunnel GUI 只向 RustDesk 传入同一虚拟网络内的对端虚拟 IP。旧 RFB 实现仍可供兼容测试使用。直接启动 C++ 核心只建立隧道，远控需通过桌面界面启动 RustDesk。
 
 本项目面向互信节点组网：路径与公钥传播信任已接入节点如实转发。当前不提供 NAT 穿透、TAP/以太网桥接、重叠虚拟网段、动态 PMTU、隧道分片重组或默认路由接管。内网功能允许隧道节点发起连接及内网设备回包，暂不支持内网设备主动向隧道发起新连接。
 
@@ -76,14 +84,14 @@ Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/
 ./build/tunnel --generate-key
 ```
 
-以下地址为文档示例，必须替换成实际可达的公布 IP 和端口。`networks` 填写本机的虚拟 IP/前缀，两端属于同一虚拟网段但使用不同 IP。
+以下地址为文档示例，必须替换成实际可达的绑定地址和端口。`networks` 填写本机的虚拟 IP/前缀，两端属于同一虚拟网段但使用不同 IP。
 
 节点 A 保存为 `node-a.json`：
 
 ```json
 {
   "device_backend": "tun",
-  "endpoint": "192.0.2.10:65535",
+  "listen": {"bind_address": "192.0.2.10:65535"},
   "networks": ["10.1.0.1/24"],
   "peers": [
     {
@@ -99,7 +107,7 @@ Windows 使用同一 CMake 工程，需安装与编译器 ABI 一致的 OpenSSL/
 ```json
 {
   "device_backend": "tun",
-  "endpoint": "192.0.2.20:65535",
+  "listen": {"bind_address": "192.0.2.20:65535"},
   "networks": ["10.1.0.2/24"],
   "peers": [
     {
@@ -119,7 +127,7 @@ sudo ./build/tunnel node-a.json --watch-config
 
 在 A 端执行 `ping 10.1.0.2` 检查连通性。Windows 在管理员终端中使用 `.\build\tunnel.exe`，多配置构建器的程序通常位于 `build\Release\`。
 
-endpoint 不是绑定通配地址；默认绑定同地址族的本地通配地址及相同端口。UDP 模式需要 TCP/UDP 端点均可达；使用 NAT 时自行配置端口映射。虚拟网络内的节点身份由该网络的 tunnel_ip 决定。若选择 TCP，在 peer 对象中添加 `"transport": "tcp"`，两端版本均须支持；程序不自动从 UDP 回退到 TCP。多网络时还须明确填写每个 peer 允许使用的网段。
+开启监听时，`listen.bind_address` 是本机唯一的传输地址，同时用于 TCP/UDP 绑定和对端连接；可填写具体单播地址，也可填写 `0.0.0.0:端口` 或 `[::]:端口` 绑定所有网卡。关闭监听时 `bind_address` 和 `shared_key` 不参与出站连接，规范化时会被移除，核心自动使用通配绑定和实际出站端点；此模式需要对端通过 `listen.shared_key` 接收入站邻接。虚拟网络内的节点身份由该网络的 `tunnel_ip` 决定。数据封装默认使用 TCP；如需 UDP，在 peer 对象中添加 `"transport": "udp"`，两端版本均须支持；程序不自动在 TCP/UDP 间回退。多网络时还须明确填写每个 peer 允许使用的网段。需要免登记接收入站节点时，可在 `listen` 中配置 `shared_key`；持钥节点仍受 `listen.networks` 限制。
 
 上述配置显式选择 `tun`，无需安装本项目的内核模块。省略 `device_backend` 时，**Linux 默认使用 `kernel`，其他平台（包括 Android）默认使用 `tun`**。
 
@@ -132,7 +140,7 @@ bash build.sh
 bash run-gui.sh
 ```
 
-Linux 默认使用 `kernel`。`build.sh` 会在当前内核上生成 `build/kernel/tunnel_kmod.ko`，`run-gui.sh` 会在缺少该产物时自动重新构建，并在取得系统权限后加载模块。不要使用 `--skip-kernel-module` 启动默认 kernel 配置。也可将配置改为 `"device_backend": "tun"` 使用用户态 TUN。内核更新后需重新构建；模块二进制不能跨内核版本通用。
+Linux 默认使用 `kernel`。先执行 `build.sh` 构建核心和 GUI 环境；如果配置选择 `tun`，运行 `run-gui.sh` 前仍需为核心设置所需能力。使用 `device_backend=kernel` 时还需按当前发行版安装模块和设备权限；模块二进制不能跨内核版本通用。
 
 WSL 也需要与其运行内核匹配的构建树，普通发行版头文件不能直接替代。已在 WSL `6.18.40.1-microsoft-standard-WSL2` 完成实际运行验证，其他版本以对应编译和测试结果为准。构建要求、ABI、WSL 和 BTF 处理见 [内核后端说明](kernel/README.md)。
 

@@ -122,8 +122,21 @@ def main():
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
+    def node_identity(destination, network):
+        # Route and end-session status use the node's virtual IP as the
+        # destination identity. The underlay endpoint is only used in
+        # next_hops, so do not compare it with the route node field.
+        if network == '10.77.0.0/24':
+            return f'10.77.0.{destination + 1}'
+        if network == '10.78.0.0/24':
+            return f'10.78.0.{destination + 1}'
+        if network == 'fd00:77::/64':
+            return f'fd00:77::{destination + 1}'
+        raise AssertionError(f'unknown test network: {network}')
+
     def route(index, destination=3, network='10.77.0.0/24'):
-        return next((r for r in state(index).get('routes', []) if r['node'] == f'192.0.2.{destination+1}:45000' and r['network'] == network), None)
+        identity = node_identity(destination, network)
+        return next((r for r in state(index).get('routes', []) if r['node'] == identity and r['network'] == network), None)
 
     def hops(index=0):
         return len((route(index) or {}).get('next_hops', []))
@@ -215,19 +228,12 @@ def main():
             if i != 2:
                 networks += [{'tunnel': 'fd00:77::/64', 'tunnel_ip': f'fd00:77::{i+1}'},
                              {'tunnel': '10.78.0.0/24', 'tunnel_ip': f'10.78.0.{i+1}'}]
-            config = {'tun_mtu': 1280, 'transport_mtu': 1500,
-                'listen': {'enabled': True, 'address': f'192.0.2.{i+1}:45000', 'bind_address': '0.0.0.0:45000', 'networks': networks},
-                'peers': [{'address': f'192.0.2.{p+1}:45000', 'shared_key': f'test-link-{min(i,p)}-{max(i,p)}', 'networks': networks} for p in graph[i]]}
-            if i % 2 == 0:
-                # Run new and legacy files in the same topology. A exercises explicit
-                # multi-network permissions; C exercises the single-network default.
-                config = {'address': f'192.0.2.{i+1}:45000',
-                    'networks': [n['tunnel_ip'] + '/' + n['tunnel'].split('/')[1] for n in networks],
-                    'peers': [{'address': f'192.0.2.{p+1}:45000', 'shared_key': f'test-link-{min(i,p)}-{max(i,p)}'} for p in graph[i]]}
-                if len(networks) > 1:
-                    for peer in config['peers']:
-                        peer['networks'] = [n['tunnel'] for n in networks]
-            config['device_backend'] = 'tun'
+            network_hosts = [n['tunnel_ip'] + '/' + n['tunnel'].split('/')[1] for n in networks]
+            network_refs = [n['tunnel'] for n in networks]
+            config = {'tun_mtu': 1280, 'transport_mtu': 1500, 'device_backend': 'tun',
+                'listen': {'enabled': True, 'bind_address': f'192.0.2.{i+1}:45000', 'networks': network_refs},
+                'networks': network_hosts,
+                'peers': [{'endpoint': f'192.0.2.{p+1}:45000', 'shared_key': f'test-link-{min(i,p)}-{max(i,p)}', 'networks': network_refs} for p in graph[i]]}
             (work / f'{i}.json').write_text(json.dumps(config))
             start(i)
         wait(lambda: hops() == 2, 'diamond ECMP convergence')
@@ -261,7 +267,7 @@ def main():
         ns(0, 'ip', '-6', 'route', 'add', 'ff05::123/128', 'dev', 'overlay0')
         exchange('ff05::123', [1, 3], 'ipv6_multicast_membership_boundary', v6=True)
         original_key = state(3)['public_key']
-        session = next(s['id'] for s in state(0)['end_sessions'] if s['network'] == '10.77.0.0/24' and s['node'] == '192.0.2.4:45000')
+        session = next(s['id'] for s in state(0)['end_sessions'] if s['network'] == '10.77.0.0/24' and s['node'] == '10.77.0.4')
         filtering('udp')
         failure_started = time.monotonic()
         wait(lambda: hops() == 1 and route(0)['next_hops'] == ['192.0.2.3:45000'], 'UDP-only failure withdrawal', 30)
@@ -282,7 +288,7 @@ def main():
         wait(lambda: hops() == 2, 'TCP restored reconnect', 25)
         stop(3)
         wait(lambda: route(0) is None, 'all destination paths withdrawn')
-        assert not any(s['node'] == '192.0.2.4:45000' for s in state(0).get('end_sessions', []))
+        assert not any(s['node'] == '10.77.0.4' for s in state(0).get('end_sessions', []))
         assert ns(3, 'ip', 'link', 'show', 'overlay0', check=False).returncode != 0
         mark('last_path_withdrawal_and_tun_cleanup')
         start(3)
@@ -290,7 +296,7 @@ def main():
         ns(0, 'ping', '-c', '2', '-W', '2', '10.77.0.4')
         mark('node_restart_new_key_and_session_recovery')
         result = {'passed': passed, 'count': len(passed), 'ok': True,
-                  'config_formats': ['simplified', 'legacy', 'simplified', 'legacy']}
+                  'config_formats': ['canonical']}
     except Exception as error:
         result = {'passed': passed, 'count': len(passed), 'ok': False, 'error': str(error)}
         for i in range(4):

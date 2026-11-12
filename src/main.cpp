@@ -1,5 +1,6 @@
 #include "node.h"
 #include "protocol.h"
+#include "linux_capability.h"
 #include <algorithm>
 #include <cstdio>
 #include <csignal>
@@ -15,12 +16,36 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #endif
 namespace {
 volatile std::sig_atomic_t stopping = 0;
 volatile std::sig_atomic_t reload_requested = 0;
 void signal_stop(int) { stopping = 1; }
 void signal_reload(int) { reload_requested = 1; }
+
+// A GUI-owned core is always started with --stdio-control by a background
+// host.  If that host is killed abruptly, the control pipe may not be drained
+// before the process becomes orphaned.  Bind the core lifetime to its parent
+// on Linux so an abandoned core cannot keep the TUN device or listen socket
+// after the GUI/host has gone away.  The normal STOP/EOF path remains the
+// graceful shutdown mechanism.
+void arm_parent_death_signal(bool stdio_control) {
+#ifdef __linux__
+    if (!stdio_control) return;
+    const auto parent = ::getppid();
+    if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+        throw std::runtime_error("cannot arm parent-death cleanup");
+    }
+    // Avoid the small race where the parent exits between fork/exec and
+    // PR_SET_PDEATHSIG.  In that case terminate immediately.
+    if (::getppid() != parent) std::raise(SIGTERM);
+#else
+    (void)stdio_control;
+#endif
+}
 // A desktop controller owns this input pipe. Read a bounded amount on the same
 // event-loop thread; neither an idle parent nor a partial command may block it.
 class StdioControl {
@@ -223,6 +248,7 @@ wire::Json control_request(Node& node, const std::string& text, const std::strin
 }
 int main(int argc, char** argv) {
     try {
+        tunnel_linux::prepare_net_admin_child();
         bool check = false, normalize = false, generate_key = false, path_given = false, stdio_control = false, watch_config = false;
         std::string path = "config/default.json", name, status, export_client, backend_override;
         int tun_fd = -1; unsigned run_for = 0;
@@ -243,7 +269,7 @@ int main(int argc, char** argv) {
                           "--stdio-control: parent stdin pipe accepts STOP/stop and remote desktop JSON RPC; EOF stops cleanly.\n"
                           "--watch-config: reload changed JSON every second; invalid changes keep the running configuration.\n"
                           "POSIX SIGHUP reloads JSON when running without --stdio-control.\n"
-                          "--normalize-config: validate and print simplified JSON, including configured PSKs.\n"
+                          "--normalize-config: validate and print canonical JSON, including configured PSKs.\n"
                           "--generate-key: print a fresh 32-byte random PSK as hexadecimal.\n"
                           "--export-client: print a server-authorized client configuration (contains its PSK).\n"
                           "An address_server-only configuration runs without TUN/UDP or administrator privileges."); return 0;
@@ -276,14 +302,15 @@ int main(int argc, char** argv) {
         }
         if (check && normalize) throw std::invalid_argument("choose --check or --normalize-config");
         if (watch_config && stdio_control) throw std::invalid_argument("parent-managed cores use config_apply instead of --watch-config");
+        arm_parent_death_signal(stdio_control);
         SocketSystem sockets;
         const auto initial_text = configuration_text(path);
-        g_config = parse_config(initial_text);
-        if (!backend_override.empty()) g_config.device_backend = backend_override;
+        auto config = parse_config(initial_text);
+        if (!backend_override.empty()) config.device_backend = backend_override;
         if (!export_client.empty()) {
             if (check || normalize) throw std::invalid_argument("--export-client cannot be combined with check/normalize");
             const auto endpoint = Endpoint::parse(export_client);
-            const auto& server = g_config.address_server;
+            const auto& server = config.address_server;
             if (!server.enabled) throw std::invalid_argument("address server is not configured");
             AddressClientConfig selected;
             if (!server.shared_key.empty()) {
@@ -294,26 +321,26 @@ int main(int argc, char** argv) {
             }
             wire::Json networks = wire::Json::array();
             for (const auto& n : selected.networks) networks.push_back(n.str());
-            wire::Json doc{{"address", endpoint.str()}, {"address_clients", wire::Json::array({
+            wire::Json doc{{"listen", {{"bind_address", endpoint.str()}}}, {"address_clients", wire::Json::array({
                 {{"address", server.address.str()}, {"shared_key", selected.shared_key}, {"networks", networks}}
             })}};
             std::cout << serialize_config(parse_config(doc.dump())); return 0;
         }
-        if (normalize) { std::cout << serialize_config(g_config); return 0; }
+        if (normalize) { std::cout << serialize_config(config); return 0; }
         if (check) {
-            if (g_config.networks.empty()) {
-                if (!g_config.address_server.shared_key.empty())
+            if (config.networks.empty()) {
+                if (!config.address_server.shared_key.empty())
                     std::printf("Configuration valid: address server, %zu pools, shared-key admission; no TUN or UDP socket\n",
-                        g_config.address_server.networks.size());
+                        config.address_server.networks.size());
                 else std::printf("Configuration valid: address server, %zu pools, %zu authorized nodes; no TUN or UDP socket\n",
-                    g_config.address_server.networks.size(), g_config.address_server.clients.size());
+                    config.address_server.networks.size(), config.address_server.clients.size());
                 return 0;
             }
-            const auto family = g_config.listen.address.ip.family;
+            const auto family = config.listen.bind_address.ip.family;
             std::printf("Configuration valid: device backend %s, %zu peers, %zu networks\n"
                         "TUN MTU: %u; outer MTU budget: %u; maximum TUN MTU: %zu\n",
-                g_config.device_backend.c_str(), g_config.peers.size(), g_config.networks.size(), g_config.tun_mtu, g_config.transport_mtu,
-                protocol::maximum_tun_mtu(g_config.transport_mtu, family)); return 0;
+                config.device_backend.c_str(), config.peers.size(), config.networks.size(), config.tun_mtu, config.transport_mtu,
+                protocol::maximum_tun_mtu(config.transport_mtu, family)); return 0;
         }
         std::signal(SIGINT, signal_stop); std::signal(SIGTERM, signal_stop);
 #ifdef SIGHUP
@@ -324,15 +351,15 @@ int main(int argc, char** argv) {
 #endif
         StdioControl control(stdio_control);
         EventLoop loop;
-        resolve_service_state(g_config, path);
+        resolve_service_state(config, path);
         std::unique_ptr<PacketDevice> device;
-        if (!g_config.networks.empty()) device = open_device(loop, g_config, name, tun_fd);
+        if (!config.networks.empty()) device = open_device(loop, config, name, tun_fd);
         else if (tun_fd >= 0) throw std::invalid_argument("address server does not use a TUN fd");
         NodeOptions options; options.log = [](const std::string& text) { std::cerr << text << '\n'; };
         if (tun_fd < 0) options.device_factory = [&loop, name](const Configure& config) {
             return config.networks.empty() ? std::unique_ptr<PacketDevice>() : open_device(loop, config, name);
         };
-        Node node(loop, g_config, std::move(device), options); node.start();
+        Node node(loop, config, std::move(device), options); node.start();
         std::string observed_config = initial_text, last_reload_error;
         auto next_watch = std::chrono::steady_clock::now();
         bool status_failed = false;

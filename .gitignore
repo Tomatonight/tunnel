@@ -45,3 +45,9 @@ node_modules/
 /*.local.json
 /node-*.json
 /=44,
+
+# Local profile state created by the CLI/GUI
+/background/
+/configure.json
+/backups/
+/_remote_screen.png
